@@ -1,54 +1,80 @@
 import sqlite3
 from pathlib import Path
+from datetime import datetime
 
 DB_PATH = Path("database") / "dastabase.db"
 
 
+def get_connection():
+    return sqlite3.connect(DB_PATH)
+
+
 def initialize_database():
-    """Create the database and companies table if they don't exist."""
 
     DB_PATH.parent.mkdir(exist_ok=True)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS companies (
+
             id INTEGER PRIMARY KEY AUTOINCREMENT,
 
             company_name TEXT,
+            tax_number TEXT UNIQUE,
             registration_number TEXT,
-            tax_number TEXT,
 
-            employees INTEGER,
-            revenue REAL,
-            profit REAL,
+            address TEXT,
 
             activity TEXT,
 
-            street TEXT,
-            postal_code TEXT,
-            city TEXT,
-
+            phone TEXT,
             website TEXT,
             email TEXT,
-            phone TEXT,
 
-            director TEXT,
-
-            source TEXT,
-            source_url TEXT,
-
-            collected_at TEXT,
-            updated_at TEXT
+            collected_at TEXT
         )
     """)
 
     conn.commit()
     conn.close()
 
-    print(f"✅ Database initialized: {DB_PATH}")
 
+def save_company(company):
 
-if __name__ == "__main__":
-    initialize_database()
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT OR IGNORE INTO companies (
+
+            company_name,
+            tax_number,
+            registration_number,
+            address,
+            activity,
+            phone,
+            website,
+            email,
+            collected_at
+
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+
+        company["company_name"],
+        company["tax_number"],
+        company["registration_number"],
+        company["address"],
+        company["activity"],
+        company["phone"],
+        company["website"],
+        company["email"],
+        datetime.now().isoformat()
+
+    ))
+
+    conn.commit()
+    conn.close()
+
+    print("✓ Company saved.")
