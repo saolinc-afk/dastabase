@@ -5,10 +5,6 @@ from settings import DATABASE_PATH
 DB_PATH = DATABASE_PATH
 
 
-def get_connection():
-    return sqlite3.connect(DB_PATH)
-
-
 def initialize_database():
     DB_PATH.parent.mkdir(exist_ok=True)
 
@@ -27,10 +23,16 @@ def initialize_database():
         phone TEXT,
         website TEXT,
         email TEXT,
+        revenue_2022 REAL,
+        revenue_2023 REAL,
         revenue_2024 REAL,
         revenue_2025 REAL,
+        employees_2022 REAL,
+        employees_2023 REAL,
         employees_2024 REAL,
         employees_2025 REAL,
+        owners TEXT,
+        representatives TEXT,
         collected_at TEXT
     )
     """)
@@ -100,11 +102,15 @@ def save_company(company):
         company_name,tax_number,registration_number,address,
         municipality,
         activity,phone,website,email,
+        revenue_2022,revenue_2023,
         revenue_2024,revenue_2025,
+        employees_2022,employees_2023,
         employees_2024,employees_2025,
+        owners,
+        representatives,
         collected_at
     )
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
         company["company_name"],
         company["tax_number"],
@@ -115,20 +121,30 @@ def save_company(company):
         company["phone"],
         company["website"],
         company["email"],
-        company["revenue_2024"],
-        company["revenue_2025"],
-        company["employees_2024"],
-        company["employees_2025"],
+        company.get("revenue_2022", 0),
+        company.get("revenue_2023", 0),
+        company.get("revenue_2024", 0),
+        company.get("revenue_2025", 0),
+        company.get("employees_2022", 0),
+        company.get("employees_2023", 0),
+        company.get("employees_2024", 0),
+        company.get("employees_2025", 0),
+        company.get("owners", ""),
+        company.get("representatives", ""),
         datetime.now().isoformat()
     ))
 
     conn.commit()
     conn.close()
-    print("✓ Company saved.")
+    print(f"✓ {company['company_name']}")
+
+def get_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def get_companies_for_enrichment(limit=None):
     conn=get_connection()
-    conn.row_factory=sqlite3.Row
     sql="""
     SELECT c.*
     FROM companies c

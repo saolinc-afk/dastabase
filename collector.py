@@ -71,19 +71,122 @@ def get_all_company_links(page):
     return list(dict.fromkeys(all_links))
 
 def financial_values(page):
-    r={"revenue_2024":0.0,"revenue_2025":0.0,"employees_2024":0.0,"employees_2025":0.0}
-    rows=page.locator("table.datatable tbody tr")
+    """
+    Parse financial table.
+    Returns:
+        revenue_2022-2025
+        employees_2022-2025
+    """
+    result = {
+        "revenue_2022": 0.0,
+        "revenue_2023": 0.0,
+        "revenue_2024": 0.0,
+        "revenue_2025": 0.0,
+        "employees_2022": 0.0,
+        "employees_2023": 0.0,
+        "employees_2024": 0.0,
+        "employees_2025": 0.0,
+    }
+
+    rows = page.locator("tr")
     for i in range(rows.count()):
-        c=rows.nth(i).locator("td")
-        if c.count()<6: continue
-        t=c.nth(0).inner_text().lower()
-        if t.startswith("celotni prihod") or t.startswith("prihodki obrest"):
-            r["revenue_2024"]=parse_number(c.nth(4).inner_text())
-            r["revenue_2025"]=parse_number(c.nth(5).inner_text())
-        elif t.startswith("povprečno števi"):
-            r["employees_2024"]=parse_number(c.nth(4).inner_text())
-            r["employees_2025"]=parse_number(c.nth(5).inner_text())
-    return r
+        try:
+            row = rows.nth(i)
+            text = row.inner_text().lower()
+            cells = row.locator("td")
+            if cells.count() < 6:
+                continue
+            values = []
+            for j in range(1, min(6, cells.count())):
+                values.append(
+                    parse_number(
+                        cells.nth(j).inner_text()
+                    )
+                )
+            # 2021 2022 2023 2024 2025
+
+            #      [1]  [2]  [3]  [4]
+
+            if "celotni prihod" in text:
+                result["revenue_2022"] = values[1]
+                result["revenue_2023"] = values[2]
+                result["revenue_2024"] = values[3]
+                result["revenue_2025"] = values[4]
+
+            elif "povprečno števi" in text:
+                result["employees_2022"] = values[1]
+                result["employees_2023"] = values[2]
+                result["employees_2024"] = values[3]
+                result["employees_2025"] = values[4]
+
+        except Exception:
+            pass
+    return result
+
+
+def parse_people(page):
+    """
+    Parse owners and representatives from the OSEBE tab.
+    """
+    result = {
+        "owners": "",
+        "representatives": ""
+    }
+
+    try:
+        page.get_by_role("link", name="OSEBE").click()
+        page.wait_for_load_state("networkidle")
+        page.wait_for_timeout(300)
+    except Exception:
+        return result
+
+    owners = []
+    representatives = []
+
+    try:
+        links = page.locator("#ctl00_MainContent_ctl01_bamCompanyOwners a")
+        for i in range(links.count()):
+            name = links.nth(i).inner_text().strip()
+            if name and not name.lower().startswith("več"):
+                owners.append(name)
+    except Exception:
+        pass
+
+    try:
+        links = page.locator("#ctl00_MainContent_ctl01_bamZastopniki a")
+        for i in range(links.count()):
+            name = links.nth(i).inner_text().strip()
+            if name and not name.lower().startswith("več"):
+                representatives.append(name)
+    except Exception:
+        pass
+
+    result["owners"] = join_people(owners)
+    result["representatives"] = join_people(representatives)
+    return result
+
+def join_people(names):
+
+    """
+
+    Convert list of names into a single string.
+
+    """
+
+    names = [
+
+        n.strip()
+
+        for n in names
+
+        if n.strip()
+
+    ]
+
+    names = list(dict.fromkeys(names))
+
+    return "; ".join(names)
+
 
 def parse_company(page):
     txt=page.locator("body").inner_text()
@@ -114,7 +217,9 @@ def parse_company(page):
       "municipality": municipality
     }
     d.update(financial_values(page))
+    d.update(parse_people(page))
     return d
+
 
 def main():
     initialize_database()
@@ -133,7 +238,25 @@ def main():
             try:
                 page.goto(BASE_URL+h)
                 page.wait_for_load_state("networkidle")
-                save_company(parse_company(page))
+
+                company = parse_company(page)
+
+                print("=" * 70)
+                print(company["company_name"])
+                print("-" * 70)
+                print("Revenue:")
+                print(company.get("revenue_2022",0), company.get("revenue_2023",0),
+                      company.get("revenue_2024",0), company.get("revenue_2025",0))
+                print("Employees:")
+                print(company.get("employees_2022",0), company.get("employees_2023",0),
+                      company.get("employees_2024",0), company.get("employees_2025",0))
+                print("Owners:")
+                print(company.get("owners",""))
+                print("Representatives:")
+                print(company.get("representatives",""))
+                print("=" * 70)
+
+                save_company(company)
             except Exception as e:
                 print(f"Skipped: {e}")
 if __name__=="__main__":
