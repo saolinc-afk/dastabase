@@ -1,0 +1,93 @@
+# ----------------------------------------------------
+# Dastabase Family Detection Rules
+# ----------------------------------------------------
+
+version: 1.0
+
+classification:
+
+  explicit_threshold: 100
+
+  likely_threshold: 70
+
+pages:
+
+  - /
+
+  - /o-nas
+
+  - /o-podjetju
+
+  - /podjetje
+
+  - /zgodovina
+
+  - /about
+
+  - /about-us
+
+  - /company
+
+  - /history
+
+rules:
+
+  explicit:
+
+    score: 100
+
+    keywords:
+
+      - družinsko podjetje
+
+      - družinsko vodeno podjetje
+
+      - family business
+
+      - family-owned
+
+      - family owned
+
+      - family-run
+
+  generation:
+
+    score: 70
+
+    keywords:
+
+      - druga generacija
+
+      - tretja generacija
+
+      - second generation
+
+      - third generation
+
+  founder:
+
+    score: 30
+
+    keywords:
+
+      - ustanovil
+
+      - ustanovila
+
+      - founded by
+
+      - our founder
+
+  family_words:
+
+    score: 50
+
+    keywords:
+
+      - naša družina
+
+      - družinska tradicija
+
+      - our family
+
+      - family tradition
