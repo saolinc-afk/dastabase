@@ -135,7 +135,7 @@ def parse_people(page):
 
     try:
         page.get_by_role("link", name="OSEBE").click()
-        page.wait_for_load_state("networkidle")
+        page.wait_for_load_state("domcontentloaded")
         page.wait_for_timeout(300)
     except Exception:
         return result
@@ -221,6 +221,21 @@ def parse_company(page):
     return d
 
 
+
+def wait_for_company(page, attempts=3):
+    for attempt in range(attempts):
+        try:
+            page.locator("h2.mL10").wait_for(timeout=8000)
+            return True
+        except Exception:
+            print(f"Retry {attempt+1}/{attempts}...")
+            try:
+                page.reload(wait_until="domcontentloaded")
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
+    return False
+
 def main():
     initialize_database()
     with sync_playwright() as p:
@@ -237,7 +252,7 @@ def main():
             print(f"[{i}/{len(links)}]")
             try:
                 page.goto(BASE_URL+h)
-                page.wait_for_load_state("networkidle")
+                page.wait_for_load_state("domcontentloaded")
 
                 company = parse_company(page)
 
