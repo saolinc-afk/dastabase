@@ -1,18 +1,38 @@
 # Python
 __pycache__/
+**/__pycache__/
 *.pyc
 
 # Virtual environment
 .venv/
 
-# SQLite database
+# Local cache and data
+cache/
+
+# SQLite/local databases
 database/*.db
+database/*
+*.sqlite
+*.sqlite3
+*.sqbpro
+
+# Excel inputs/outputs
+*.xlsx
+~$*.xlsx
+dastabase_gvin_test_output*.xlsx
 
 # Logs
 logs/
 
 # Environment variables
 .env
+.env.*
+
+# Credentials / browser sessions
+credentials*
+cookies*
+chrome-profile/
+user-data-dir/
 
 # macOS
 .DS_Store

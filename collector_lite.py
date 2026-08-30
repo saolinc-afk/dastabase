@@ -59,6 +59,26 @@ def parse_number(value):
         return 0.0
 
 
+def parse_optional_number(value):
+
+    if value is None:
+        return None
+
+    value = value.strip()
+
+    if value == "":
+        return None
+
+    value = value.replace(".", "")
+    value = value.replace(",", ".")
+
+    try:
+        return round(float(value), 2)
+
+    except:
+        return None
+
+
 def municipality_from_address(address):
 
     m = re.search(
@@ -83,6 +103,61 @@ def company_id_from_href(href):
     return ""
 
 
+def detail_url_from_href(href):
+
+    if not href:
+        return ""
+
+    href = href.strip()
+
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+
+    if href.startswith("/"):
+        return BASE_URL + href
+
+    return BASE_URL + "/" + href
+
+
+def normalize_domain(value):
+
+    if not value:
+        return ""
+
+    value = value.strip()
+
+    if value.lower().startswith("mailto:"):
+        value = value[7:]
+
+    if "@" in value:
+        value = value.rsplit("@", 1)[1]
+
+    if not value.startswith(("http://", "https://")):
+        value = "http://" + value
+
+    host = urlparse(value).netloc.lower()
+
+    if host.startswith("www."):
+        host = host[4:]
+
+    return host.strip().rstrip(".")
+
+
+def normalize_email(value):
+
+    if not value:
+        return ""
+
+    value = value.strip()
+
+    if value.lower().startswith("mailto:"):
+        value = value[7:]
+
+    value = value.split("?", 1)[0]
+
+    return value.strip().lower()
+
+
 def find_gvin_page(context):
 
     for page in context.pages:
@@ -105,7 +180,7 @@ def parse_company_row(item):
     # -----------------------------
 
     company["company_name"] = (
-        item.locator("h3 span")
+        item.locator("h3 a").first
         .inner_text()
         .strip()
     )
@@ -169,21 +244,21 @@ def parse_company_row(item):
         "div.advanceResultDataDisplaySubjektFix"
     )
 
-    company["revenue_2025"] = 0.0
-    company["profit_2025"] = 0.0
-    company["employees_2025"] = 0.0
+    company["revenue_2025"] = None
+    company["profit_2025"] = None
+    company["employees_2025"] = None
 
     if values.count() >= 3:
 
-        company["revenue_2025"] = parse_number(
+        company["revenue_2025"] = parse_optional_number(
             values.nth(0).inner_text()
         )
 
-        company["profit_2025"] = parse_number(
+        company["profit_2025"] = parse_optional_number(
             values.nth(1).inner_text()
         )
 
-        company["employees_2025"] = parse_number(
+        company["employees_2025"] = parse_optional_number(
             values.nth(2).inner_text()
         )
 
@@ -192,13 +267,165 @@ def parse_company_row(item):
     # -----------------------------
 
     href = (
-        item.locator("h3 a")
+        item.locator('a[href*="CompanyId="]').first
         .get_attribute("href")
     )
+
+    company["gvin_detail_url"] = detail_url_from_href(href)
 
     company["gvin_company_id"] = (
         company_id_from_href(href)
     )
+
+    company["domain"] = ""
+    company["email"] = ""
+    company["email_domain"] = ""
+
+    return company
+
+
+def financial_value_2025(page, row_prefix):
+
+    table = page.locator(
+        "#ctl00_MainContent_ctl04_bamCompanyFinancialData "
+        "table.datatable.data-table-fix"
+    )
+
+    if table.count() == 0:
+        return None
+
+    raw_value = table.first.evaluate(
+        """
+        (table, rowPrefix) => {
+          const normalize = (value) => (
+            value || ''
+          ).replace(/\\s+/g, ' ').trim().toLowerCase();
+
+          const rows = Array.from(table.querySelectorAll('tr'));
+
+          if (!rows.length) {
+            return null;
+          }
+
+          const headerCells = Array.from(rows[0].children);
+          const yearIndex = headerCells.findIndex(
+            (cell) => normalize(cell.innerText) === '2025'
+          );
+
+          if (yearIndex < 0) {
+            return null;
+          }
+
+          const wantedPrefix = normalize(rowPrefix);
+
+          for (const row of rows.slice(1)) {
+            const cells = Array.from(row.children);
+
+            if (!cells.length) {
+              continue;
+            }
+
+            const label = normalize(cells[0].innerText);
+
+            if (label.startsWith(wantedPrefix)) {
+              const valueCell = cells[yearIndex];
+              return valueCell ? valueCell.innerText.trim() : null;
+            }
+          }
+
+          return null;
+        }
+        """,
+        row_prefix,
+    )
+
+    return parse_optional_number(raw_value)
+
+
+def enrich_company_from_detail(page, company):
+
+    detail_url = company.get("gvin_detail_url", "")
+
+    if not detail_url:
+        return company
+
+    result_url = page.url
+
+    try:
+
+        page.goto(
+            detail_url,
+            wait_until="domcontentloaded"
+        )
+
+        human_pause(page)
+
+        url_link = page.locator(
+            'div.textInfoRight '
+            'div.headerAlignTextContainer:has-text("URL:") '
+            'a.w85Overflow'
+        )
+
+        if url_link.count() > 0:
+
+            raw_url = (
+                url_link.first.get_attribute("href")
+                or url_link.first.inner_text()
+            )
+
+            company["domain"] = normalize_domain(raw_url)
+
+        email_link = page.locator(
+            'div.textInfoRight '
+            'div.headerAlignTextContainer:has-text("E-pošta:") '
+            'a.w75Overflow'
+        )
+
+        if email_link.count() > 0:
+
+            raw_email = (
+                email_link.first.get_attribute("href")
+                or email_link.first.inner_text()
+            )
+
+            company["email"] = normalize_email(raw_email)
+            company["email_domain"] = normalize_domain(
+                company["email"]
+            )
+
+        company["revenue_2025"] = financial_value_2025(
+            page,
+            "Celotni prihodk",
+        )
+        company["employees_2025"] = financial_value_2025(
+            page,
+            "Povprečno števi",
+        )
+
+    except Exception as e:
+
+        print(
+            f"Skipped detail data for "
+            f"{company.get('company_name', '')}: {e}"
+        )
+
+    finally:
+
+        try:
+
+            page.goto(
+                result_url,
+                wait_until="domcontentloaded"
+            )
+
+            human_pause(page)
+
+        except Exception as e:
+
+            print(
+                f"Could not return to results after "
+                f"{company.get('company_name', '')}: {e}"
+            )
 
     return company
 
@@ -210,7 +437,7 @@ def collect_page(page):
 
     companies = []
 
-    rows = page.locator("li.newsearchIcon.semaphoreG")
+    rows = page.locator("li.newsearchIcon")
 
     if rows.count() == 0:
         print("No companies found.")
@@ -224,6 +451,11 @@ def collect_page(page):
 
             company = parse_company_row(
                 rows.nth(i)
+            )
+
+            company = enrich_company_from_detail(
+                page,
+                company
             )
 
             companies.append(company)
