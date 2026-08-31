@@ -44,6 +44,13 @@ class CompanyPersonRoleResult:
     created: bool
 
 
+@dataclass(frozen=True)
+class SourceRecordResult:
+    source_record_id: int
+    created: bool
+    company_id: int | None = None
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -432,6 +439,240 @@ def raw_hash(raw: Any) -> str:
     return hashlib.sha256(json_dumps(raw).encode("utf-8")).hexdigest()
 
 
+def create_job(
+    *,
+    job_type: str,
+    source: str | None = None,
+    input_name: str | None = None,
+    total_items: int = 0,
+    config: dict[str, Any] | None = None,
+    db_path: Path | str = DB_PATH,
+) -> int:
+    initialize_database(db_path)
+    now = utc_now()
+
+    with get_connection(db_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO jobs(
+                job_type,
+                source,
+                input_name,
+                status,
+                started_at,
+                total_items,
+                config_json,
+                created_at
+            )
+            VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (
+                job_type,
+                source,
+                input_name,
+                "RUNNING",
+                now,
+                total_items,
+                json_dumps(config or {}),
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def finish_job(
+    *,
+    job_id: int,
+    status: str,
+    processed_items: int,
+    error_count: int = 0,
+    db_path: Path | str = DB_PATH,
+) -> None:
+    initialize_database(db_path)
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE jobs
+            SET status = ?,
+                finished_at = ?,
+                processed_items = ?,
+                error_count = ?
+            WHERE job_id = ?
+            """,
+            (status, utc_now(), processed_items, error_count, job_id),
+        )
+
+
+def upsert_source_record(
+    *,
+    job_id: int | None,
+    company_id: int | None,
+    source: str,
+    source_file: str | None,
+    source_row: int | None,
+    external_id: str | None,
+    raw: dict[str, Any],
+    collected_at: str,
+    db_path: Path | str = DB_PATH,
+) -> SourceRecordResult:
+    initialize_database(db_path)
+    payload_hash = raw_hash(raw)
+
+    with get_connection(db_path) as conn:
+        existing = conn.execute(
+            """
+            SELECT source_record_id, company_id
+            FROM source_records
+            WHERE source = ?
+              AND source_file = ?
+              AND source_row = ?
+              AND raw_hash = ?
+            """,
+            (source, source_file, source_row, payload_hash),
+        ).fetchone()
+
+        if existing is not None:
+            existing_company_id = (
+                int(existing["company_id"])
+                if existing["company_id"] is not None
+                else None
+            )
+            if company_id is not None and existing_company_id is None:
+                conn.execute(
+                    """
+                    UPDATE source_records
+                    SET company_id = ?
+                    WHERE source_record_id = ?
+                    """,
+                    (company_id, existing["source_record_id"]),
+                )
+                existing_company_id = company_id
+
+            return SourceRecordResult(
+                source_record_id=int(existing["source_record_id"]),
+                created=False,
+                company_id=existing_company_id,
+            )
+
+        cursor = conn.execute(
+            """
+            INSERT INTO source_records(
+                job_id,
+                company_id,
+                source,
+                source_file,
+                source_row,
+                external_id,
+                raw_json,
+                raw_hash,
+                collected_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                job_id,
+                company_id,
+                source,
+                source_file,
+                source_row,
+                external_id,
+                json_dumps(raw),
+                payload_hash,
+                collected_at,
+            ),
+        )
+        return SourceRecordResult(
+            source_record_id=int(cursor.lastrowid),
+            created=True,
+            company_id=company_id,
+        )
+
+
+def update_source_record_company(
+    *,
+    source_record_id: int,
+    company_id: int,
+    db_path: Path | str = DB_PATH,
+) -> None:
+    initialize_database(db_path)
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE source_records
+            SET company_id = ?
+            WHERE source_record_id = ?
+            """,
+            (company_id, source_record_id),
+        )
+
+
+def create_job_item(
+    *,
+    job_id: int,
+    company_id: int | None,
+    item_key: str,
+    input_row_number: int | None,
+    input_payload: dict[str, Any],
+    status: str,
+    match_status: str | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    output_payload: dict[str, Any] | None = None,
+    attempt_count: int = 1,
+    db_path: Path | str = DB_PATH,
+) -> None:
+    initialize_database(db_path)
+    now = utc_now()
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO job_items(
+                job_id,
+                company_id,
+                item_key,
+                input_row_number,
+                input_payload_json,
+                status,
+                match_status,
+                error_type,
+                error_message,
+                started_at,
+                finished_at,
+                attempt_count,
+                output_payload_json
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(job_id, item_key) DO UPDATE SET
+                company_id = excluded.company_id,
+                status = excluded.status,
+                match_status = excluded.match_status,
+                error_type = excluded.error_type,
+                error_message = excluded.error_message,
+                finished_at = excluded.finished_at,
+                attempt_count = job_items.attempt_count + excluded.attempt_count,
+                output_payload_json = excluded.output_payload_json
+            """,
+            (
+                job_id,
+                company_id,
+                item_key,
+                input_row_number,
+                json_dumps(input_payload),
+                status,
+                match_status,
+                error_type,
+                error_message,
+                now,
+                now,
+                attempt_count,
+                json_dumps(output_payload or {}),
+            ),
+        )
+
+
 def _find_company_by_identifier(
     conn: sqlite3.Connection,
     column: str,
@@ -444,6 +685,44 @@ def _find_company_by_identifier(
         f"SELECT * FROM companies WHERE {column} = ?",
         (value,),
     ).fetchone()
+
+
+def find_company_id_by_identifiers(
+    *,
+    registration_number: Any = None,
+    tax_number: Any = None,
+    db_path: Path | str = DB_PATH,
+) -> int | None:
+    initialize_database(db_path)
+    normalized_registration = normalize_registration_number(registration_number)
+    normalized_tax = normalize_tax_number(tax_number)
+
+    with get_connection(db_path) as conn:
+        ids: set[int] = set()
+
+        reg_company = _find_company_by_identifier(
+            conn,
+            "registration_number",
+            normalized_registration,
+        )
+        if reg_company is not None:
+            ids.add(int(reg_company["company_id"]))
+
+        tax_company = _find_company_by_identifier(
+            conn,
+            "tax_number",
+            normalized_tax,
+        )
+        if tax_company is not None:
+            ids.add(int(tax_company["company_id"]))
+
+    if len(ids) > 1:
+        raise IdentityConflictError(
+            conflict_id=-1,
+            message="registration_number and tax_number resolve to different companies",
+        )
+
+    return next(iter(ids), None)
 
 
 def _record_identity_conflict(

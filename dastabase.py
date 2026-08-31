@@ -9,6 +9,21 @@ import pandas as pd
 from playwright.sync_api import TimeoutError, sync_playwright
 
 from collector_lite import collect_page, find_gvin_page, human_pause
+from database_v2 import (
+    DB_PATH as DB_V2_PATH,
+    create_job as create_v2_job,
+    create_job_item as create_v2_job_item,
+    find_company_id_by_identifiers,
+    finish_job as finish_v2_job,
+    initialize_database as initialize_v2_database,
+    normalize_registration_number,
+    normalize_tax_number,
+    update_source_record_company as update_v2_source_record_company,
+    upsert_source_record as upsert_v2_source_record,
+    utc_now,
+)
+from ingestion.models import CompanyRecord, FactRecord
+from ingestion.writer import ingest_company
 from matching.company_matcher import CompanyCandidate, CompanyInput, best_match
 
 
@@ -47,6 +62,8 @@ RATE_LIMIT_MARKERS = [
     "poskusite kasneje",
     "temporarily unavailable",
 ]
+V2_JOB_TYPE = "excel_gvin_enrichment"
+V2_SOURCE = "gvin"
 
 
 def usage() -> None:
@@ -267,6 +284,308 @@ def print_summary(output_df: pd.DataFrame, processed_now: int, output_path: Path
     print("Output:", output_path)
 
 
+def clean_v2_value(value):
+    if pd.isna(value):
+        return None
+
+    if hasattr(value, "item"):
+        value = value.item()
+
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+
+    return value
+
+
+def row_payload(row) -> dict:
+    return {
+        str(key): clean_v2_value(value)
+        for key, value in row.to_dict().items()
+    }
+
+
+def cell_number(value) -> float | None:
+    if pd.isna(value) or value == "":
+        return None
+
+    if isinstance(value, str):
+        value = value.strip().replace(".", "").replace(",", ".")
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def gvin_external_url(gvin_company_id: str) -> str | None:
+    if not gvin_company_id:
+        return None
+
+    return (
+        "https://www.gvin.com/GvinOverview/Pages/"
+        f"Company.aspx?CompanyId={gvin_company_id}"
+    )
+
+
+def combined_v2_raw(row, result: dict) -> dict:
+    return {
+        "input": row_payload(row),
+        "enrichment": {
+            key: clean_v2_value(value)
+            for key, value in result.items()
+        },
+    }
+
+
+class V2EnrichmentRecorder:
+    def __init__(self, input_path: Path, total_rows: int):
+        self.input_path = input_path
+        self.total_rows = total_rows
+        self.job_id: int | None = None
+        self.enabled = False
+        self.disabled_reason = ""
+        self.processed_items = 0
+        self.error_count = 0
+
+        try:
+            initialize_v2_database(DB_V2_PATH)
+            self.job_id = create_v2_job(
+                job_type=V2_JOB_TYPE,
+                source=V2_SOURCE,
+                input_name=input_path.name,
+                total_items=total_rows,
+                config={
+                    "pipeline": "dastabase.py",
+                    "mode": "live_enrichment",
+                    "v2_optional": True,
+                },
+                db_path=DB_V2_PATH,
+            )
+            self.enabled = True
+            print(f"V2 job: {self.job_id}", flush=True)
+        except Exception as exc:
+            self.disabled_reason = str(exc)
+            print(
+                "WARNING: V2 ingestion disabled for this run: "
+                f"{self.disabled_reason}",
+                flush=True,
+            )
+
+    def record_resume_skip(self, *, row_number: int, row, result: dict) -> None:
+        if not self.enabled or self.job_id is None:
+            return
+
+        try:
+            create_v2_job_item(
+                job_id=self.job_id,
+                company_id=None,
+                item_key=f"row:{row_number}",
+                input_row_number=row_number,
+                input_payload=row_payload(row),
+                status="resume_skipped",
+                match_status=cell_text(result.get("Match Status")),
+                output_payload={"v1_result": result, "v2_ingestion": "not_run"},
+                db_path=DB_V2_PATH,
+            )
+            self.processed_items += 1
+        except Exception as exc:
+            self._disable_after_system_error(exc)
+
+    def record_row(self, *, row_number: int, row, result: dict) -> None:
+        if not self.enabled or self.job_id is None:
+            return
+
+        match_status = cell_text(result.get("Match Status")).upper()
+        gvin_company_id = cell_text(result.get("GVIN Company ID"))
+        registration = normalize_registration_number(result.get("GVIN Registration"))
+        tax = normalize_tax_number(result.get("GVIN Tax"))
+        raw = combined_v2_raw(row, result)
+        company_id: int | None = None
+        source_record_id: int | None = None
+        item_status = "v2/unresolved"
+        error_type = None
+        error_message = None
+        output_payload = {"v1_result": result}
+
+        try:
+            source_record = upsert_v2_source_record(
+                job_id=self.job_id,
+                company_id=None,
+                source=V2_SOURCE,
+                source_file=self.input_path.name,
+                source_row=row_number,
+                external_id=gvin_company_id or None,
+                raw=raw,
+                collected_at=utc_now(),
+                db_path=DB_V2_PATH,
+            )
+            source_record_id = source_record.source_record_id
+            company_id = source_record.company_id
+
+            should_ingest = False
+            if match_status == "CONFIRMED":
+                should_ingest = bool(registration or tax)
+                if not should_ingest:
+                    error_type = "UNRESOLVED_IDENTITY"
+                    error_message = "CONFIRMED row has no registration_number or tax_number"
+            elif match_status == "REVIEW":
+                existing_company_id = find_company_id_by_identifiers(
+                    registration_number=registration,
+                    tax_number=tax,
+                    db_path=DB_V2_PATH,
+                )
+                should_ingest = existing_company_id is not None
+                if not should_ingest:
+                    error_type = "REVIEW_HELD"
+                    error_message = "REVIEW match held from canonical creation"
+            elif match_status == "ERROR":
+                item_status = "v2/error"
+                error_type = "SOURCE_ROW_ERROR"
+                error_message = cell_text(result.get("Match Reasons")) or "V1 row status ERROR"
+            elif match_status == "NO_MATCH":
+                error_type = "NO_MATCH"
+                error_message = cell_text(result.get("Match Reasons")) or "V1 row status NO_MATCH"
+            else:
+                error_type = "UNKNOWN_MATCH_STATUS"
+                error_message = f"Unknown Match Status: {match_status}"
+
+            if should_ingest:
+                facts = []
+                for fact_key, result_key in (
+                    ("revenue", "GVIN Revenue 2025"),
+                    ("employees", "GVIN Employees 2025"),
+                ):
+                    value = cell_number(result.get(result_key))
+                    if value is not None:
+                        facts.append(
+                            FactRecord(
+                                fact_key=fact_key,
+                                value=value,
+                                value_year=2025,
+                            )
+                        )
+
+                ingest_result = ingest_company(
+                    CompanyRecord(
+                        source=V2_SOURCE,
+                        external_id=gvin_company_id or None,
+                        external_url=gvin_external_url(gvin_company_id),
+                        canonical_name=cell_text(result.get("GVIN Company")) or None,
+                        registration_number=registration,
+                        tax_number=tax,
+                        address=cell_text(result.get("GVIN Address")) or None,
+                        website=cell_text(result.get("GVIN Domain")) or None,
+                        email=cell_text(result.get("GVIN Email")) or None,
+                        observed_at=utc_now(),
+                        verified_at=utc_now(),
+                        source_record_id=source_record_id,
+                        job_id=self.job_id,
+                        facts=facts,
+                    ),
+                    db_path=DB_V2_PATH,
+                )
+                company_id = ingest_result.company_id
+                output_payload["v2_ingestion"] = {
+                    "status": ingest_result.status,
+                    "facts_written": ingest_result.facts_written,
+                    "warnings": list(ingest_result.warnings),
+                    "conflicts": list(ingest_result.conflicts),
+                }
+
+                if ingest_result.status in {"CREATED", "RESOLVED"}:
+                    item_status = "v2/resolved"
+                    if company_id is not None:
+                        update_v2_source_record_company(
+                            source_record_id=source_record_id,
+                            company_id=company_id,
+                            db_path=DB_V2_PATH,
+                        )
+                elif ingest_result.status == "IDENTITY_CONFLICT":
+                    item_status = "v2/error"
+                    error_type = "IDENTITY_CONFLICT"
+                    error_message = "; ".join(ingest_result.conflicts)
+                    self.error_count += 1
+                else:
+                    item_status = "v2/unresolved"
+                    error_type = ingest_result.status
+                    error_message = "; ".join(ingest_result.warnings)
+            else:
+                output_payload["v2_ingestion"] = "not_ingested"
+                if item_status == "v2/error":
+                    self.error_count += 1
+
+            create_v2_job_item(
+                job_id=self.job_id,
+                company_id=company_id,
+                item_key=f"row:{row_number}",
+                input_row_number=row_number,
+                input_payload=row_payload(row),
+                status=item_status,
+                match_status=match_status,
+                error_type=error_type,
+                error_message=error_message,
+                output_payload={
+                    **output_payload,
+                    "source_record_id": source_record_id,
+                    "company_id": company_id,
+                },
+                db_path=DB_V2_PATH,
+            )
+            self.processed_items += 1
+        except Exception as exc:
+            self.error_count += 1
+            print(
+                f"WARNING: V2 ingestion failed for row {row_number}: {exc}",
+                flush=True,
+            )
+            try:
+                if self.enabled and self.job_id is not None:
+                    create_v2_job_item(
+                        job_id=self.job_id,
+                        company_id=company_id,
+                        item_key=f"row:{row_number}",
+                        input_row_number=row_number,
+                        input_payload=row_payload(row),
+                        status="v2/error",
+                        match_status=match_status,
+                        error_type="V2_WRITE_ERROR",
+                        error_message=str(exc),
+                        output_payload={
+                            **output_payload,
+                            "source_record_id": source_record_id,
+                            "company_id": company_id,
+                        },
+                        db_path=DB_V2_PATH,
+                    )
+                    self.processed_items += 1
+            except Exception as job_item_exc:
+                self._disable_after_system_error(job_item_exc)
+
+    def finish(self, status: str = "FINISHED") -> None:
+        if not self.enabled or self.job_id is None:
+            return
+
+        try:
+            finish_v2_job(
+                job_id=self.job_id,
+                status=status,
+                processed_items=self.processed_items,
+                error_count=self.error_count,
+                db_path=DB_V2_PATH,
+            )
+        except Exception as exc:
+            print(f"WARNING: could not finish V2 job {self.job_id}: {exc}", flush=True)
+
+    def _disable_after_system_error(self, exc: Exception) -> None:
+        self.enabled = False
+        self.disabled_reason = str(exc)
+        print(
+            "WARNING: V2 ingestion disabled after write failure: "
+            f"{self.disabled_reason}",
+            flush=True,
+        )
+
+
 def conservative_delay(page, row_number: int) -> None:
     if row_number > 0 and row_number % 20 == 0:
         page.wait_for_timeout(random.randint(30000, 60000))
@@ -323,6 +642,8 @@ def main() -> int:
             print("ERROR: GVIN page not found in open Chrome.")
             return 1
 
+        v2_recorder = V2EnrichmentRecorder(input_path, len(input_df))
+
         print()
         print("=" * 80)
         print("DASTABASE V1 - EXCEL -> GVIN -> MATCH -> EXCEL")
@@ -345,6 +666,14 @@ def main() -> int:
                     f"- resume skip ({existing_status})",
                     flush=True,
                 )
+                v2_recorder.record_resume_skip(
+                    row_number=row_number,
+                    row=row,
+                    result={
+                        key: output_df.at[index, key]
+                        for key in GVIN_COLUMNS + MATCH_COLUMNS
+                    },
+                )
                 continue
 
             print(f"[{row_number}/{len(input_df)}] {company_input.name}", flush=True)
@@ -354,6 +683,11 @@ def main() -> int:
                 for key, value in result.items():
                     output_df.at[index, key] = value
                 save_checkpoint(output_df, output_path)
+                v2_recorder.record_row(
+                    row_number=row_number,
+                    row=row,
+                    result=result,
+                )
                 print("GVIN candidates: 0", flush=True)
                 print("Match: NO_MATCH", flush=True)
                 print("✓ saved", flush=True)
@@ -374,6 +708,11 @@ def main() -> int:
                     for key, value in result.items():
                         output_df.at[index, key] = value
                     save_checkpoint(output_df, output_path)
+                    v2_recorder.record_row(
+                        row_number=row_number,
+                        row=row,
+                        result=result,
+                    )
                     processed_now += 1
                     print("GVIN candidates: 0", flush=True)
                     print(f"Match: ERROR - {problem}", flush=True)
@@ -408,6 +747,11 @@ def main() -> int:
                     output_df.at[index, key] = value
 
                 save_checkpoint(output_df, output_path)
+                v2_recorder.record_row(
+                    row_number=row_number,
+                    row=row,
+                    result=result,
+                )
                 processed_now += 1
 
                 match_label = result["Match Status"]
@@ -428,6 +772,11 @@ def main() -> int:
                 for key, value in result.items():
                     output_df.at[index, key] = value
                 save_checkpoint(output_df, output_path)
+                v2_recorder.record_row(
+                    row_number=row_number,
+                    row=row,
+                    result=result,
+                )
                 processed_now += 1
                 print("GVIN candidates: 0", flush=True)
                 print(f"Match: ERROR - Timeout: {exc}", flush=True)
@@ -439,11 +788,18 @@ def main() -> int:
                 for key, value in result.items():
                     output_df.at[index, key] = value
                 save_checkpoint(output_df, output_path)
+                v2_recorder.record_row(
+                    row_number=row_number,
+                    row=row,
+                    result=result,
+                )
                 processed_now += 1
                 print("GVIN candidates: 0", flush=True)
                 print(f"Match: ERROR - {exc}", flush=True)
                 print("✓ saved", flush=True)
                 page.wait_for_timeout(random.randint(10000, 15000))
+
+        v2_recorder.finish()
 
     print_summary(output_df, processed_now, output_path)
     print("GVIN rate-limit issues:", rate_limit_issues)
