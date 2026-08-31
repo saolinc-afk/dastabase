@@ -10,16 +10,16 @@ import pandas as pd
 
 from database_v2 import (
     DB_PATH,
-    IdentityConflictError,
     get_connection,
     initialize_database,
     json_dumps,
     normalize_registration_number,
     normalize_tax_number,
     raw_hash,
-    resolve_or_create_company,
     utc_now,
 )
+from ingestion.models import CompanyRecord, FactRecord
+from ingestion.writer import ingest_company
 
 
 SOURCE = "excel_gvin_enrichment"
@@ -196,6 +196,22 @@ def upsert_source_record(
     return int(cursor.lastrowid), True
 
 
+def update_source_record_company(
+    conn: sqlite3.Connection,
+    *,
+    source_record_id: int,
+    company_id: int,
+) -> None:
+    conn.execute(
+        """
+        UPDATE source_records
+        SET company_id = ?
+        WHERE source_record_id = ?
+        """,
+        (company_id, source_record_id),
+    )
+
+
 def find_existing_company_id(
     conn: sqlite3.Connection,
     *,
@@ -234,217 +250,6 @@ def find_existing_company_id(
         raise ImportErrorV2("registration_number and tax_number point to different companies")
 
     return next(iter(ids), None)
-
-
-def fill_company_current_fields(
-    conn: sqlite3.Connection,
-    *,
-    company_id: int,
-    data: dict[str, Any],
-) -> None:
-    row = conn.execute(
-        "SELECT * FROM companies WHERE company_id = ?",
-        (company_id,),
-    ).fetchone()
-
-    if row is None:
-        raise ImportErrorV2(f"Company does not exist: {company_id}")
-
-    field_map = {
-        "canonical_name": data.get("canonical_name"),
-        "registration_number": data.get("registration_number"),
-        "tax_number": data.get("tax_number"),
-        "address": data.get("address"),
-        "website": data.get("website"),
-        "email": data.get("email"),
-    }
-    updates = {
-        column: value
-        for column, value in field_map.items()
-        if value and not row[column]
-    }
-
-    if not updates:
-        return
-
-    updates["updated_at"] = utc_now()
-    assignments = ", ".join(f"{column} = ?" for column in updates)
-    conn.execute(
-        f"UPDATE companies SET {assignments} WHERE company_id = ?",
-        (*updates.values(), company_id),
-    )
-
-
-def upsert_gvin_identity(
-    conn: sqlite3.Connection,
-    *,
-    company_id: int,
-    gvin_company_id: str,
-    observed_at: str,
-) -> None:
-    existing = conn.execute(
-        """
-        SELECT company_id
-        FROM company_source_identities
-        WHERE source = 'gvin' AND external_id = ?
-        """,
-        (gvin_company_id,),
-    ).fetchone()
-
-    if existing is not None and int(existing["company_id"]) != company_id:
-        raise ImportErrorV2(
-            f"GVIN Company ID {gvin_company_id} already belongs to another company"
-        )
-
-    conn.execute(
-        """
-        INSERT INTO company_source_identities(
-            company_id,
-            source,
-            external_id,
-            external_url,
-            observed_at,
-            last_seen_at
-        )
-        VALUES(?,?,?,?,?,?)
-        ON CONFLICT(source, external_id) DO UPDATE SET
-            external_url = COALESCE(excluded.external_url, external_url),
-            last_seen_at = excluded.last_seen_at
-        """,
-        (
-            company_id,
-            "gvin",
-            gvin_company_id,
-            f"https://www.gvin.com/GvinOverview/Pages/Company.aspx?CompanyId={gvin_company_id}",
-            observed_at,
-            observed_at,
-        ),
-    )
-
-
-def insert_observation(
-    conn: sqlite3.Connection,
-    *,
-    company_id: int,
-    job_id: int,
-    source_record_id: int,
-    fact_key: str,
-    value_number: float,
-    value_year: int,
-    collected_at: str,
-) -> tuple[int, bool]:
-    existing = conn.execute(
-        """
-        SELECT observation_id
-        FROM company_observations
-        WHERE source_record_id = ?
-          AND fact_key = ?
-          AND COALESCE(value_year, -1) = COALESCE(?, -1)
-        """,
-        (source_record_id, fact_key, value_year),
-    ).fetchone()
-
-    if existing is not None:
-        return int(existing["observation_id"]), False
-
-    cursor = conn.execute(
-        """
-        INSERT INTO company_observations(
-            company_id,
-            job_id,
-            source_record_id,
-            fact_key,
-            value_number,
-            value_year,
-            source,
-            collected_at,
-            observed_at
-        )
-        VALUES(?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            company_id,
-            job_id,
-            source_record_id,
-            fact_key,
-            value_number,
-            value_year,
-            "gvin",
-            collected_at,
-            collected_at,
-        ),
-    )
-    return int(cursor.lastrowid), True
-
-
-def upsert_current_fact(
-    conn: sqlite3.Connection,
-    *,
-    company_id: int,
-    observation_id: int,
-    fact_key: str,
-    value_number: float,
-    value_year: int,
-    collected_at: str,
-) -> None:
-    existing = conn.execute(
-        """
-        SELECT current_fact_id
-        FROM company_current_facts
-        WHERE company_id = ?
-          AND fact_key = ?
-          AND COALESCE(value_year, -1) = COALESCE(?, -1)
-        """,
-        (company_id, fact_key, value_year),
-    ).fetchone()
-
-    if existing is not None:
-        conn.execute(
-            """
-            UPDATE company_current_facts
-            SET observation_id = ?,
-                value_number = ?,
-                source = ?,
-                observed_at = ?,
-                updated_at = ?
-            WHERE current_fact_id = ?
-            """,
-            (
-                observation_id,
-                value_number,
-                "gvin",
-                collected_at,
-                collected_at,
-                existing["current_fact_id"],
-            ),
-        )
-        return
-
-    conn.execute(
-        """
-        INSERT INTO company_current_facts(
-            company_id,
-            fact_key,
-            value_year,
-            observation_id,
-            value_number,
-            source,
-            observed_at,
-            updated_at
-        )
-        VALUES(?,?,?,?,?,?,?,?)
-        """,
-        (
-            company_id,
-            fact_key,
-            value_year,
-            observation_id,
-            value_number,
-            "gvin",
-            collected_at,
-            collected_at,
-        ),
-    )
 
 
 def create_job_item(
@@ -507,6 +312,7 @@ def import_row(
     row_index: int,
     row: pd.Series,
     collected_at: str,
+    db_path: Path | str = DB_PATH,
 ) -> dict[str, Any]:
     source_row = row_index + 2
     raw = row_payload(row)
@@ -540,135 +346,117 @@ def import_row(
             status = "skipped duplicate"
             source_record_id = int(existing_source_record["source_record_id"])
         else:
-            if match_status == "CONFIRMED":
-                if registration or tax:
-                    result = resolve_or_create_company(
-                        canonical_name=gvin_company or None,
-                        registration_number=registration,
-                        tax_number=tax,
-                        source=SOURCE,
-                        db_path=DB_PATH,
-                    )
-                    company_id = result.company_id
-                    status = "imported/resolved"
-                else:
-                    status = "imported/unresolved"
-                    error_type = "UNRESOLVED_IDENTITY"
-                    error_message = "CONFIRMED row has no registration_number or tax_number"
-
-            elif match_status == "REVIEW":
-                existing_company_id = find_existing_company_id(
-                    conn,
-                    registration_number=registration,
-                    tax_number=tax,
-                )
-
-                if existing_company_id is not None:
-                    resolve_or_create_company(
-                        canonical_name=gvin_company or None,
-                        registration_number=registration,
-                        tax_number=tax,
-                        source=SOURCE,
-                        db_path=DB_PATH,
-                    )
-                    company_id = existing_company_id
-                    status = "imported/resolved"
-                else:
-                    status = "imported/unresolved"
-                    error_type = "REVIEW_HELD"
-                    error_message = "REVIEW match held from canonical creation"
-
-            elif match_status == "ERROR":
-                status = "error"
-                error_type = "SOURCE_ROW_ERROR"
-                error_message = match_reasons or "Excel row has Match Status ERROR"
-
-            elif match_status == "NO_MATCH":
-                status = "imported/unresolved"
-                error_type = "NO_MATCH"
-                error_message = match_reasons or "Excel row has Match Status NO_MATCH"
-
-            else:
-                status = "imported/unresolved"
-                error_type = "UNKNOWN_MATCH_STATUS"
-                error_message = f"Unknown Match Status: {match_status}"
-
             source_record_id, _created = upsert_source_record(
                 conn,
                 job_id=job_id,
-                company_id=company_id,
+                company_id=None,
                 source_file=source_file,
                 source_row=source_row,
                 external_id=gvin_company_id or None,
                 raw=raw,
                 collected_at=collected_at,
             )
+            conn.commit()
 
-            if company_id is not None:
-                fill_company_current_fields(
-                    conn,
-                    company_id=company_id,
-                    data={
-                        "canonical_name": gvin_company,
-                        "registration_number": registration,
-                        "tax_number": tax,
-                        "address": cell_text(row.get("GVIN Address")),
-                        "website": cell_text(row.get("GVIN Domain")),
-                        "email": cell_text(row.get("GVIN Email")),
-                    },
-                )
+            if match_status == "CONFIRMED":
+                should_ingest = bool(registration or tax)
+                if not should_ingest:
+                    status = "imported/unresolved"
+                    error_type = "UNRESOLVED_IDENTITY"
+                    error_message = "CONFIRMED row has no registration_number or tax_number"
 
-                if gvin_company_id:
-                    upsert_gvin_identity(
+            elif match_status == "REVIEW":
+                should_ingest = (
+                    find_existing_company_id(
                         conn,
-                        company_id=company_id,
-                        gvin_company_id=gvin_company_id,
-                        observed_at=collected_at,
+                        registration_number=registration,
+                        tax_number=tax,
                     )
+                    is not None
+                )
+                if not should_ingest:
+                    status = "imported/unresolved"
+                    error_type = "REVIEW_HELD"
+                    error_message = "REVIEW match held from canonical creation"
 
+            elif match_status == "ERROR":
+                should_ingest = False
+                status = "error"
+                error_type = "SOURCE_ROW_ERROR"
+                error_message = match_reasons or "Excel row has Match Status ERROR"
+
+            elif match_status == "NO_MATCH":
+                should_ingest = False
+                status = "imported/unresolved"
+                error_type = "NO_MATCH"
+                error_message = match_reasons or "Excel row has Match Status NO_MATCH"
+
+            else:
+                should_ingest = False
+                status = "imported/unresolved"
+                error_type = "UNKNOWN_MATCH_STATUS"
+                error_message = f"Unknown Match Status: {match_status}"
+
+            if should_ingest:
+                facts = []
                 for fact_key, column_name in (
                     ("revenue", "GVIN Revenue 2025"),
                     ("employees", "GVIN Employees 2025"),
                 ):
                     value = cell_number(row.get(column_name))
+                    if value is not None:
+                        facts.append(
+                            FactRecord(
+                                fact_key=fact_key,
+                                value=value,
+                                value_year=2025,
+                                observed_at=collected_at,
+                            )
+                        )
 
-                    if value is None:
-                        continue
-
-                    observation_id, _created = insert_observation(
-                        conn,
-                        company_id=company_id,
-                        job_id=job_id,
+                ingest_result = ingest_company(
+                    CompanyRecord(
+                        source="gvin",
+                        external_id=gvin_company_id or None,
+                        external_url=(
+                            "https://www.gvin.com/GvinOverview/Pages/"
+                            f"Company.aspx?CompanyId={gvin_company_id}"
+                            if gvin_company_id
+                            else None
+                        ),
+                        canonical_name=gvin_company or None,
+                        registration_number=registration,
+                        tax_number=tax,
+                        address=cell_text(row.get("GVIN Address")) or None,
+                        website=cell_text(row.get("GVIN Domain")) or None,
+                        email=cell_text(row.get("GVIN Email")) or None,
+                        observed_at=collected_at,
+                        verified_at=collected_at,
                         source_record_id=source_record_id,
-                        fact_key=fact_key,
-                        value_number=value,
-                        value_year=2025,
-                        collected_at=collected_at,
-                    )
-                    upsert_current_fact(
-                        conn,
-                        company_id=company_id,
-                        observation_id=observation_id,
-                        fact_key=fact_key,
-                        value_number=value,
-                        value_year=2025,
-                        collected_at=collected_at,
-                    )
+                        job_id=job_id,
+                        facts=facts,
+                    ),
+                    db_path=db_path,
+                )
 
-    except IdentityConflictError as exc:
-        source_record_id, _created = upsert_source_record(
-            conn,
-            job_id=job_id,
-            company_id=None,
-            source_file=source_file,
-            source_row=source_row,
-            external_id=gvin_company_id or None,
-            raw=raw,
-            collected_at=collected_at,
-        )
-        status = "error"
-        error_type = "IDENTITY_CONFLICT"
-        error_message = f"{exc}; conflict_id={exc.conflict_id}"
+                company_id = ingest_result.company_id
+
+                if ingest_result.status in ("CREATED", "RESOLVED"):
+                    if company_id is not None:
+                        update_source_record_company(
+                            conn,
+                            source_record_id=source_record_id,
+                            company_id=company_id,
+                        )
+                    status = "imported/resolved"
+                elif ingest_result.status == "IDENTITY_CONFLICT":
+                    status = "error"
+                    error_type = "IDENTITY_CONFLICT"
+                    error_message = "; ".join(ingest_result.conflicts)
+                else:
+                    status = "imported/unresolved"
+                    error_type = ingest_result.status
+                    error_message = "; ".join(ingest_result.warnings)
 
     except ImportErrorV2 as exc:
         source_record_id, _created = upsert_source_record(
@@ -713,8 +501,8 @@ def import_row(
     }
 
 
-def import_file(path: Path) -> dict[str, int]:
-    initialize_database(DB_PATH)
+def import_file(path: Path, *, db_path: Path | str = DB_PATH) -> dict[str, int]:
+    initialize_database(db_path)
     df = pd.read_excel(path)
     collected_at = utc_now()
     stats = {
@@ -725,7 +513,7 @@ def import_file(path: Path) -> dict[str, int]:
         "errors": 0,
     }
 
-    with get_connection(DB_PATH) as conn:
+    with get_connection(db_path) as conn:
         job_id = create_job(conn, path.name, len(df))
         conn.commit()
 
@@ -738,6 +526,7 @@ def import_file(path: Path) -> dict[str, int]:
                     row_index=index,
                     row=row,
                     collected_at=collected_at,
+                    db_path=db_path,
                 )
 
                 status = result["status"]
