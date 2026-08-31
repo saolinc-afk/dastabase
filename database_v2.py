@@ -5,12 +5,21 @@ import json
 import re
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 DB_PATH = Path("database") / "database_v2.db"
+
+
+class ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 class IdentityConflictError(Exception):
@@ -51,12 +60,27 @@ class SourceRecordResult:
     company_id: int | None = None
 
 
+@dataclass(frozen=True)
+class EnrichmentTaskResult:
+    task_id: int
+    created: bool
+
+
+@dataclass(frozen=True)
+class SourceUsageResult:
+    source: str
+    usage_date: str
+    used_count: int
+    daily_limit: int | None
+    enabled: bool
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, factory=ClosingConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -427,6 +451,67 @@ def initialize_database(db_path: Path | str = DB_PATH) -> None:
 
             CREATE INDEX IF NOT EXISTS ix_company_person_roles_current
                 ON company_person_roles(company_person_id, is_current);
+
+            CREATE TABLE IF NOT EXISTS source_budgets (
+                source TEXT PRIMARY KEY,
+                daily_limit INTEGER,
+                enabled INTEGER DEFAULT 1,
+                timezone TEXT DEFAULT 'Europe/Ljubljana',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS source_usage (
+                source TEXT NOT NULL,
+                usage_date TEXT NOT NULL,
+                used_count INTEGER DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(source, usage_date),
+                FOREIGN KEY(source) REFERENCES source_budgets(source)
+            );
+
+            CREATE TABLE IF NOT EXISTS enrichment_tasks (
+                task_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER,
+                person_id INTEGER,
+                source TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                priority INTEGER DEFAULT 100,
+                payload_json TEXT,
+                result_json TEXT,
+                attempt_count INTEGER DEFAULT 0,
+                max_attempts INTEGER DEFAULT 3,
+                not_before TEXT,
+                claimed_at TEXT,
+                claimed_by TEXT,
+                started_at TEXT,
+                finished_at TEXT,
+                error_type TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(company_id) REFERENCES companies(company_id),
+                FOREIGN KEY(person_id) REFERENCES people(person_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS ix_enrichment_tasks_status_priority
+                ON enrichment_tasks(status, priority, not_before, created_at);
+
+            CREATE INDEX IF NOT EXISTS ix_enrichment_tasks_company
+                ON enrichment_tasks(company_id, source, task_type, status);
+
+            CREATE INDEX IF NOT EXISTS ix_enrichment_tasks_person
+                ON enrichment_tasks(person_id, source, task_type, status);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_enrichment_tasks_active_identity
+                ON enrichment_tasks(
+                    COALESCE(company_id, -1),
+                    COALESCE(person_id, -1),
+                    source,
+                    task_type
+                )
+                WHERE status IN ('PENDING', 'RUNNING');
             """
         )
 
@@ -669,6 +754,420 @@ def create_job_item(
                 now,
                 attempt_count,
                 json_dumps(output_payload or {}),
+            ),
+        )
+
+
+ACTIVE_ENRICHMENT_TASK_STATUSES = ("PENDING", "RUNNING")
+DONE_ENRICHMENT_TASK_STATUS = "DONE"
+ENRICHMENT_TASK_STATUSES = (
+    "PENDING",
+    "RUNNING",
+    "DONE",
+    "ERROR",
+    "REVIEW_REQUIRED",
+    "SKIPPED",
+)
+
+
+def _ensure_source_budget(
+    conn: sqlite3.Connection,
+    source: str,
+) -> sqlite3.Row:
+    now = utc_now()
+    conn.execute(
+        """
+        INSERT INTO source_budgets(
+            source,
+            daily_limit,
+            enabled,
+            timezone,
+            created_at,
+            updated_at
+        )
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(source) DO NOTHING
+        """,
+        (source, None, 1, "Europe/Ljubljana", now, now),
+    )
+    row = conn.execute(
+        """
+        SELECT source, daily_limit, enabled, timezone
+        FROM source_budgets
+        WHERE source = ?
+        """,
+        (source,),
+    ).fetchone()
+
+    if row is None:
+        raise ValueError(f"Source budget row was not created: {source}")
+
+    return row
+
+
+def _usage_date_for_budget(row: sqlite3.Row) -> str:
+    timezone_name = row["timezone"] or "Europe/Ljubljana"
+
+    try:
+        tz = ZoneInfo(timezone_name)
+    except Exception:
+        tz = timezone.utc
+
+    return datetime.now(tz).date().isoformat()
+
+
+def _can_use_source_conn(
+    conn: sqlite3.Connection,
+    source: str,
+) -> tuple[bool, SourceUsageResult]:
+    budget = _ensure_source_budget(conn, source)
+    usage_date = _usage_date_for_budget(budget)
+    usage = conn.execute(
+        """
+        SELECT used_count
+        FROM source_usage
+        WHERE source = ? AND usage_date = ?
+        """,
+        (source, usage_date),
+    ).fetchone()
+    used_count = int(usage["used_count"]) if usage is not None else 0
+    daily_limit = (
+        int(budget["daily_limit"])
+        if budget["daily_limit"] is not None
+        else None
+    )
+    enabled = bool(budget["enabled"])
+
+    allowed = enabled and (daily_limit is None or used_count < daily_limit)
+    return allowed, SourceUsageResult(
+        source=source,
+        usage_date=usage_date,
+        used_count=used_count,
+        daily_limit=daily_limit,
+        enabled=enabled,
+    )
+
+
+def set_source_budget(
+    *,
+    source: str,
+    daily_limit: int | None = None,
+    enabled: bool = True,
+    timezone_name: str = "Europe/Ljubljana",
+    db_path: Path | str = DB_PATH,
+) -> None:
+    initialize_database(db_path)
+    now = utc_now()
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO source_budgets(
+                source,
+                daily_limit,
+                enabled,
+                timezone,
+                created_at,
+                updated_at
+            )
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(source) DO UPDATE SET
+                daily_limit = excluded.daily_limit,
+                enabled = excluded.enabled,
+                timezone = excluded.timezone,
+                updated_at = excluded.updated_at
+            """,
+            (source, daily_limit, int(enabled), timezone_name, now, now),
+        )
+
+
+def can_use_source(
+    source: str,
+    *,
+    db_path: Path | str = DB_PATH,
+) -> bool:
+    initialize_database(db_path)
+
+    with get_connection(db_path) as conn:
+        allowed, _usage = _can_use_source_conn(conn, source)
+        return allowed
+
+
+def consume_source_budget(
+    source: str,
+    *,
+    db_path: Path | str = DB_PATH,
+) -> bool:
+    initialize_database(db_path)
+    now = utc_now()
+
+    with get_connection(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        allowed, usage = _can_use_source_conn(conn, source)
+
+        if not allowed:
+            return False
+
+        conn.execute(
+            """
+            INSERT INTO source_usage(source, usage_date, used_count, updated_at)
+            VALUES(?,?,1,?)
+            ON CONFLICT(source, usage_date) DO UPDATE SET
+                used_count = used_count + 1,
+                updated_at = excluded.updated_at
+            """,
+            (source, usage.usage_date, now),
+        )
+        return True
+
+
+def get_source_usage(
+    source: str,
+    *,
+    db_path: Path | str = DB_PATH,
+) -> SourceUsageResult:
+    initialize_database(db_path)
+
+    with get_connection(db_path) as conn:
+        _allowed, usage = _can_use_source_conn(conn, source)
+        return usage
+
+
+def create_enrichment_task(
+    *,
+    source: str,
+    task_type: str,
+    company_id: int | None = None,
+    person_id: int | None = None,
+    priority: int = 100,
+    payload: dict[str, Any] | None = None,
+    max_attempts: int = 3,
+    not_before: str | None = None,
+    db_path: Path | str = DB_PATH,
+) -> EnrichmentTaskResult:
+    initialize_database(db_path)
+    now = utc_now()
+
+    with get_connection(db_path) as conn:
+        try:
+            cursor = conn.execute(
+                """
+                INSERT INTO enrichment_tasks(
+                    company_id,
+                    person_id,
+                    source,
+                    task_type,
+                    status,
+                    priority,
+                    payload_json,
+                    attempt_count,
+                    max_attempts,
+                    not_before,
+                    created_at,
+                    updated_at
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    company_id,
+                    person_id,
+                    source,
+                    task_type,
+                    "PENDING",
+                    priority,
+                    json_dumps(payload or {}),
+                    0,
+                    max_attempts,
+                    not_before,
+                    now,
+                    now,
+                ),
+            )
+            return EnrichmentTaskResult(task_id=int(cursor.lastrowid), created=True)
+        except sqlite3.IntegrityError:
+            existing = conn.execute(
+                """
+                SELECT task_id
+                FROM enrichment_tasks
+                WHERE COALESCE(company_id, -1) = COALESCE(?, -1)
+                  AND COALESCE(person_id, -1) = COALESCE(?, -1)
+                  AND source = ?
+                  AND task_type = ?
+                  AND status IN ('PENDING', 'RUNNING')
+                ORDER BY created_at
+                LIMIT 1
+                """,
+                (company_id, person_id, source, task_type),
+            ).fetchone()
+
+            if existing is None:
+                raise
+
+            return EnrichmentTaskResult(
+                task_id=int(existing["task_id"]),
+                created=False,
+            )
+
+
+def needs_enrichment(
+    *,
+    company_id: int | None = None,
+    person_id: int | None = None,
+    source: str,
+    task_type: str,
+    max_age_days: int,
+    db_path: Path | str = DB_PATH,
+) -> bool:
+    initialize_database(db_path)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT finished_at, updated_at
+            FROM enrichment_tasks
+            WHERE COALESCE(company_id, -1) = COALESCE(?, -1)
+              AND COALESCE(person_id, -1) = COALESCE(?, -1)
+              AND source = ?
+              AND task_type = ?
+              AND status = ?
+            ORDER BY COALESCE(finished_at, updated_at) DESC
+            LIMIT 1
+            """,
+            (
+                company_id,
+                person_id,
+                source,
+                task_type,
+                DONE_ENRICHMENT_TASK_STATUS,
+            ),
+        ).fetchone()
+
+    if row is None:
+        return True
+
+    timestamp = row["finished_at"] or row["updated_at"]
+    if not timestamp:
+        return True
+
+    completed_at = datetime.fromisoformat(timestamp)
+    if completed_at.tzinfo is None:
+        completed_at = completed_at.replace(tzinfo=timezone.utc)
+
+    return completed_at < cutoff
+
+
+def claim_next_enrichment_task(
+    *,
+    worker_id: str,
+    db_path: Path | str = DB_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    now = utc_now()
+
+    with get_connection(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT t.*
+            FROM enrichment_tasks t
+            LEFT JOIN source_budgets b ON b.source = t.source
+            WHERE t.status = 'PENDING'
+              AND t.attempt_count < t.max_attempts
+              AND (t.not_before IS NULL OR t.not_before <= ?)
+              AND COALESCE(b.enabled, 1) = 1
+            ORDER BY t.priority ASC, t.created_at ASC, t.task_id ASC
+            """,
+            (now,),
+        ).fetchall()
+
+        for row in rows:
+            allowed, _usage = _can_use_source_conn(conn, str(row["source"]))
+            if not allowed:
+                continue
+
+            cursor = conn.execute(
+                """
+                UPDATE enrichment_tasks
+                SET status = 'RUNNING',
+                    claimed_at = ?,
+                    claimed_by = ?,
+                    started_at = ?,
+                    attempt_count = attempt_count + 1,
+                    updated_at = ?
+                WHERE task_id = ? AND status = 'PENDING'
+                """,
+                (now, worker_id, now, now, row["task_id"]),
+            )
+
+            if cursor.rowcount != 1:
+                continue
+
+            claimed = conn.execute(
+                """
+                SELECT *
+                FROM enrichment_tasks
+                WHERE task_id = ?
+                """,
+                (row["task_id"],),
+            ).fetchone()
+            return dict(claimed)
+
+    return None
+
+
+def update_enrichment_task(
+    *,
+    task_id: int,
+    status: str,
+    result: dict[str, Any] | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+    not_before: str | None = None,
+    db_path: Path | str = DB_PATH,
+) -> None:
+    if status not in ENRICHMENT_TASK_STATUSES:
+        raise ValueError(f"Unsupported enrichment task status: {status}")
+
+    initialize_database(db_path)
+    now = utc_now()
+    finished_at = (
+        now
+        if status in {"DONE", "ERROR", "REVIEW_REQUIRED", "SKIPPED"}
+        else None
+    )
+    claimed_at = None if status == "PENDING" else "KEEP"
+    claimed_by = None if status == "PENDING" else "KEEP"
+    started_at = None if status == "PENDING" else "KEEP"
+
+    with get_connection(db_path) as conn:
+        conn.execute(
+            """
+            UPDATE enrichment_tasks
+            SET status = ?,
+                result_json = ?,
+                not_before = ?,
+                finished_at = ?,
+                claimed_at = CASE WHEN ? IS NULL THEN NULL ELSE claimed_at END,
+                claimed_by = CASE WHEN ? IS NULL THEN NULL ELSE claimed_by END,
+                started_at = CASE WHEN ? IS NULL THEN NULL ELSE started_at END,
+                error_type = ?,
+                error_message = ?,
+                updated_at = ?
+            WHERE task_id = ?
+            """,
+            (
+                status,
+                json_dumps(result or {}),
+                not_before,
+                finished_at,
+                claimed_at,
+                claimed_by,
+                started_at,
+                error_type,
+                error_message,
+                now,
+                task_id,
             ),
         )
 
