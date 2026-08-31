@@ -54,6 +54,12 @@ class CompanyPersonRoleResult:
 
 
 @dataclass(frozen=True)
+class CompanyOwnershipResult:
+    ownership_id: int
+    created: bool
+
+
+@dataclass(frozen=True)
 class SourceRecordResult:
     source_record_id: int
     created: bool
@@ -248,6 +254,11 @@ def initialize_database(db_path: Path | str = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS ix_source_records_raw_hash
                 ON source_records(raw_hash);
 
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_source_records_external_hash
+                ON source_records(source, external_id, raw_hash)
+                WHERE external_id IS NOT NULL
+                  AND raw_hash IS NOT NULL;
+
             CREATE TABLE IF NOT EXISTS company_observations (
                 observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 company_id INTEGER NOT NULL,
@@ -420,6 +431,7 @@ def initialize_database(db_path: Path | str = DB_PATH) -> None:
                 role_type TEXT NOT NULL,
                 title TEXT,
                 ownership_pct REAL,
+                source_role_id TEXT,
                 is_current INTEGER DEFAULT 1,
                 valid_from TEXT,
                 valid_to TEXT,
@@ -427,6 +439,7 @@ def initialize_database(db_path: Path | str = DB_PATH) -> None:
                 observed_at TEXT,
                 last_seen_at TEXT,
                 confidence REAL,
+                evidence_json TEXT,
                 source_record_id INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -451,6 +464,64 @@ def initialize_database(db_path: Path | str = DB_PATH) -> None:
 
             CREATE INDEX IF NOT EXISTS ix_company_person_roles_current
                 ON company_person_roles(company_person_id, is_current);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_company_person_roles_source_role
+                ON company_person_roles(company_person_id, source, source_role_id)
+                WHERE source_role_id IS NOT NULL
+                  AND is_current = 1
+                  AND valid_to IS NULL;
+
+            CREATE TABLE IF NOT EXISTS company_ownership (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owned_company_id INTEGER NOT NULL,
+                owner_person_id INTEGER,
+                owner_company_id INTEGER,
+                source TEXT NOT NULL,
+                source_shareholder_id TEXT,
+                source_share_id TEXT,
+                owner_raw_name TEXT,
+                owner_raw_identifier TEXT,
+                owner_type TEXT,
+                share_raw TEXT,
+                share_percent REAL,
+                nominal_value_raw TEXT,
+                valid_from TEXT,
+                valid_to TEXT,
+                is_current INTEGER DEFAULT 1,
+                evidence_url TEXT,
+                evidence_json TEXT,
+                observed_at TEXT NOT NULL,
+                last_seen_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                source_record_id INTEGER,
+                FOREIGN KEY(owned_company_id) REFERENCES companies(company_id),
+                FOREIGN KEY(owner_person_id) REFERENCES people(person_id),
+                FOREIGN KEY(owner_company_id) REFERENCES companies(company_id),
+                FOREIGN KEY(source_record_id) REFERENCES source_records(source_record_id),
+                CHECK(owner_person_id IS NULL OR owner_company_id IS NULL)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_company_ownership_current_source
+                ON company_ownership(
+                    owned_company_id,
+                    source,
+                    COALESCE(source_shareholder_id, ''),
+                    COALESCE(source_share_id, ''),
+                    COALESCE(owner_raw_name, ''),
+                    COALESCE(owner_raw_identifier, ''),
+                    COALESCE(owner_type, '')
+                )
+                WHERE is_current = 1 AND valid_to IS NULL;
+
+            CREATE INDEX IF NOT EXISTS ix_company_ownership_owned_current
+                ON company_ownership(owned_company_id, is_current);
+
+            CREATE INDEX IF NOT EXISTS ix_company_ownership_owner_person
+                ON company_ownership(owner_person_id);
+
+            CREATE INDEX IF NOT EXISTS ix_company_ownership_owner_company
+                ON company_ownership(owner_company_id);
 
             CREATE TABLE IF NOT EXISTS source_budgets (
                 source TEXT PRIMARY KEY,
@@ -514,6 +585,15 @@ def initialize_database(db_path: Path | str = DB_PATH) -> None:
                 WHERE status IN ('PENDING', 'RUNNING');
             """
         )
+        for statement in (
+            "ALTER TABLE company_person_roles ADD COLUMN source_role_id TEXT",
+            "ALTER TABLE company_person_roles ADD COLUMN evidence_json TEXT",
+        ):
+            try:
+                conn.execute(statement)
+            except sqlite3.OperationalError as exc:
+                if "duplicate column name" not in str(exc).lower():
+                    raise
 
 
 def json_dumps(value: Any) -> str:
@@ -605,17 +685,29 @@ def upsert_source_record(
     payload_hash = raw_hash(raw)
 
     with get_connection(db_path) as conn:
-        existing = conn.execute(
-            """
-            SELECT source_record_id, company_id
-            FROM source_records
-            WHERE source = ?
-              AND source_file = ?
-              AND source_row = ?
-              AND raw_hash = ?
-            """,
-            (source, source_file, source_row, payload_hash),
-        ).fetchone()
+        if source_file is None and source_row is None and external_id is not None:
+            existing = conn.execute(
+                """
+                SELECT source_record_id, company_id
+                FROM source_records
+                WHERE source = ?
+                  AND external_id = ?
+                  AND raw_hash = ?
+                """,
+                (source, external_id, payload_hash),
+            ).fetchone()
+        else:
+            existing = conn.execute(
+                """
+                SELECT source_record_id, company_id
+                FROM source_records
+                WHERE source = ?
+                  AND source_file = ?
+                  AND source_row = ?
+                  AND raw_hash = ?
+                """,
+                (source, source_file, source_row, payload_hash),
+            ).fetchone()
 
         if existing is not None:
             existing_company_id = (
@@ -1670,9 +1762,14 @@ def add_company_person_role(
     role_type: str,
     title: str | None = None,
     ownership_pct: float | None = None,
+    source_role_id: str | None = None,
     source: str | None = None,
     observed_at: str | None = None,
+    valid_from: str | None = None,
+    valid_to: str | None = None,
+    is_current: bool = True,
     confidence: float | None = None,
+    evidence: dict[str, Any] | None = None,
     source_record_id: int | None = None,
     db_path: Path | str = DB_PATH,
 ) -> CompanyPersonRoleResult:
@@ -1687,18 +1784,34 @@ def add_company_person_role(
     observed = observed_at or now
 
     with get_connection(db_path) as conn:
-        existing = conn.execute(
-            """
-            SELECT company_person_role_id
-            FROM company_person_roles
-            WHERE company_person_id = ?
-              AND role_type = ?
-              AND COALESCE(title, '') = COALESCE(?, '')
-              AND is_current = 1
-              AND valid_to IS NULL
-            """,
-            (company_person_id, role, title_text),
-        ).fetchone()
+        existing = None
+        if source_role_id:
+            existing = conn.execute(
+                """
+                SELECT company_person_role_id
+                FROM company_person_roles
+                WHERE company_person_id = ?
+                  AND source = ?
+                  AND source_role_id = ?
+                  AND is_current = 1
+                  AND valid_to IS NULL
+                """,
+                (company_person_id, source, source_role_id),
+            ).fetchone()
+
+        if existing is None:
+            existing = conn.execute(
+                """
+                SELECT company_person_role_id
+                FROM company_person_roles
+                WHERE company_person_id = ?
+                  AND role_type = ?
+                  AND COALESCE(title, '') = COALESCE(?, '')
+                  AND is_current = 1
+                  AND valid_to IS NULL
+                """,
+                (company_person_id, role, title_text),
+            ).fetchone()
 
         if existing is not None:
             role_id = int(existing["company_person_role_id"])
@@ -1706,20 +1819,30 @@ def add_company_person_role(
                 """
                 UPDATE company_person_roles
                 SET ownership_pct = COALESCE(?, ownership_pct),
+                    source_role_id = COALESCE(?, source_role_id),
+                    valid_from = COALESCE(?, valid_from),
+                    valid_to = COALESCE(?, valid_to),
+                    is_current = ?,
                     source = COALESCE(?, source),
                     observed_at = COALESCE(observed_at, ?),
                     last_seen_at = ?,
                     confidence = COALESCE(?, confidence),
+                    evidence_json = COALESCE(?, evidence_json),
                     source_record_id = COALESCE(?, source_record_id),
                     updated_at = ?
                 WHERE company_person_role_id = ?
                 """,
                 (
                     ownership_pct,
+                    source_role_id,
+                    valid_from,
+                    valid_to,
+                    int(is_current),
                     source,
                     observed,
                     observed,
                     confidence,
+                    json_dumps(evidence) if evidence is not None else None,
                     source_record_id,
                     now,
                     role_id,
@@ -1737,27 +1860,35 @@ def add_company_person_role(
                 role_type,
                 title,
                 ownership_pct,
+                source_role_id,
                 is_current,
+                valid_from,
+                valid_to,
                 source,
                 observed_at,
                 last_seen_at,
                 confidence,
+                evidence_json,
                 source_record_id,
                 created_at,
                 updated_at
             )
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 company_person_id,
                 role,
                 title_text,
                 ownership_pct,
-                1,
+                source_role_id,
+                int(is_current),
+                valid_from,
+                valid_to,
                 source,
                 observed,
                 observed,
                 confidence,
+                json_dumps(evidence) if evidence is not None else None,
                 source_record_id,
                 now,
                 now,
@@ -1765,5 +1896,159 @@ def add_company_person_role(
         )
         return CompanyPersonRoleResult(
             company_person_role_id=int(cursor.lastrowid),
+            created=True,
+        )
+
+
+def add_company_ownership(
+    *,
+    owned_company_id: int,
+    source: str,
+    source_shareholder_id: str | None = None,
+    source_share_id: str | None = None,
+    owner_person_id: int | None = None,
+    owner_company_id: int | None = None,
+    owner_raw_name: str | None = None,
+    owner_raw_identifier: str | None = None,
+    owner_type: str | None = None,
+    share_raw: str | None = None,
+    share_percent: float | None = None,
+    nominal_value_raw: str | None = None,
+    valid_from: str | None = None,
+    valid_to: str | None = None,
+    is_current: bool = True,
+    evidence_url: str | None = None,
+    evidence: dict[str, Any] | None = None,
+    observed_at: str | None = None,
+    source_record_id: int | None = None,
+    db_path: Path | str = DB_PATH,
+) -> CompanyOwnershipResult:
+    initialize_database(db_path)
+
+    if owner_person_id is not None and owner_company_id is not None:
+        raise ValueError("Only one owner reference can be set")
+
+    now = utc_now()
+    observed = observed_at or now
+    evidence_json = json_dumps(evidence) if evidence is not None else None
+
+    with get_connection(db_path) as conn:
+        existing = conn.execute(
+            """
+            SELECT id
+            FROM company_ownership
+            WHERE owned_company_id = ?
+              AND source = ?
+              AND COALESCE(source_shareholder_id, '') = COALESCE(?, '')
+              AND COALESCE(source_share_id, '') = COALESCE(?, '')
+              AND COALESCE(owner_raw_name, '') = COALESCE(?, '')
+              AND COALESCE(owner_raw_identifier, '') = COALESCE(?, '')
+              AND COALESCE(owner_type, '') = COALESCE(?, '')
+              AND is_current = 1
+              AND valid_to IS NULL
+            """,
+            (
+                owned_company_id,
+                source,
+                source_shareholder_id,
+                source_share_id,
+                owner_raw_name,
+                owner_raw_identifier,
+                owner_type,
+            ),
+        ).fetchone()
+
+        if existing is not None:
+            ownership_id = int(existing["id"])
+            conn.execute(
+                """
+                UPDATE company_ownership
+                SET owner_person_id = COALESCE(?, owner_person_id),
+                    owner_company_id = COALESCE(?, owner_company_id),
+                    share_raw = COALESCE(?, share_raw),
+                    share_percent = COALESCE(?, share_percent),
+                    nominal_value_raw = COALESCE(?, nominal_value_raw),
+                    valid_from = COALESCE(?, valid_from),
+                    evidence_url = COALESCE(?, evidence_url),
+                    evidence_json = COALESCE(?, evidence_json),
+                    observed_at = COALESCE(observed_at, ?),
+                    last_seen_at = ?,
+                    source_record_id = COALESCE(?, source_record_id),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    owner_person_id,
+                    owner_company_id,
+                    share_raw,
+                    share_percent,
+                    nominal_value_raw,
+                    valid_from,
+                    evidence_url,
+                    evidence_json,
+                    observed,
+                    observed,
+                    source_record_id,
+                    now,
+                    ownership_id,
+                ),
+            )
+            return CompanyOwnershipResult(ownership_id=ownership_id, created=False)
+
+        cursor = conn.execute(
+            """
+            INSERT INTO company_ownership(
+                owned_company_id,
+                owner_person_id,
+                owner_company_id,
+                source,
+                source_shareholder_id,
+                source_share_id,
+                owner_raw_name,
+                owner_raw_identifier,
+                owner_type,
+                share_raw,
+                share_percent,
+                nominal_value_raw,
+                valid_from,
+                valid_to,
+                is_current,
+                evidence_url,
+                evidence_json,
+                observed_at,
+                last_seen_at,
+                created_at,
+                updated_at,
+                source_record_id
+            )
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                owned_company_id,
+                owner_person_id,
+                owner_company_id,
+                source,
+                source_shareholder_id,
+                source_share_id,
+                owner_raw_name,
+                owner_raw_identifier,
+                owner_type,
+                share_raw,
+                share_percent,
+                nominal_value_raw,
+                valid_from,
+                valid_to,
+                int(is_current),
+                evidence_url,
+                evidence_json,
+                observed,
+                observed,
+                now,
+                now,
+                source_record_id,
+            ),
+        )
+        return CompanyOwnershipResult(
+            ownership_id=int(cursor.lastrowid),
             created=True,
         )

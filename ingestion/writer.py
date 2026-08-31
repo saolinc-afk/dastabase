@@ -7,10 +7,12 @@ from typing import Any
 from database_v2 import (
     DB_PATH,
     IdentityConflictError,
+    add_company_ownership,
     add_company_person_role,
     get_connection,
     initialize_database,
     json_dumps,
+    upsert_source_record,
     resolve_or_create_company,
     resolve_or_create_person,
     link_person_to_company,
@@ -109,6 +111,32 @@ def _find_existing_value_observation(
     return int(row["observation_id"]) if row is not None else None
 
 
+def _find_person_id_by_source_role(
+    conn: sqlite3.Connection,
+    *,
+    company_id: int,
+    source: str,
+    source_role_id: str,
+) -> int | None:
+    row = conn.execute(
+        """
+        SELECT cp.person_id
+        FROM company_person_roles cpr
+        JOIN company_people cp
+          ON cp.company_person_id = cpr.company_person_id
+        WHERE cp.company_id = ?
+          AND cpr.source = ?
+          AND cpr.source_role_id = ?
+          AND cpr.is_current = 1
+          AND cpr.valid_to IS NULL
+        LIMIT 1
+        """,
+        (company_id, source, source_role_id),
+    ).fetchone()
+
+    return int(row["person_id"]) if row is not None else None
+
+
 def _insert_observation(
     conn: sqlite3.Connection,
     *,
@@ -116,13 +144,15 @@ def _insert_observation(
     company_id: int,
     fact: FactRecord,
     collected_at: str,
+    source_record_id: int | None = None,
 ) -> tuple[int, bool]:
     value_columns = _typed_value(fact.value)
+    effective_source_record_id = source_record_id or record.source_record_id
 
-    if record.source_record_id is not None:
+    if effective_source_record_id is not None:
         existing_id = _find_existing_source_record_observation(
             conn,
-            source_record_id=record.source_record_id,
+            source_record_id=effective_source_record_id,
             fact_key=fact.fact_key,
             value_year=fact.value_year,
         )
@@ -165,7 +195,7 @@ def _insert_observation(
         (
             company_id,
             record.job_id,
-            record.source_record_id,
+            effective_source_record_id,
             fact.fact_key,
             value_columns.get("value_text"),
             value_columns.get("value_number"),
@@ -424,6 +454,22 @@ def ingest_company(
     facts_written = 0
     people_linked = 0
     roles_written = 0
+    ownership_written = 0
+    source_record_id = record.source_record_id
+
+    if record.raw_data is not None and source_record_id is None:
+        source_record = upsert_source_record(
+            job_id=record.job_id,
+            company_id=resolved.company_id,
+            source=record.source,
+            source_file=None,
+            source_row=None,
+            external_id=record.external_id,
+            raw=record.raw_data,
+            collected_at=observed_at,
+            db_path=db_path,
+        )
+        source_record_id = source_record.source_record_id
 
     with get_connection(db_path) as conn:
         fields, field_warnings = _fill_company_current_fields(
@@ -459,6 +505,7 @@ def ingest_company(
                 company_id=resolved.company_id,
                 fact=fact,
                 collected_at=observed_at,
+                source_record_id=source_record_id,
             )
             _upsert_current_fact(
                 conn,
@@ -472,21 +519,37 @@ def ingest_company(
                 facts_written += 1
 
     for person in record.people:
-        person_result = resolve_or_create_person(
-            first_name=person.first_name,
-            last_name=person.last_name,
-            full_name=person.full_name,
-            email=person.email,
-            phone=person.phone,
-            linkedin_url=person.linkedin_url,
-            db_path=db_path,
-        )
+        existing_person_id = None
+        role_source_ids = [role.source_role_id for role in person.roles if role.source_role_id]
+        if role_source_ids:
+            with get_connection(db_path) as conn:
+                existing_person_id = _find_person_id_by_source_role(
+                    conn,
+                    company_id=resolved.company_id,
+                    source=record.source,
+                    source_role_id=role_source_ids[0],
+                )
+
+        if existing_person_id is None:
+            person_result = resolve_or_create_person(
+                first_name=person.first_name,
+                last_name=person.last_name,
+                full_name=person.full_name,
+                email=person.email,
+                phone=person.phone,
+                linkedin_url=person.linkedin_url,
+                db_path=db_path,
+            )
+            person_id = person_result.person_id
+        else:
+            person_id = existing_person_id
+
         link_result = link_person_to_company(
             company_id=resolved.company_id,
-            person_id=person_result.person_id,
+            person_id=person_id,
             source=record.source,
             observed_at=observed_at,
-            source_record_id=record.source_record_id,
+            source_record_id=source_record_id,
             db_path=db_path,
         )
         if link_result.created:
@@ -498,14 +561,45 @@ def ingest_company(
                 role_type=role.role_type,
                 title=role.title,
                 ownership_pct=role.ownership_pct,
+                source_role_id=role.source_role_id,
                 source=record.source,
                 observed_at=role.observed_at or observed_at,
+                valid_from=role.valid_from,
+                valid_to=role.valid_to,
+                is_current=role.is_current,
                 confidence=role.confidence,
-                source_record_id=record.source_record_id,
+                evidence=role.evidence,
+                source_record_id=source_record_id,
                 db_path=db_path,
             )
             if role_result.created:
                 roles_written += 1
+
+    for ownership in record.ownership:
+        ownership_result = add_company_ownership(
+            owned_company_id=resolved.company_id,
+            source=ownership.source,
+            source_shareholder_id=ownership.source_shareholder_id,
+            source_share_id=ownership.source_share_id,
+            owner_person_id=ownership.owner_person_id,
+            owner_company_id=ownership.owner_company_id,
+            owner_raw_name=ownership.owner_raw_name,
+            owner_raw_identifier=ownership.owner_raw_identifier,
+            owner_type=ownership.owner_type,
+            share_raw=ownership.share_raw,
+            share_percent=ownership.share_percent,
+            nominal_value_raw=ownership.nominal_value_raw,
+            valid_from=ownership.valid_from,
+            valid_to=ownership.valid_to,
+            is_current=ownership.is_current,
+            evidence_url=ownership.evidence_url,
+            evidence=ownership.evidence,
+            observed_at=ownership.observed_at or observed_at,
+            source_record_id=source_record_id,
+            db_path=db_path,
+        )
+        if ownership_result.created:
+            ownership_written += 1
 
     return IngestCompanyResult(
         company_id=resolved.company_id,
@@ -515,5 +609,6 @@ def ingest_company(
         facts_written=facts_written,
         people_linked=people_linked,
         roles_written=roles_written,
+        ownership_written=ownership_written,
         warnings=tuple(warnings),
     )

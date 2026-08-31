@@ -26,6 +26,8 @@ class PersonRoleRecord:
     valid_to: str | None = None
     confidence: float | None = None
     observed_at: str | None = None
+    source_role_id: str | None = None
+    evidence: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,27 @@ class PersonRecord:
     phone: str | None = None
     linkedin_url: str | None = None
     roles: list[PersonRoleRecord] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class OwnershipRecord:
+    source: str
+    source_shareholder_id: str | None = None
+    source_share_id: str | None = None
+    owner_person_id: int | None = None
+    owner_company_id: int | None = None
+    owner_raw_name: str | None = None
+    owner_raw_identifier: str | None = None
+    owner_type: str | None = None
+    share_raw: str | None = None
+    share_percent: float | None = None
+    nominal_value_raw: str | None = None
+    valid_from: str | None = None
+    valid_to: str | None = None
+    is_current: bool = True
+    evidence_url: str | None = None
+    evidence: Any | None = None
+    observed_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,8 +81,10 @@ class CompanyRecord:
     verified_at: str | None = None
     source_record_id: int | None = None
     job_id: int | None = None
+    raw_data: dict[str, Any] | None = None
     facts: list[FactRecord] = field(default_factory=list)
     people: list[PersonRecord] = field(default_factory=list)
+    ownership: list[OwnershipRecord] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -71,5 +96,6 @@ class IngestCompanyResult:
     facts_written: int = 0
     people_linked: int = 0
     roles_written: int = 0
+    ownership_written: int = 0
     conflicts: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()

@@ -79,6 +79,8 @@ class WorkerRunner:
             "warnings": result.warnings,
             "metadata": result.metadata,
         }
+        if "page_diagnostics" in result.metadata:
+            result_payload["page_diagnostics"] = result.metadata["page_diagnostics"]
         ingest_results: list[dict[str, Any]] = []
 
         for company_record in result.company_records:
@@ -92,6 +94,7 @@ class WorkerRunner:
                     "facts_written": ingest_result.facts_written,
                     "people_linked": ingest_result.people_linked,
                     "roles_written": ingest_result.roles_written,
+                    "ownership_written": ingest_result.ownership_written,
                     "conflicts": list(ingest_result.conflicts),
                     "warnings": list(ingest_result.warnings),
                 }
@@ -117,6 +120,17 @@ class WorkerRunner:
             result_payload["person_ids"] = person_ids
 
         if result.status == AdapterStatus.SUCCESS:
+            if any(item["status"] == "IDENTITY_CONFLICT" for item in ingest_results):
+                update_enrichment_task(
+                    task_id=task.task_id,
+                    status="REVIEW_REQUIRED",
+                    result=result_payload,
+                    error_type="IDENTITY_CONFLICT",
+                    error_message="Ingestion detected an identity conflict",
+                    db_path=self.db_path,
+                )
+                return
+
             update_enrichment_task(
                 task_id=task.task_id,
                 status="DONE",
