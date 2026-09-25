@@ -1,244 +1,93 @@
-"""
-----------------------------------------------------
-Dastabase
-Search Engine
-Release 2.0
-----------------------------------------------------
-"""
-
+"""Search fallback for the existing guess-first website discovery workflow."""
+import re
 from ddgs import DDGS
-from urllib.parse import urlparse
+from discovery.domain_generator import normalize_domain, normalize_url
 
 
-# ----------------------------------------------------
-# SETTINGS
-# ----------------------------------------------------
-
-MAX_RESULTS = 10
-
-BLACKLIST = {
-
-    "facebook.com",
-    "linkedin.com",
-    "instagram.com",
-    "youtube.com",
-    "x.com",
-    "twitter.com",
-
-    "ajpes.si",
-    "bizi.si",
-    "gvin.com",
-    "companywall.si",
-
-    "wikipedia.org",
-    "najdi.si",
-
-}
+class SearchInfrastructureStopped(RuntimeError):
+    """Abort this invocation without completing the current company."""
 
 
-# ----------------------------------------------------
-# HELPERS
-# ----------------------------------------------------
-
-def normalize_host(url):
-
-    try:
-
-        host = urlparse(url).netloc.lower()
-
-        if host.startswith("www."):
-
-            host = host[4:]
-
-        return host
-
-    except:
-
-        return ""
+def infrastructure_failure(exc):
+    # DDGS wraps transport errors in DDGSException; inspect the wrapped message.
+    text = f'{type(exc).__name__}: {exc}'.lower()
+    return isinstance(exc, (ConnectionError, TimeoutError)) or any(token in text for token in (
+        'dns error', 'nameresolutionerror', 'failed to resolve', 'nodename nor servname',
+        'name or service not known', 'temporary failure in name resolution',
+        'connecterror', 'connectionerror', 'connection refused', 'connection reset',
+        'no connections available', 'network is unreachable', 'transporterror',
+        'proxyerror', 'sslerror', 'tls handshake', 'timeout', 'timed out',
+    ))
 
 
-def allowed(url):
+class SearchCircuitBreaker:
+    def __init__(self, threshold=10):
+        if threshold < 1:
+            raise ValueError('Search failure threshold must be positive')
+        self.threshold = threshold
+        self.consecutive_failures = 0
 
-    host = normalize_host(url)
+    def success(self):
+        self.consecutive_failures = 0
 
-    if host == "":
-
-        return False
-
-    for blocked in BLACKLIST:
-
-        if host.endswith(blocked):
-
-            return False
-
-    return True
+    def failure(self, exc):
+        if not infrastructure_failure(exc):
+            self.consecutive_failures = 0
+            return
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.threshold:
+            raise SearchInfrastructureStopped(
+                f'{self.consecutive_failures} consecutive search infrastructure failures: {exc}'
+            ) from exc
 
 
-# ----------------------------------------------------
-# SEARCH
-# ----------------------------------------------------
+def base_company_name(name):
+    return re.split(r'\b(?:d\s*\.\s*o\s*\.\s*o\.?|d\s*\.\s*d\.?|s\s*\.\s*p\.?)', name or '', maxsplit=1, flags=re.I)[0].strip(' ,')
 
-def run_query(query):
 
-    print()
+def build_queries(company):
+    base = base_company_name(company['company_name'])
+    location = company.get('municipality') or company.get('address') or 'Slovenija'
+    queries = [f'"{base}" {location}']
+    tax = str(company.get('tax_number') or '').removeprefix('SI')
+    queries.append(f'"{tax}" "{base}"' if tax else f'"{base}" Slovenija kontakt')
+    return queries
 
-    print("SEARCH:", query)
 
+def deduplicate(results):
+    seen, unique = set(), []
+    for item in results:
+        url = normalize_url(item.get('url', ''))
+        if url and url not in seen:
+            seen.add(url)
+            unique.append({**item, 'url': url})
+    return unique
+
+
+def prioritize(results):
+    return sorted(results, key=lambda x: not normalize_domain(x['url']).endswith('.si'))
+
+
+def search_ddg(query, max_results=6):
+    with DDGS(timeout=8) as ddgs:
+        results = ddgs.text(query, max_results=max_results)
+    return [{'url': item.get('href') or item.get('url', ''),
+             'title': item.get('title', ''), 'body': item.get('body', ''),
+             'query': query, 'provider': 'ddgs'} for item in results]
+
+
+def discover_urls(company, stats=None, errors=None, breaker=None):
     results = []
-
-    try:
-
-        with DDGS() as ddgs:
-
-            for r in ddgs.text(
-
-                query,
-
-                max_results=MAX_RESULTS
-
-            ):
-
-                url = r.get("href") or r.get("link") or ""
-
-                if not allowed(url):
-
-                    continue
-
-                results.append({
-
-                    "url": url,
-
-                    "title": r.get("title",""),
-
-                    "snippet": r.get("body",""),
-
-                    "host": normalize_host(url)
-
-                })
-
-    except Exception as e:
-
-        print("Search error:", e)
-
-    return results
-
-
-# ----------------------------------------------------
-# COMPANY SEARCH
-# ----------------------------------------------------
-
-def search_company(company):
-
-    queries = [
-
-        f'"{company["company_name"]}"',
-
-        f'"{company["company_name"]}" Slovenija',
-
-        f'"{company["company_name"]}" {company["municipality"]}',
-
-        f'"{company["company_name"]}" {company["address"]}'
-
-    ]
-
-    all_results = []
-
-    seen = set()
-
-    for query in queries:
-
-        results = run_query(query)
-
-        for r in results:
-
-            if r["host"] in seen:
-
-                continue
-
-            seen.add(r["host"])
-
-            all_results.append(r)
-
-    return all_results
-
-# ----------------------------------------------------
-# DISCOVER URLS
-# ----------------------------------------------------
-
-def discover_urls(company):
-
-    results = search_company(company)
-
-    urls = []
-
-    seen = set()
-
-    for result in results:
-
-        url = result["url"]
-
-        host = result["host"]
-
-        if host in seen:
-            continue
-
-        seen.add(host)
-        urls.append(url)
-
-    return urls
-
-
-# ----------------------------------------------------
-# DISCOVER RESULTS
-# ----------------------------------------------------
-
-def discover_results(company):
-
-    return search_company(company)
-
-
-# ----------------------------------------------------
-# TEST
-# ----------------------------------------------------
-
-if __name__ == "__main__":
-
-    company = {
-
-        "company_name": "SLOMETAL d.o.o.",
-
-        "municipality": "5000 Nova Gorica",
-
-        "address": "Ulica Gradnikove brigade 6",
-
-    }
-
-    results = discover_results(company)
-
-    print()
-    print("=" * 70)
-    print("SEARCH RESULTS")
-    print("=" * 70)
-    print()
-
-    if not results:
-
-        print("No results found.")
-
-    else:
-
-        for i, result in enumerate(results, start=1):
-
-            print(f"{i:2d}. {result['url']}")
-
-            if result["title"]:
-                print(f"    {result['title']}")
-
-            if result["snippet"]:
-                print(f"    {result['snippet'][:120]}")
-
-            print()
-
-    print("=" * 70)
-    print(f"{len(results)} unique domains")
-    print("=" * 70)
+    for query in build_queries(company):
+        if stats is not None:
+            stats['search_calls'] = stats.get('search_calls', 0) + 1
+        try:
+            results.extend(search_ddg(query))
+            if breaker is not None:
+                breaker.success()
+        except Exception as exc:
+            if errors is not None:
+                errors.append(f'Search {query}: {type(exc).__name__}: {exc}')
+            if breaker is not None:
+                breaker.failure(exc)
+    return prioritize(deduplicate(results))

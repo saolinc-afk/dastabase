@@ -126,6 +126,81 @@ def detect_gvin_problem(page) -> str:
     return ""
 
 
+def gvin_search_session_problem(page) -> str:
+    url = page.url.lower()
+
+    if "authenticate" in url or "accounts.bisnode" in url:
+        return f"GVIN redirected to login/authentication: {page.url}"
+
+    if "errorpage.aspx" in url:
+        return f"GVIN error page is open: {page.url}"
+
+    if "gvin.com" not in url or "searchresult.aspx" not in url:
+        return f"GVIN search/results context is not open: {page.url}"
+
+    try:
+        body = page.locator("body").inner_text(timeout=5000).lower()
+    except Exception as exc:
+        return f"Could not read page body: {exc}"
+
+    if "oprostite, prišlo je do napake" in body:
+        return "GVIN error page text is visible: Oprostite, prišlo je do napake"
+
+    if "oprostite, prislo je do napake" in body:
+        return "GVIN error page text is visible: Oprostite, prislo je do napake"
+
+    for marker in RATE_LIMIT_MARKERS:
+        if marker in body:
+            return f"GVIN rate-limit/error marker found: {marker}"
+
+    return ""
+
+
+def is_gvin_error_page(page, problem: str = "") -> bool:
+    url = page.url.lower()
+    problem_text = problem.lower()
+
+    if "errorpage.aspx" in url or "errorpage.aspx" in problem_text:
+        return True
+
+    try:
+        body = page.locator("body").inner_text(timeout=5000).lower()
+    except Exception:
+        return False
+
+    return (
+        "oprostite, prišlo je do napake" in body
+        or "oprostite, prislo je do napake" in body
+    )
+
+
+def restore_gvin_search_context(page, fallback_url: str) -> str:
+    try:
+        page.go_back(wait_until="domcontentloaded", timeout=30000)
+        human_pause(page)
+        problem = gvin_search_session_problem(page)
+
+        if not problem:
+            return ""
+    except Exception as exc:
+        problem = f"Could not go back after GVIN ErrorPage: {exc}"
+
+    if fallback_url:
+        try:
+            page.goto(fallback_url, wait_until="domcontentloaded", timeout=30000)
+            human_pause(page)
+            fallback_problem = gvin_search_session_problem(page)
+
+            if not fallback_problem:
+                return ""
+
+            problem = fallback_problem
+        except Exception as exc:
+            problem = f"Could not restore previous GVIN search results: {exc}"
+
+    return problem
+
+
 def company_input_from_row(row, columns) -> CompanyInput:
     person_col, email_col, phone_col, company_col = columns
 
@@ -642,6 +717,13 @@ def main() -> int:
             print("ERROR: GVIN page not found in open Chrome.")
             return 1
 
+        session_problem = gvin_search_session_problem(page)
+
+        if session_problem:
+            print(f"ERROR: GVIN search session is not ready: {session_problem}")
+            print("Open GVIN, perform one manual search, then rerun.")
+            return 1
+
         v2_recorder = V2EnrichmentRecorder(input_path, len(input_df))
 
         print()
@@ -654,6 +736,7 @@ def main() -> int:
         print()
 
         columns = (person_col, email_col, phone_col, company_col)
+        last_good_search_url = page.url
 
         for index, row in input_df.iterrows():
             row_number = index + 1
@@ -704,6 +787,41 @@ def main() -> int:
                 problem = detect_gvin_problem(page)
 
                 if problem:
+                    if is_gvin_error_page(page, problem):
+                        reason = f"GVIN ErrorPage during search: {page.url}"
+                        result = blank_result("ERROR", reason)
+                        for key, value in result.items():
+                            output_df.at[index, key] = value
+                        save_checkpoint(output_df, output_path)
+                        v2_recorder.record_row(
+                            row_number=row_number,
+                            row=row,
+                            result=result,
+                        )
+                        processed_now += 1
+                        print("GVIN candidates: 0", flush=True)
+                        print(f"Match: ERROR - {reason}", flush=True)
+                        print("✓ saved", flush=True)
+
+                        recovery_problem = restore_gvin_search_context(
+                            page,
+                            last_good_search_url,
+                        )
+
+                        if recovery_problem:
+                            print(
+                                "Stopping because GVIN search context could "
+                                f"not be restored: {recovery_problem}",
+                                flush=True,
+                            )
+                            print(
+                                "Manual GVIN recovery/login is required.",
+                                flush=True,
+                            )
+                            break
+
+                        continue
+
                     result = blank_result("ERROR", problem)
                     for key, value in result.items():
                         output_df.at[index, key] = value
@@ -726,6 +844,7 @@ def main() -> int:
                     page.wait_for_timeout(random.randint(10000, 15000))
                     continue
 
+                last_good_search_url = page.url
                 companies = collect_page(page)
                 print(f"GVIN candidates: {len(companies)}", flush=True)
 

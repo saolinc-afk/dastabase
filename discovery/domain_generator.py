@@ -103,3 +103,47 @@ if __name__ == "__main__":
 
         for d in generate_candidates(company):
             print(d)
+
+# Shared URL handling for the existing discovery stages.
+from urllib.parse import urlsplit, urlunsplit
+import ipaddress
+
+
+def normalize_domain(value):
+    value = str(value or '').strip().lower()
+    if value.startswith('mailto:'):
+        value = value[7:].split('?', 1)[0]
+    if '@' in value and '://' not in value:
+        value = value.rsplit('@', 1)[1]
+    try:
+        host = urlsplit(value if '://' in value else 'https://' + value).hostname or ''
+        host = host.rstrip('.').encode('idna').decode('ascii')
+        return host[4:] if host.startswith('www.') else host
+    except (ValueError, UnicodeError):
+        return ''
+
+
+def normalize_url(value):
+    value = str(value or '').strip()
+    if not value:
+        return ''
+    try:
+        parsed = urlsplit(value if '://' in value else 'https://' + value)
+        if parsed.scheme.lower() not in ('http', 'https') or parsed.username or parsed.password:
+            return ''
+        host = parsed.hostname or ''
+        if not host or '.' not in host or host.endswith('.local') or parsed.port not in (None, 80, 443):
+            return ''
+        try:
+            ipaddress.ip_address(host)
+            return ''  # Company sites must be named public hosts.
+        except ValueError:
+            pass
+        return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or '/', parsed.query, ''))
+    except ValueError:
+        return ''
+
+
+def same_site(url, website):
+    # Only exact host / www aliases, never arbitrary sibling domains.
+    return bool(normalize_domain(url)) and normalize_domain(url) == normalize_domain(website)

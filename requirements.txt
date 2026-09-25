@@ -5,3 +5,7 @@ requests
 beautifulsoup4
 
 lxml
+
+PyYAML
+
+ddgs>=9,<10

@@ -69,6 +69,13 @@ def initialize_database():
         facebook_url TEXT,
         instagram_url TEXT,
         youtube_url TEXT,
+        export_score INTEGER,
+        export_reason TEXT,
+        industry_keywords TEXT,
+        ai_summary TEXT,
+        ai_sales_angle TEXT,
+        company_size TEXT,
+        revenue_per_employee REAL,
         enriched_version INTEGER DEFAULT 1,
         last_enriched TEXT,
         FOREIGN KEY(company_id) REFERENCES companies(id)
@@ -187,3 +194,79 @@ def save_website_intelligence(data):
     ))
     conn.commit()
     conn.close()
+
+def get_companies_with_websites(conn):
+
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            id,
+            company_name,
+            website
+        FROM companies
+        WHERE website IS NOT NULL
+          AND website <> ''
+        ORDER BY id
+    """)
+
+    return cursor.fetchall()
+
+def init_enrichment_tables(conn):
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS website_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            company_id INTEGER UNIQUE,
+            url TEXT,
+            html TEXT,
+            text TEXT,
+            status_code INTEGER,
+            crawled_at TEXT,
+            content_hash TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS company_enrichment (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+            company_id INTEGER UNIQUE,
+
+            website_url TEXT,
+
+            website_title TEXT,
+
+            website_description TEXT,
+
+            languages TEXT,
+
+            export_score INTEGER,
+            export_reason TEXT,
+
+            family_score INTEGER,
+            family_reason TEXT,
+
+            industry_keywords TEXT,
+
+            ai_summary TEXT,
+
+            ai_sales_angle TEXT,
+
+            linkedin TEXT,
+            facebook TEXT,
+            instagram TEXT,
+            youtube TEXT,
+
+            company_size TEXT,
+
+            revenue_per_employee REAL,
+
+            enrichment_version TEXT,
+
+            last_enriched TEXT
+        )
+    """)
+
+    conn.commit()

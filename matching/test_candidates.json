@@ -1,0 +1,16 @@
+{
+  "companies": [
+    {"name": "TORRE, d.o.o.", "domain": "torre.si", "email_domain": "torre.si", "phone": "040 797 486"},
+    {"name": "OKC PFEIFER, d.o.o.", "domain": "okc-pfeifer.si", "email_domain": "okc-pfeifer.si", "phone": "031 355 557"},
+    {"name": "PRODUKT, d.o.o.", "domain": "produkt.si", "email_domain": "produkt.si", "phone": "01 520 04 50"},
+    {"name": "DISTRIBUTIO, d.o.o.", "domain": "distributio.si", "email_domain": "distributio.si", "phone": "031 746 819"},
+    {"name": "CSG, d.o.o.", "domain": "csg.si", "email_domain": "csg.si", "phone": "041 202 632"},
+    {"name": "AAB ARHITEKTURA, d.o.o.", "domain": "aab.archi", "email_domain": "aab.archi", "phone": "031 272 312"},
+    {"name": "HPE, d.o.o.", "domain": "hpe.si", "email_domain": "hpe.si", "phone": "031 670 588"},
+    {"name": "KOMPAS XNET, d.o.o.", "domain": "kompas-xnet.si", "email_domain": "kompas-xnet.si", "phone": "041 745 785"},
+    {"name": "BLACKBLOX, d.o.o.", "domain": "blackblox.si", "email_domain": "blackblox.si", "phone": "01 236 48 80"},
+    {"name": "KOMPAS, d.d.", "domain": "kompas.si", "email_domain": "kompas.si", "phone": "01 123 45 67"},
+    {"name": "XNET SISTEMI, d.o.o.", "domain": "xnet.si", "email_domain": "xnet.si", "phone": "041 111 222"},
+    {"name": "TORRE DESIGN, d.o.o.", "domain": "torredesign.si", "email_domain": "torredesign.si", "phone": "041 999 888"}
+  ]
+}

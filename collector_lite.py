@@ -1,607 +1,382 @@
-# ----------------------------------------------------
-# Dastabase
-# GVIN Lite Collector
-# Release 0.9
-# ----------------------------------------------------
+"""GVIN Lite: collect manually prepared search results only; never open details."""
 
-import random
+import hashlib
+import json
+import logging
+import math
 import re
-from urllib.parse import urlparse, parse_qs
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
+from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 
-from database_lite import (
-    initialize_database,
-    save_company
-)
+from database_lite import IdentityConflict, get_connection, initialize_database, save_company
 
 BASE_URL = "https://www.gvin.com"
 CDP_URL = "http://127.0.0.1:9222"
+ROWS = "li.newsearchIcon"
+VALUES = "div.advanceResultDataDisplaySubjektFix"
+NEXT = '[id$="bamSearch_lnkPagingNext"]'
+LOG_PATH = Path(__file__).resolve().parent / "logs" / "collector_lite.log"
+LOG = logging.getLogger("collector_lite")
 
-POSTBACK_JS = "__doPostBack('ctl00$contentPlaceHolderMain$ctl00$ctl04$bamSearch$ctl21$bamSearch_lnkPagingNext','')"
+# Prefer durable row identifiers over values, which can change independently.
+IDENTITIES_JS = r"""() => Array.from(document.querySelectorAll('li.newsearchIcon')).map(row => {
+    const href = row.querySelector('a[href*="CompanyId="]')?.getAttribute('href') || '';
+    const id = href.match(/CompanyId=(\d+)/);
+    const reg = row.querySelector('.registrationNumber')?.textContent.trim();
+    return id ? 'gvin:' + id[1] : (reg || row.textContent.replace(/\s+/g, ' ').trim());
+})"""
 
-
-# ----------------------------------------------------
-# Helpers
-# ----------------------------------------------------
 
 def human_pause(page):
-
-    r = random.random()
-
-    if r < 0.80:
-        page.wait_for_timeout(random.randint(700, 1300))
-
-    elif r < 0.95:
-        page.wait_for_timeout(random.randint(1800, 3500))
-
-    else:
-        page.wait_for_timeout(random.randint(5000, 9000))
-
-
-def parse_number(value):
-
-    if value is None:
-        return 0.0
-
-    value = value.strip()
-
-    if value == "":
-        return 0.0
-
-    value = value.replace(".", "")
-    value = value.replace(",", ".")
-
-    try:
-        return round(float(value), 2)
-
-    except:
-        return 0.0
+    """Simple pacing between results pages; retained for existing callers."""
+    page.wait_for_timeout(1000)
 
 
 def parse_optional_number(value):
-
-    if value is None:
+    if not value:
         return None
-
-    value = value.strip()
-
-    if value == "":
-        return None
-
-    value = value.replace(".", "")
-    value = value.replace(",", ".")
-
     try:
-        return round(float(value), 2)
-
-    except:
+        number = float(re.sub(r"\s+", "", value).replace(".", "").replace(",", "."))
+        return round(number, 2) if math.isfinite(number) else None
+    except (TypeError, ValueError):
         return None
+
+
+def parse_number(value):
+    return parse_optional_number(value) or 0.0
 
 
 def municipality_from_address(address):
-
-    m = re.search(
-        r"(\d{4}\s+[A-Za-zČŠŽčšž\- ]+)$",
-        address
-    )
-
-    if m:
-        return m.group(1).strip()
-
-    return ""
+    match = re.search(r"(\d{4}\s+[A-Za-zČŠŽčšžĆćĐđ\- ]+)$", address)
+    return match.group(1).strip() if match else ""
 
 
 def company_id_from_href(href):
-
-    if not href:
-        return ""
-
-    m = re.search(r"CompanyId=(\d+)", href)
-    if m:
-        return m.group(1)
-    return ""
+    match = re.search(r"CompanyId=(\d+)", href or "")
+    return match.group(1) if match else ""
 
 
 def detail_url_from_href(href):
-
-    if not href:
-        return ""
-
-    href = href.strip()
-
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-
-    if href.startswith("/"):
-        return BASE_URL + href
-
-    return BASE_URL + "/" + href
-
-
-def normalize_domain(value):
-
-    if not value:
-        return ""
-
-    value = value.strip()
-
-    if value.lower().startswith("mailto:"):
-        value = value[7:]
-
-    if "@" in value:
-        value = value.rsplit("@", 1)[1]
-
-    if not value.startswith(("http://", "https://")):
-        value = "http://" + value
-
-    host = urlparse(value).netloc.lower()
-
-    if host.startswith("www."):
-        host = host[4:]
-
-    return host.strip().rstrip(".")
-
-
-def normalize_email(value):
-
-    if not value:
-        return ""
-
-    value = value.strip()
-
-    if value.lower().startswith("mailto:"):
-        value = value[7:]
-
-    value = value.split("?", 1)[0]
-
-    return value.strip().lower()
+    # Stored provenance only. No caller navigates to this URL.
+    return urljoin(BASE_URL, href.strip()) if href else ""
 
 
 def find_gvin_page(context):
-
     for page in context.pages:
-
-        if "gvin" in page.url.lower():
+        host = (urlparse(page.url).hostname or "").lower()
+        if host == "gvin.com" or host.endswith(".gvin.com"):
             return page
-
     return None
 
-# ----------------------------------------------------
-# Parse one company row
-# ----------------------------------------------------
 
-def parse_company_row(item):
-
-    company = {}
-
-    # -----------------------------
-    # Company name
-    # -----------------------------
-
-    company["company_name"] = (
-        item.locator("h3 a").first
-        .inner_text()
-        .strip()
-    )
-
-    # -----------------------------
-    # Address
-    # -----------------------------
-
-    address = (
-        item.locator("div.address")
-        .inner_text()
-        .replace("\n", " ")
-        .replace("\xa0", " ")
-        .strip()
-    )
-
-    address = " ".join(address.split())
-
-    company["address"] = address
-    company["municipality"] = municipality_from_address(address)
-
-    # -----------------------------
-    # Registration number
-    # -----------------------------
-
-    reg = (
-        item.locator("span.registrationNumber")
-        .inner_text()
-    )
-
-    reg = (
-        reg.replace("Matična:", "")
-        .replace("\xa0", "")
-        .strip()
-    )
-
-    company["registration_number"] = reg
-
-    # -----------------------------
-    # Tax number
-    # -----------------------------
-
-    tax = (
-        item.locator("span.taxNumber")
-        .inner_text()
-    )
-
-    tax = (
-        tax.replace("Davčna:", "")
-        .replace("\xa0", "")
-        .strip()
-    )
-
-    company["tax_number"] = tax
-
-    # -----------------------------
-    # Financial values
-    # -----------------------------
-
-    values = item.locator(
-        "div.advanceResultDataDisplaySubjektFix"
-    )
-
-    company["revenue_2025"] = None
-    company["profit_2025"] = None
-    company["employees_2025"] = None
-
-    if values.count() >= 3:
-
-        company["revenue_2025"] = parse_optional_number(
-            values.nth(0).inner_text()
-        )
-
-        company["profit_2025"] = parse_optional_number(
-            values.nth(1).inner_text()
-        )
-
-        company["employees_2025"] = parse_optional_number(
-            values.nth(2).inner_text()
-        )
-
-    # -----------------------------
-    # Company ID
-    # -----------------------------
-
-    href = (
-        item.locator('a[href*="CompanyId="]').first
-        .get_attribute("href")
-    )
-
-    company["gvin_detail_url"] = detail_url_from_href(href)
-
-    company["gvin_company_id"] = (
-        company_id_from_href(href)
-    )
-
-    company["domain"] = ""
-    company["email"] = ""
-    company["email_domain"] = ""
-
-    return company
+def financial_metric(label):
+    text = label.casefold()
+    found = []
+    if re.search(r"prihod|celotni prih|revenue", text):
+        found.append("revenue")
+    if re.search(r"dobič|dobic|profit|poslovni izid|čisti poslov", text):
+        found.append("profit")
+    if re.search(r"zaposlen|employees|povprečno št", text):
+        found.append("employees")
+    if text.strip() in ("sredstva", "assets"):
+        found.append("assets")
+    if text.strip() in ("kapital", "capital"):
+        found.append("capital")
+    return found[0] if len(found) == 1 else None
 
 
-def financial_value_2025(page, row_prefix):
+def financial_fields(soup, headers=()):
+    """Map labeled metrics; financial year 2025 is supplied by the operator."""
+    cells = soup.select(VALUES)
+    entries = []
+    result = {f"{metric}_2025": None for metric in ("revenue", "profit", "employees", "assets", "capital")}
+    use_headers = len(headers) == len(cells) and len(cells) > 0
+    for index, cell in enumerate(cells):
+        raw = cell.get_text(" ", strip=True)
+        contexts = [cell.get(attr, "") for attr in ("title", "aria-label", "data-label")]
+        # Some result layouts wrap a label and one value together.
+        parent = cell.parent
+        if parent and parent.name not in ("li", "body", "html", "[document]") and len(parent.select(VALUES)) == 1:
+            wrapper = BeautifulSoup(str(parent), "html.parser")
+            for value in wrapper.select(VALUES):
+                value.decompose()
+            contexts.append(wrapper.get_text(" ", strip=True))
+        if use_headers:
+            contexts.append(headers[index])
+        # A value cell may itself contain "Revenue 2025: 1.234,00".
+        if financial_metric(raw):
+            contexts.append(raw)
+        label = " | ".join(text for text in contexts if text)
+        metric = financial_metric(label)
+        value = parse_optional_number(raw)
+        if value is None and ":" in raw:
+            value = parse_optional_number(raw.rsplit(":", 1)[1])
+        entries.append({"raw": raw, "label": label, "metric": metric, "year": 2025, "value": value})
 
-    table = page.locator(
-        "#ctl00_MainContent_ctl04_bamCompanyFinancialData "
-        "table.datatable.data-table-fix"
-    )
+    errors = bool(headers) and len(headers) != len(cells)
+    recognized = 0
+    for entry in entries:
+        metric = entry["metric"]
+        if not metric:
+            continue
+        recognized += 1
+        unique = sum(e["metric"] == metric for e in entries) == 1
+        if not unique:
+            errors = True
+        elif entry["value"] is not None:
+            result[f"{metric}_2025"] = entry["value"]
+        elif entry["raw"].strip().lower() not in ("", "-", "—", "n/a", "ni podatka"):
+            errors = True
+    if cells and not recognized:
+        errors = True
+    missing = any(result[f"{metric}_2025"] is None for metric in ("revenue", "profit", "employees"))
+    missing = missing or any(e["metric"] and e["value"] is None for e in entries)
+    result["financial_status"] = "PARSE_ERROR" if errors else "PARTIAL" if missing else "OK"
+    result["financial_raw_json"] = json.dumps({
+        "configured_year": 2025, "year_source": "user_configuration",
+        "cells": entries, "headers": list(headers),
+    }, ensure_ascii=False)
+    return result
 
-    if table.count() == 0:
+
+def results_financial_headers(page):
+    # Keep every heading in order, including unknown metrics, to avoid shifting
+    # values into adjacent columns. These selectors were inspected in live GVIN.
+    return page.locator(".advenceResultDisplaySubjektFinHeader").evaluate_all("""nodes => nodes
+        .filter(n => n.getClientRects().length)
+        .map(n => [n.innerText, n.getAttribute('title'), n.getAttribute('aria-label')]
+            .filter(Boolean).join(' '))""")
+
+
+def expected_result_count(page):
+    labels = page.locator('[id$="_lblPageStats"]:visible').all_inner_texts()
+    if len(labels) != 1:
         return None
-
-    raw_value = table.first.evaluate(
-        """
-        (table, rowPrefix) => {
-          const normalize = (value) => (
-            value || ''
-          ).replace(/\\s+/g, ' ').trim().toLowerCase();
-
-          const rows = Array.from(table.querySelectorAll('tr'));
-
-          if (!rows.length) {
-            return null;
-          }
-
-          const headerCells = Array.from(rows[0].children);
-          const yearIndex = headerCells.findIndex(
-            (cell) => normalize(cell.innerText) === '2025'
-          );
-
-          if (yearIndex < 0) {
-            return null;
-          }
-
-          const wantedPrefix = normalize(rowPrefix);
-
-          for (const row of rows.slice(1)) {
-            const cells = Array.from(row.children);
-
-            if (!cells.length) {
-              continue;
-            }
-
-            const label = normalize(cells[0].innerText);
-
-            if (label.startsWith(wantedPrefix)) {
-              const valueCell = cells[yearIndex];
-              return valueCell ? valueCell.innerText.trim() : null;
-            }
-          }
-
-          return null;
-        }
-        """,
-        row_prefix,
-    )
-
-    return parse_optional_number(raw_value)
+    text = labels[0].strip()
+    # Accept integers and conventional thousands separators, not page ranges.
+    if not re.fullmatch(r"(?:[0-9]+|[0-9]{1,3}(?:[.\s][0-9]{3})+)", text):
+        return None
+    return int(re.sub(r"[.\s]", "", text))
 
 
-def enrich_company_from_detail(page, company):
+def parse_company_row(item, headers=()):
+    # A snapshot avoids locator waits for optional fields and row shifts.
+    soup = BeautifulSoup(item if isinstance(item, str) else item.inner_html(), "html.parser")
 
-    detail_url = company.get("gvin_detail_url", "")
+    def text(selector):
+        node = soup.select_one(selector)
+        return " ".join(node.get_text(" ", strip=True).split()) if node else ""
 
-    if not detail_url:
-        return company
-
-    result_url = page.url
-
-    try:
-
-        page.goto(
-            detail_url,
-            wait_until="domcontentloaded"
-        )
-
-        human_pause(page)
-
-        url_link = page.locator(
-            'div.textInfoRight '
-            'div.headerAlignTextContainer:has-text("URL:") '
-            'a.w85Overflow'
-        )
-
-        if url_link.count() > 0:
-
-            raw_url = (
-                url_link.first.get_attribute("href")
-                or url_link.first.inner_text()
-            )
-
-            company["domain"] = normalize_domain(raw_url)
-
-        email_link = page.locator(
-            'div.textInfoRight '
-            'div.headerAlignTextContainer:has-text("E-pošta:") '
-            'a.w75Overflow'
-        )
-
-        if email_link.count() > 0:
-
-            raw_email = (
-                email_link.first.get_attribute("href")
-                or email_link.first.inner_text()
-            )
-
-            company["email"] = normalize_email(raw_email)
-            company["email_domain"] = normalize_domain(
-                company["email"]
-            )
-
-        company["revenue_2025"] = financial_value_2025(
-            page,
-            "Celotni prihodk",
-        )
-        company["employees_2025"] = financial_value_2025(
-            page,
-            "Povprečno števi",
-        )
-
-    except Exception as e:
-
-        print(
-            f"Skipped detail data for "
-            f"{company.get('company_name', '')}: {e}"
-        )
-
-    finally:
-
-        try:
-
-            page.goto(
-                result_url,
-                wait_until="domcontentloaded"
-            )
-
-            human_pause(page)
-
-        except Exception as e:
-
-            print(
-                f"Could not return to results after "
-                f"{company.get('company_name', '')}: {e}"
-            )
-
+    name = text("h3 a")
+    if not name:
+        raise ValueError("Missing company name")
+    address = text("div.address")
+    link = soup.select_one('a[href*="CompanyId="]')
+    href = link.get("href", "") if link else ""
+    company = {
+        "company_name": name,
+        "address": address,
+        "municipality": municipality_from_address(address),
+        "registration_number": re.sub(r"^Matična:\s*", "", text("span.registrationNumber"), flags=re.I),
+        "tax_number": re.sub(r"^Davčna:\s*", "", text("span.taxNumber"), flags=re.I),
+        "gvin_company_id": company_id_from_href(href),
+        "gvin_detail_url": detail_url_from_href(href),
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+        # Compatibility with existing matching callers; never fetched here.
+        "domain": "", "email": "", "email_domain": "",
+    }
+    company.update(financial_fields(soup, headers))
     return company
 
-# ----------------------------------------------------
-# Collect one results page
-# ----------------------------------------------------
 
-def collect_page(page):
+def page_identity(page):
+    return page.evaluate(IDENTITIES_JS)
 
+
+def fingerprint(identities):
+    return hashlib.sha256(json.dumps(sorted(identities), ensure_ascii=False).encode()).hexdigest()[:20]
+
+
+def collect_page(page, stats=None):
+    if stats is None:
+        stats = {}
+    headers = results_financial_headers(page)
+    snapshots = page.locator(ROWS).evaluate_all("nodes => nodes.map(n => n.outerHTML)")
+    stats.update(rows=len(snapshots), parsed=0, inserted=0, updated=0, failed=0)
     companies = []
-
-    rows = page.locator("li.newsearchIcon")
-
-    if rows.count() == 0:
-        print("No companies found.")
-        return []
-
-    print(f"Found {rows.count()} companies")
-
-    for i in range(rows.count()):
-
+    for index, html in enumerate(snapshots, 1):
         try:
-
-            company = parse_company_row(
-                rows.nth(i)
-            )
-
-            company = enrich_company_from_detail(
-                page,
-                company
-            )
-
+            company = parse_company_row(html, headers)
             companies.append(company)
-
-            print(
-                f"✓ {company['company_name']}"
-            )
-
-        except Exception as e:
-
-            print(
-                f"Skipped company: {e}"
-            )
-
+            stats["parsed"] += 1
+            if company["financial_status"] != "OK":
+                LOG.warning("Row %s %s financials=%s; raw values retained: %s", index,
+                            company["company_name"], company["financial_status"], company["financial_raw_json"])
+        except (ValueError, TypeError) as exc:
+            stats["failed"] += 1
+            LOG.error("Row %s parse failed: %s; row=%s", index, exc, html)
     return companies
 
 
-# ----------------------------------------------------
-# Go to next page
-# ----------------------------------------------------
+def access_blocked(page):
+    # Detect visible challenges only; never interact with them.
+    for selector in ('iframe[src*="recaptcha"]', 'iframe[src*="hcaptcha"]', 'input[name*="captcha" i]'):
+        for node in page.locator(selector).all():
+            if node.is_visible():
+                LOG.error("Visible access challenge; stopping for manual action.")
+                return True
+    return False
 
-def next_page(page):
 
+def next_page(page, previous=None, timeout=30000):
+    previous = previous if previous is not None else page_identity(page)
+    if not previous or access_blocked(page):
+        return False
+    controls = page.locator(NEXT)
+    if controls.count() != 1 or not controls.first.is_visible():
+        LOG.info("Next page unavailable; stopping.")
+        return False
+    control = controls.first
+    disabled = control.evaluate("""n => !!n.closest(
+        '[disabled], [aria-disabled="true"], .disabled, .aspNetDisabled') ||
+        !(n.getAttribute('href') || n.getAttribute('onclick'))""")
+    if disabled:
+        LOG.info("Next page disabled/unavailable; stopping.")
+        return False
+    action = (control.get_attribute("href") or "") + (control.get_attribute("onclick") or "")
+    if "__doPostBack" not in action or "bamSearch_lnkPagingNext" not in action:
+        LOG.error("Next control has an unrecognized action; stopping without navigation.")
+        return False
     try:
-
-        page.evaluate(POSTBACK_JS)
-
-        page.wait_for_load_state(
-            "domcontentloaded"
+        # Activate the actual existing ASP.NET Next control, retaining its
+        # __doPostBack behavior without hardcoding a potentially stale control ID.
+        control.click(timeout=timeout)
+        page.wait_for_function(
+            """previous => {
+                const current = (""" + IDENTITIES_JS + """)();
+                return current.length && current[0] !== previous[0] &&
+                    JSON.stringify([...current].sort()) !== JSON.stringify([...previous].sort());
+            }""", arg=previous, timeout=timeout,
         )
-
-        page.wait_for_timeout(
-            random.randint(1000, 2000)
-        )
-
-        return True
-
-    except:
-
+        human_pause(page)
+        current = page_identity(page)
+        if (not current or current[0] == previous[0] or fingerprint(current) == fingerprint(previous)):
+            LOG.error("Pagination did not produce a stable changed results page; stopping.")
+            return False
+        return not access_blocked(page)
+    except Exception as exc:
+        LOG.error("Pagination failed after committed page %s: %s; stopping. Check Chrome before restarting.",
+                  fingerprint(previous), exc)
         return False
 
 
-# ----------------------------------------------------
-# Save one page
-# ----------------------------------------------------
+def process_page(page, page_no=1, collected_ids=None):
+    stats = {}
+    before = page_identity(page)
+    LOG.info("PAGE_START page=%s fingerprint=%s url=%s", page_no, fingerprint(before), page.url)
+    companies = collect_page(page, stats)
+    if page_identity(page) != before:
+        raise RuntimeError("Results changed during parsing; page not saved")
+    committed_ids = set()
+    conn = get_connection()
+    try:
+        with conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for company in companies:
+                conn.execute("SAVEPOINT company_row")
+                try:
+                    action, company_id = save_company(company, conn, return_id=True)
+                    stats[action] += 1
+                    # Count canonical SQLite identities, not duplicate result rows.
+                    committed_ids.add(company_id)
+                    conn.execute("RELEASE company_row")
+                except (IdentityConflict, sqlite3.IntegrityError) as exc:
+                    conn.execute("ROLLBACK TO company_row")
+                    conn.execute("RELEASE company_row")
+                    stats["failed"] += 1
+                    LOG.error("Company %s persistence failed: %s; row=%s", company["company_name"], exc,
+                              json.dumps(company, ensure_ascii=False))
+        if collected_ids is not None:
+            collected_ids.update(committed_ids)
+        # Only report counts as saved after the page transaction commits.
+        LOG.info("PAGE_COMMITTED page=%s fingerprint=%s %s", page_no, fingerprint(before), json.dumps(stats))
+    finally:
+        conn.close()
+    print(f"\nPage {page_no}\n  {stats['rows']} rows found\n  {stats['parsed']} parsed\n"
+          f"  {stats['inserted']} inserted\n  {stats['updated']} updated\n  {stats['failed']} failed", flush=True)
+    return stats["inserted"] + stats["updated"]
 
-def process_page(page):
 
-    companies = collect_page(page)
+def run_collection(page):
+    expected = expected_result_count(page)
+    collected_ids = set()
+    seen, seen_first = set(), set()
+    page_no = 1
+    LOG.info("Expected results: %s; configured financial year: 2025", expected)
+    try:
+        while True:
+            if expected is not None and len(collected_ids) >= expected:
+                message = f"Collection complete: {len(collected_ids)} / {expected} expected companies collected."
+                print(message, flush=True)
+                LOG.info(message)
+                break
+            if access_blocked(page):
+                break
+            identity = page_identity(page)
+            if not identity:
+                LOG.info("No result rows; stopping. Check search/login state manually.")
+                break
+            signature = fingerprint(identity)
+            if signature in seen or identity[0] in seen_first:
+                LOG.warning("Repeated results page %s; stopping.", signature)
+                break
+            process_page(page, page_no, collected_ids)
+            seen.add(signature)
+            seen_first.add(identity[0])
+            if expected is not None and len(collected_ids) >= expected:
+                continue  # Report completion before making another Next request.
+            if not next_page(page, identity):
+                break
+            page_no += 1
+    finally:
+        if expected is not None and len(collected_ids) < expected:
+            message = f"Collection incomplete: {len(collected_ids)} / {expected} expected companies collected."
+            print("WARNING: " + message, flush=True)
+            LOG.warning(message)
+        LOG.info("RUN_END unique_saved=%s expected=%s last_attempted_page=%s",
+                 len(collected_ids), expected, page_no)
+    return collected_ids
 
-    for company in companies:
-
-        save_company(company)
-
-    print(
-        f"Saved {len(companies)} companies."
-    )
-
-    return len(companies)
-
-# ----------------------------------------------------
-# Main
-# ----------------------------------------------------
 
 def main():
-
-    initialize_database()
-
-    with sync_playwright() as p:
-
-        browser = p.chromium.connect_over_cdp(
-            CDP_URL
-        )
-
-        if not browser.contexts:
-            print("No Chrome context found.")
-            return
-
-        context = browser.contexts[0]
-
-        page = find_gvin_page(context)
-
-        if page is None:
-
-            print("GVIN page not found.")
-            return
-
-        input(
-            "Open GVIN search results and press ENTER..."
-        )
-
-        page_no = 1
-        total = 0
-        seen_first_company_ids = set()
-
-        while True:
-
-            print()
-            print("=" * 60)
-            print(f"PAGE {page_no}")
-            print("=" * 60)
-
-            rows = page.locator("li.newsearchIcon")
-
-            if rows.count() == 0:
-                print("No companies found. Finished.")
-                break
-
-            try:
-                href = rows.nth(0).locator("h3 a").first.get_attribute("href")
-                first_company_id = company_id_from_href(href)
-            except Exception:
-                first_company_id = ""
-
-            if first_company_id and first_company_id in seen_first_company_ids:
-                print("Reached last page.")
-                break
-
-            if first_company_id:
-                seen_first_company_ids.add(first_company_id)
-
-            count = process_page(page)
-
-            total += count
-
-            print()
-            print(
-                f"Total companies: {total}"
-            )
-
-            human_pause(page)
-
-            if not next_page(page):
-
-                print()
-                print("Finished.")
-                break
-
-            page_no += 1
-
-    print()
-    print("=" * 60)
-    print(f"Collected {total} companies.")
-    print("=" * 60)
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        handlers=[logging.FileHandler(LOG_PATH, encoding="utf-8"), logging.StreamHandler()])
+    LOG.info("RUN_START result-pages-only; log=%s", LOG_PATH)
+    try:
+        initialize_database()
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(CDP_URL)
+            input("Manually log in and prepare a small GVIN search, then press ENTER...")
+            pages = [page for context in browser.contexts for page in context.pages
+                     if (urlparse(page.url).hostname or "").lower() in ("gvin.com", "www.gvin.com")]
+            candidates = [page for page in pages if page.locator(ROWS).count()]
+            if len(candidates) != 1:
+                LOG.error("Expected one GVIN results tab, found %s. Prepare one results tab and restart.", len(candidates))
+                return
+            page = candidates[0]
+            run_collection(page)
+    except KeyboardInterrupt:
+        LOG.warning("Interrupted. Committed pages are safe; repeat the search to collect the full expected total.")
+    except Exception:
+        LOG.exception("Collection stopped. The current transaction was rolled back if uncommitted.")
+        raise
 
 
 if __name__ == "__main__":
     main()
-    

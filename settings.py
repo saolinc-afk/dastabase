@@ -19,9 +19,6 @@ EXPORT_DIR = BASE_DIR / "exports"
 # Documentation
 DOCS_DIR = BASE_DIR / "docs"
 
-# Current enrichment version
-ENRICHMENT_VERSION = 1
-
 # Request settings
 REQUEST_TIMEOUT = 20
 
@@ -32,3 +29,17 @@ USER_AGENT = (
     "(KHTML, like Gecko) "
     "Chrome/138.0 Safari/537.36"
 )
+# -------------------------
+# Website crawling
+# -------------------------
+
+CACHE_DAYS = 30
+
+# -------------------------
+# Enrichment
+# -------------------------
+
+ENRICHMENT_VERSION = "0.6"
+
+MAX_WEBSITE_SIZE = 2_000_000
+

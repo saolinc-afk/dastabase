@@ -39,3 +39,7 @@ user-data-dir/
 
 # VS Code
 .vscode/
+
+# Local backups and generated exports
+backups/
+exports/
