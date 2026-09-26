@@ -29,19 +29,72 @@ Configuration is through server-side environment variables, never request inputs
 | `MONITOR_LOGS` | repository `logs/` |
 
 For later private access, set `MONITOR_HOST` to Duke's specific Tailscale/private
-interface address. There is no authentication in v1; keep access on trusted
+interface address. There is no authentication; keep access on trusted
 private networking. The included Flask server is for local review; choose a WSGI
 service/reverse proxy separately before deployment. No deployment is performed.
 
 ## API and display
 
-`GET /` serves the page; `GET /api/status` returns `timestamp`, `database`,
-`active`, `recent`, `server`, and `services`. Missing metrics are JSON null and
-render as N/A. Service state `unknown` means not detected or inaccessible, not an
-error. The browser polls 10 seconds after each completed request without reloading;
-one process-wide snapshot is cached for 10 seconds. Failed refreshes retain the
-previous display with a stale-data warning. Snapshots are approximate observations,
-not an atomic transaction spanning the database, processes and reports.
+`GET /` serves the terminal-style console. No development-phase labels remain in
+its headings or metrics. Missing metrics render as N/A; unavailable activity
+fields are omitted. Services report `unknown` when inspection is unavailable.
+
+| Endpoint | Browser polling | Data |
+| --- | --- | --- |
+| `GET /api/live` | 1 second | `timestamp`, `server`, `processes` (PID/start-tick identity and runtime only) |
+| `GET /api/status` | 2.5 seconds | `timestamp`, `database`, `active`, `workload`, `activity`, `recent`, `services` |
+
+System and operations requests run in separate sequential polling loops, so a
+slow database snapshot does not block system refresh. No overlapping requests or
+catch-up bursts occur within either loop. Failed requests preserve the prior
+section with an independent stale-data warning. Recent timestamps use the
+browser's local timezone. A process identity combines PID and Linux start ticks,
+so PID reuse cannot update an older job's runtime.
+
+`active.jobs[]` adds `job_type`, `remaining`, `percent`, `last_completed`, and
+`identity` alongside the existing PID/report/current company/runtime/breaker
+fields. Internal selected/completed ID arrays and raw evidence are never returned.
+`activity.entries[]` contains company ID and, when established, company name,
+website status, verified domain, report reference and `usable_emails`.
+`workload` is a distinct `kind: "observed_workload"` object with
+`persistent_queue: false`, `state` (`active`, `idle`, `unknown`), `active_batches`,
+`batch_remaining`, `database_remaining`, `unprocessed_in_active_batches`,
+`remaining_after_batch`, and `estimate: true`. A future scheduler can add its own
+queue object without changing the meaning of observed workload.
+
+Snapshots are observations, not an atomic transaction across DB, processes and
+files. Database `sampled_at` identifies its actual last collection time.
+
+## Caching and resource budget
+
+- System snapshots cache for 0.8 seconds, operations for 2 seconds, services for
+  30 seconds. Slightly shorter server caches than browser polling prevent boundary
+  timing from accidentally halving the visible refresh rate. Cache locks are
+  independent, and concurrent tabs share one collection per interval.
+- The live endpoint reads only Linux process metadata and system counters: no
+  SQLite, report parsing, Docker, systemctl, or other subprocess calls.
+- Database and WAL inode/size/nanosecond timestamps invalidate the database cache.
+  Unchanged files reuse results; a 30-second fallback recollection prevents
+  indefinite reuse. Failed/racing reads retry on the next operations tick.
+- Attribution results are memoized per company using a SHA-256 fingerprint of all
+  company/email inputs. Only changed inputs are re-evaluated. The memo holds small
+  digests and counts, not evidence blobs; deleted companies are evicted.
+- Report metadata invalidates an LRU of at most 64 projected reports. Unchanged
+  checkpoints are not decoded again. Bulky evidence is discarded while decoding;
+  full report objects are never retained in the cache. Existing 32 MB file limits,
+  64 KiB log tails, newest-500 candidate bound and 20-report display remain.
+- Name/workload lookups are parameterized and limited to IDs in the observed
+  reports; queries are chunked at 400 IDs with a one-second deadline. SQLite
+  aggregation retains its two-second query deadline and short-lived connection.
+- No new dependencies, frameworks, websocket servers, background workers,
+  persistent queues, schema changes or indexes are added.
+
+Local timings on this Mac with the existing 6,561-company database: initial
+attribution collection about 3.8 seconds; a forced database reread with unchanged
+attribution inputs about 0.18 seconds; unchanged warm operations about 10 ms;
+system endpoint below 1 ms. These are local observations, not Duke benchmarks.
+The initial collection can be slower than the polling interval; requests never
+pile up to compensate. Use one WSGI process to avoid duplicating caches.
 
 ## Exact database queries and semantics
 
@@ -59,9 +112,6 @@ the monitor issues no data/schema writes and never changes journal mode.
 SELECT COUNT(*) FROM companies_lite;
 ```
 
-**Phase 1 complete:** N/A. There is no explicit per-company completion marker.
-`collected_at` and `financial_status` are not treated as completion flags.
-
 **Latest website status counts:**
 
 ```sql
@@ -77,7 +127,7 @@ GROUP BY w.status;
 This matches `discovery.runner.load_companies`: only the newest discovery row per
 company counts. Orphan website rows are excluded. VERIFIED, REVIEW, GROUP_REVIEW,
 NOT_FOUND and ERROR are displayed separately; any legacy/other states are counted
-in an additional bucket. **Phase 2 processed** is the sum of all these counts:
+in an additional bucket. **Processed** is the sum of all these counts:
 companies with a discovery row, not necessarily successful or fully email-crawled.
 Retries do not increase this count. **Remaining** is `max(0, total - processed)`.
 **Percentage** is `round(100 * processed / total, 1)`, or zero for an empty database.
@@ -125,7 +175,10 @@ uses `/proc/uptime` and field 22 of `/proc/[pid]/stat`.
 files inside `MONITOR_LOGS`; paths displayed are relative to that directory.
 `selected` is the length of the report's `selected_ids`, not the number of IDs
 requested on argv. `processed` is the count of checkpointed `companies` entries.
-The CLI limit can differ from actual selected count after filtering or resume.
+Remaining is `selected - processed`; percentage is `100 * processed / selected`
+(rounded to one decimal, zero for an empty batch). Duplicate IDs or entries outside
+the selection make a report invalid. The CLI limit can differ from actual selected
+count after filtering or resume.
 Without a report, these values are N/A, not inferred from a database delta.
 
 For a worker's actual stdout/stderr regular file beneath logs, the last 64 KiB is
@@ -134,7 +187,12 @@ read. A runner `Report:` startup line can identify its default report. The lates
 result or breaker line. Pipes and arbitrary files are not read. A truncated startup
 line or unavailable output leaves report/current company unknown. The checkpoint's
 breaker flag or the runner's exact breaker log marker establishes breaker status.
-An uncheckpointed log line is only a last-observed activity, not proof of liveness.
+Current-company data is suppressed if already checkpointed, outside the selection,
+a breaker fired, the log predates the process start, or its startup report conflicts
+with the explicit report flag. Appended logs are scoped after their latest runner
+startup line. A missing log name can be looked up by the explicitly observed ID in
+`companies_lite`; selected IDs alone never imply that a company is currently running.
+An uncheckpointed log line is only last-observed activity, not proof of liveness.
 
 Recent batches scan nested `*.json` files under logs, considering the newest 500
 files and displaying up to 20 valid runner reports. Files larger than 32 MB and
@@ -148,6 +206,46 @@ JSON without `selected_ids` and `companies` arrays are ignored. Timestamps prefe
 - `interrupted`: explicit `interrupted: true`.
 - `incomplete`: no definitive completion/interruption evidence. A missing process
   alone does not prove an interrupted run; it could be hidden by permissions.
+
+## Activity and workload semantics
+
+The activity feed projects the last ten completed `companies` entries in reverse
+checkpoint order from active reports, falling back to the newest recent report
+when active report data is unavailable. Multiple active reports are interleaved;
+no global chronology is claimed. The latest completed entry also supplies each
+job's last-result field. An absent company name is looked up by ID with:
+
+```sql
+SELECT c.id, c.company_name,
+       EXISTS(SELECT 1 FROM website_discovery w WHERE w.company_id=c.id)
+FROM companies_lite c WHERE c.id IN (?, ...);
+```
+
+The actual runner does not record per-company completion times. Neither report
+mtime nor batch `finished_at` is presented as an event time. VERIFIED results may
+show only their official hostname; URL credentials, path, query and fragment are
+never exposed. Other candidates are not labelled official. Activity email counts
+are historical **at processing time**, not the current database total: the report
+must use `phase2-ownership-1`, and every email must have explicit stored
+`evidence.attribution.attributable: true`. Missing/old/malformed proof omits the
+count. Empty proven-version result lists yield zero. No addresses are returned.
+Current database totals still use the full live outreach attribution checks.
+
+Workload calculation:
+
+1. Each observed batch's remaining IDs are `selected_ids - completed_ids`.
+2. `batch_remaining` sums each batch's remaining count (actual work, including
+   retry/overlapping tasks).
+3. Pending IDs are unioned across workers. The lookup above counts those that
+   still have **no** discovery result as `unprocessed_in_active_batches`.
+4. `remaining_after_batch = max(0, database_remaining - unprocessed_in_active_batches)`.
+
+This avoids subtracting retry jobs or overlapping IDs twice. It is an estimate
+assuming all active batches finish and may span slightly different observations.
+Missing reports, missing IDs, inaccessible processes or DB lookups yield N/A rather
+than an invented queue. When process inspection succeeds and no worker exists,
+the UI says "No active batch" and shows unprocessed companies. When process
+inspection is unavailable it explicitly says visibility is unavailable.
 
 ## Server and services
 
@@ -189,9 +287,10 @@ tests require permission to launch local Chromium. Root-level scripts named
 `test_results.py`/`connect_test.py` are interactive live-browser utilities, not the
 offline test suite.
 
-Local validation (2026-09-26): full suite **141 tests passed**, including 10 monitor
-tests. Chromium desktop (1280 px) and phone (390 px) smoke checks passed, including
-API responses, periodic refresh, no document-wide horizontal overflow and no
-JavaScript errors. Native Linux process inspection is tested with a synthetic
-`/proc` tree; Duke's actual processes, service names/permissions and hardware
-metrics have not been tested because deployment is intentionally deferred.
+Local validation (2026-09-26): **151 tests passed**, including **20 monitor tests**.
+`git diff --check` passed. No dependencies were added in this iteration.
+Browser checks include the actual local API plus a browser-only active-worker
+fixture (no runner invoked, no database writes) for changing progress, runtime,
+activity, metric bars, phone layout and independent stale-refresh warnings.
+Native Linux process inspection uses a synthetic `/proc` tree in tests. Duke has
+not been accessed or deployed to as part of this iteration.

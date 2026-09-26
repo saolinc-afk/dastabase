@@ -2,12 +2,14 @@
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dastabase Monitor</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"><script defer src="{{ url_for('static', filename='monitor.js') }}"></script></head>
 <body><header><h1><span class="good">▸</span> DASTABASE <span class="muted">MONITOR</span></h1><span class="tag">READ ONLY / DUKE</span></header>
-<div id="connection" role="status">Connecting…</div>
+<div class="connections"><span id="connection" role="status">Operations: connecting…</span><span id="live-connection" role="status">System: connecting…</span></div>
 <main>
-<section><h2>01 / DATABASE</h2><div id="database"></div><progress id="progress" max="100" value="0" aria-label="Phase 2 coverage"></progress><p class="muted">Processed = a discovery row exists. Includes review, not found and errors; does not imply successful enrichment.</p></section>
-<section><h2>02 / PHASE 2 RESULTS</h2><div id="results"></div><p class="muted">Latest row per company. Emails must pass the current outreach attribution rules.</p></section>
-<section class="wide"><h2>03 / ACTIVE JOBS</h2><div id="active"></div></section>
-<section class="wide"><h2>04 / RECENT BATCHES</h2><div id="recent" class="scroll"></div></section>
-<section><h2>05 / DUKE SERVER</h2><div id="server"></div></section>
-<section><h2>06 / SERVICES</h2><div id="services"></div><p class="muted">Observed container/unit state, not an application health probe.</p></section>
-</main><footer>10s refresh · read-only SQLite · no worker controls</footer></body></html>
+<section><h2>01 / DATABASE</h2><div id="database"></div><progress id="progress" max="100" value="0" aria-label="Processing coverage"></progress><p class="muted">Processed = a discovery result exists; it does not imply successful enrichment.</p></section>
+<section><h2>02 / ENRICHMENT OUTPUT</h2><div id="results"></div><p class="muted">Latest result per company · current outreach attribution rules.</p></section>
+<section><h2>03 / ACTIVE JOBS</h2><div id="active"></div></section>
+<section><h2>04 / WORKLOAD / NEXT</h2><div id="workload"></div><p class="muted">Observed workload, not a persistent job queue. Estimate assumes the active batches finish; retries and overlapping selections are accounted for.</p></section>
+<section class="wide"><h2>05 / LIVE ACTIVITY</h2><div id="activity"></div><p id="activity-note" class="muted"></p></section>
+<section><h2>06 / DUKE SERVER</h2><div id="server"></div></section>
+<section><h2>07 / SERVICES</h2><div id="services"></div><p class="muted">Observed container/unit state, not an application health probe.</p></section>
+<section class="wide"><h2>08 / RECENT BATCHES</h2><div id="recent" class="scroll"></div></section>
+</main><footer>System 1s · operations 2.5s · services 30s · read-only SQLite</footer></body></html>

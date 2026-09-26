@@ -1,5 +1,8 @@
 """Read-only collectors. Never import database initialization or runner code."""
 import json
+import hashlib
+from collections import defaultdict
+from urllib.parse import urlsplit
 import os
 import re
 import shutil
@@ -34,7 +37,7 @@ def obj(raw, kind):
         return kind()
 
 
-def database_metrics(path):
+def database_metrics(path, attribution_cache=None):
     result = dict(available=False, total=None, phase1_complete=None,
                   phase1_note='No explicit Phase 1 completion flag in the schema.',
                   processed=None, remaining=None, percent=None,
@@ -69,23 +72,42 @@ def database_metrics(path):
         if conn is not None:
             conn.close()
     # All attribution evaluation happens after the SQLite connection is closed.
-    accepted = set()
-    malformed = False
+    grouped = defaultdict(list)
     for mail in emails:
-        company = companies.get(mail['company_id'])
-        if not company or company['website_status'] != 'VERIFIED' or company['rule_version'] != EMAIL_RULE_VERSION:
-            continue
-        evidence = obj(mail.get('evidence_json'), dict)
-        try:
-            attribution = email_attribution(company, mail['email'], mail.get('page_url') or '',
-                evidence.get('publication', ''), obj(company['ownership_json'], dict),
-                obj(company['evidence_json'], list), mail.get('page_title') or '',
-                evidence.get('contact_block'), evidence.get('visible_email', ''))
-            if attribution.get('attributable'):
-                accepted.add((mail['company_id'], mail['email']))
-        except (TypeError, ValueError, KeyError, AttributeError):
-            malformed = True
-    result.update(emails=len(accepted), email_companies=len({c for c, _ in accepted}))
+        grouped[mail['company_id']].append(mail)
+    memo = attribution_cache if attribution_cache is not None else {}
+    accepted_count = company_count = 0
+    malformed = False
+    for company_id, mails in grouped.items():
+        company = companies.get(company_id)
+        signature = hashlib.sha256(repr((company, mails)).encode()).digest()
+        previous = memo.get(company_id)
+        if previous and previous[0] == signature:
+            count, invalid = previous[1:]
+        else:
+            accepted = set()
+            invalid = False
+            if company and company['website_status'] == 'VERIFIED' and company['rule_version'] == EMAIL_RULE_VERSION:
+                ownership = obj(company['ownership_json'], dict)
+                pages = obj(company['evidence_json'], list)
+                for mail in mails:
+                    evidence = obj(mail.get('evidence_json'), dict)
+                    try:
+                        attribution = email_attribution(company, mail['email'], mail.get('page_url') or '',
+                            evidence.get('publication', ''), ownership, pages, mail.get('page_title') or '',
+                            evidence.get('contact_block'), evidence.get('visible_email', ''))
+                        if attribution.get('attributable'):
+                            accepted.add(mail['email'])
+                    except (TypeError, ValueError, KeyError, AttributeError):
+                        invalid = True
+            count = len(accepted)
+            memo[company_id] = (signature, count, invalid)
+        accepted_count += count
+        company_count += bool(count)
+        malformed |= invalid
+    for company_id in set(memo) - set(grouped):
+        del memo[company_id]
+    result.update(emails=accepted_count, email_companies=company_count)
     if malformed:
         result['email_note'] = 'Malformed provenance excluded; counts may be incomplete.'
     return result
@@ -128,8 +150,52 @@ def parse_report(data):
         timestamp = datetime.fromisoformat(timestamp).isoformat()
     except (TypeError, ValueError):
         timestamp = None
-    return dict(processed=len(entries), selected=len(selected), status=state,
-                circuit_breaker=triggered, timestamp=timestamp)
+    selected_ids = list(dict.fromkeys(selected))
+    completed_ids = list(dict.fromkeys(e['company_id'] for e in entries))
+    if len(selected_ids) != len(selected) or len(completed_ids) != len(entries) or not set(completed_ids) <= set(selected_ids):
+        return None
+    remaining = len(selected_ids) - len(completed_ids)
+    activity = [activity_entry(e, data.get('rule_version')) for e in entries[-10:]][::-1]
+    return dict(processed=len(entries), selected=len(selected), remaining=remaining,
+                percent=round(100*len(entries)/len(selected), 1) if selected else 0,
+                status=state, circuit_breaker=triggered if isinstance(breaker, dict) and type(breaker.get('triggered')) is bool else None,
+                timestamp=timestamp, selected_ids=selected_ids, completed_ids=completed_ids,
+                activity=activity, last_completed=activity[0] if activity else None)
+
+
+def activity_entry(entry, rule_version):
+    """Project only established runner fields; never expose arbitrary report content."""
+    result = {'company_id': entry['company_id']}
+    if isinstance(entry.get('company_name'), str) and entry['company_name'].strip():
+        result['company_name'] = entry['company_name'][:200]
+    website = entry.get('website')
+    if isinstance(website, dict):
+        status = website.get('status')
+        if status in STATUSES or status == 'FOUND':
+            result['status'] = status
+        # Only a verified domain is described as official. Never return URL credentials/query.
+        if status == 'VERIFIED':
+            try:
+                url = urlsplit(website.get('final_url') or '')
+                if url.scheme in ('http', 'https') and url.hostname:
+                    result['domain'] = url.hostname
+            except (ValueError, TypeError):
+                pass
+    email_result = entry.get('email_result')
+    if rule_version == EMAIL_RULE_VERSION and isinstance(email_result, dict):
+        mails = email_result.get('emails')
+        if isinstance(mails, list):
+            proven = []
+            for mail in mails:
+                proof = mail.get('evidence') if isinstance(mail, dict) else None
+                attribution = proof.get('attribution') if isinstance(proof, dict) else None
+                if not isinstance(attribution, dict) or attribution.get('attributable') is not True or not isinstance(mail.get('email'), str):
+                    break
+                proven.append(mail['email'])
+            else:
+                result['usable_emails'] = len(set(proven))
+    # The runner has no per-entry timestamp. Do not manufacture one from mtime.
+    return result
 
 
 def runner_args(argv):
@@ -157,20 +223,23 @@ def runner_args(argv):
 
 def log_progress(path):
     text = bounded_read(path, 65536, tail=True)
-    matches = list(re.finditer(r'^\[(\d+)/(\d+)\] ID (\d+) ([^\r\n]*)$', text, re.M))
+    starts = list(re.finditer(r'^\d+ companies selected .*?Report: (.+)$', text, re.M))
+    if starts:
+        text = text[starts[-1].start():]
+    matches = list(re.finditer(r'^\[(\d+)/(\d+)\] ID (\d+)(?: ([^\r\n]*))?$', text, re.M))
     result = {'circuit_breaker': 'Search circuit breaker stopped batch:' in text}
     if matches:
         match = matches[-1]
         # A following result line means this company is no longer known to be active.
         if not re.search(r'^  .*; emails=', text[match.end():], re.M) and not result['circuit_breaker']:
-            result['current_company'] = {'id': int(match[3]), 'name': match[4][:200]}
+            result['current_company'] = {'id': int(match[3]), 'name': (match[4] or '')[:200]}
     reports = re.findall(r'^\d+ companies selected .*?Report: (.+)$', text, re.M)
     if reports:
         result['report_path'] = reports[-1]
     return result
 
 
-def active_jobs(logs, proc=Path('/proc')):
+def active_jobs(logs, proc=Path('/proc'), report_reader=None, details=True):
     jobs = []
     available = (proc / 'uptime').exists()
     if not available:
@@ -194,24 +263,40 @@ def active_jobs(logs, proc=Path('/proc')):
             fields = (entry / 'stat').read_text().rsplit(')', 1)[1].split()
             uptime = float((proc / 'uptime').read_text().split()[0])
             job['runtime_seconds'] = max(0, round(uptime - int(fields[19])/os.sysconf('SC_CLK_TCK')))
+            job['identity'] = f"{entry.name}:{fields[19]}"
+            job['job_type'] = 'WEBSITE + EMAIL DISCOVERY' if parsed['module'] == 'discovery.runner' else 'DASTABASE WORKER'
+            if not details:
+                jobs.append(job)
+                continue
             progress = {}
             for fd in ('1', '2'):
                 path = safe_file(entry / 'fd' / fd, logs)
-                if path:
-                    progress.update(log_progress(path))
+                if path and path.stat().st_mtime >= time.time()-job['runtime_seconds']-2:
+                    candidate = log_progress(path)
+                    if candidate.get('current_company') or candidate.get('report_path') or candidate.get('circuit_breaker'):
+                        progress = candidate
+                        break
             report_arg = parsed['report'] or progress.get('report_path')
             report = safe_file(cwd / report_arg, logs) if report_arg else None
+            if parsed['report'] and progress.get('report_path'):
+                logged_report = safe_file(cwd / progress['report_path'], logs)
+                if logged_report != report:
+                    progress = {}
             if report:
                 job['report'] = str(report.relative_to(logs.resolve()))
                 try:
-                    summary = parse_report(json.loads(bounded_read(report)))
+                    summary = report_reader(report) if report_reader else parse_report(json.loads(bounded_read(report)))
                     if summary:
-                        job.update({k: summary[k] for k in ('selected', 'processed', 'circuit_breaker')})
+                        job.update({k: summary[k] for k in ('selected', 'processed', 'remaining', 'percent', 'circuit_breaker', 'last_completed', 'selected_ids', 'completed_ids', 'activity')})
                 except (OSError, ValueError):
                     pass
             job['current_company'] = progress.get('current_company')
             if progress.get('circuit_breaker'):
                 job['circuit_breaker'] = True
+            current = job['current_company']
+            if current and (job['circuit_breaker'] or current['id'] in job.get('completed_ids', []) or
+                            ('selected_ids' in job and current['id'] not in job['selected_ids'])):
+                job['current_company'] = None
             jobs.append(job)
         except PermissionError:
             inaccessible += 1
@@ -220,7 +305,7 @@ def active_jobs(logs, proc=Path('/proc')):
     return dict(available=True, jobs=jobs, inaccessible_processes=inaccessible)
 
 
-def recent_jobs(logs, active):
+def recent_jobs(logs, active, report_reader=None):
     candidates = []
     skipped = 0
     try:
@@ -237,9 +322,10 @@ def recent_jobs(logs, active):
     results = []
     for mtime, path in sorted(candidates, reverse=True)[:500]:
         try:
-            summary = parse_report(json.loads(bounded_read(path)))
+            summary = report_reader(path) if report_reader else parse_report(json.loads(bounded_read(path)))
             if summary is None:
                 continue
+            summary = dict(summary)
             name = str(path.relative_to(logs.resolve()))
             if name in running and not summary['circuit_breaker']:
                 summary['status'] = 'running'

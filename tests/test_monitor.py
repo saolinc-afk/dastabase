@@ -1,5 +1,7 @@
 """Offline monitor regressions: temporary databases and fake Linux processes."""
 import json
+import os
+import time
 import sqlite3
 import tempfile
 import unittest
@@ -110,6 +112,13 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(recent_jobs(self.logs, result)['jobs'][0]['status'], 'running')
         out.write_text('[2/2] ID 2 Test company\n  VERIFIED x confidence=90; emails=1 (FOUND); HTTP=1\n')
         self.assertNotIn('current_company', log_progress(out))
+        out.write_text('[2/2] ID 2 Test company\n')
+        old = time.time()-2000
+        os.utime(out, (old, old))
+        self.assertIsNone(active_jobs(self.logs, proc)['jobs'][0]['current_company'])
+        out.write_text('[2/2] ID 2 Test company\n')
+        report.write_text(json.dumps({'selected_ids': [1, 2], 'companies': [{'company_id': 1}, {'company_id': 2}]}))
+        self.assertIsNone(active_jobs(self.logs, proc)['jobs'][0]['current_company'])
 
     def test_reports_are_confined_and_malformed_skipped(self):
         outside = self.root/'outside.json'; outside.write_text('{}')
@@ -143,3 +152,166 @@ class MonitorTests(unittest.TestCase):
             self.assertIn("script-src 'self'", response.headers['Content-Security-Policy'])
             self.assertEqual(client.post('/api/status').status_code, 405)
             self.assertEqual(client.get('/api/status?db=/etc/passwd').json['database']['total'], 3)
+
+
+class LiveMonitorTests(unittest.TestCase):
+    setUp = MonitorTests.setUp
+    tearDown = MonitorTests.tearDown
+    fixture = MonitorTests.fixture
+
+    def test_batch_progress_and_activity_projection(self):
+        report = {'selected_ids': [1, 2, 3], 'rule_version': 'phase2-ownership-1',
+                  'companies': [{'company_id': 1, 'company_name': 'One',
+                    'website': {'status': 'VERIFIED', 'final_url': 'https://user:SECRET@one.si/contact?token=SECRET'},
+                    'email_result': {'emails': [{'email': 'a@one.si', 'evidence': {'attribution': {'attributable': True}}}]}}]}
+        result = parse_report(report)
+        self.assertEqual((result['processed'], result['selected'], result['remaining'], result['percent']), (1, 3, 2, 33.3))
+        event = result['last_completed']
+        self.assertEqual(event, {'company_id': 1, 'company_name': 'One', 'status': 'VERIFIED', 'domain': 'one.si', 'usable_emails': 1})
+        self.assertNotIn('SECRET', json.dumps(result))
+        self.assertNotIn('time', event)
+        report['companies'][0]['email_result']['emails'][0]['evidence'] = {}
+        self.assertNotIn('usable_emails', parse_report(report)['last_completed'])
+        report['companies'][0]['website']['status'] = 'REVIEW'
+        self.assertNotIn('domain', parse_report(report)['last_completed'])
+        report['selected_ids'] = [1, 1]
+        self.assertIsNone(parse_report(report))
+
+    def test_workload_retries_overlaps_and_no_worker(self):
+        from monitor.state import workload
+        database = {'remaining': 10}
+        companies = {1: {'processed': True}, 2: {'processed': False}, 3: {'processed': False}}
+        jobs = [{'selected_ids': [1, 2], 'completed_ids': [], 'remaining': 2},
+                {'selected_ids': [2, 3], 'completed_ids': [], 'remaining': 2}]
+        result = workload(database, {'available': True, 'jobs': jobs}, companies)
+        self.assertEqual(result['batch_remaining'], 4)
+        self.assertEqual(result['unprocessed_in_active_batches'], 2)
+        self.assertEqual(result['remaining_after_batch'], 8)
+        self.assertFalse(result['persistent_queue'])
+        idle = workload(database, {'available': True, 'jobs': []}, {})
+        self.assertEqual((idle['state'], idle['remaining_after_batch']), ('idle', 10))
+        hidden = workload(database, {'available': False, 'jobs': []}, {})
+        self.assertEqual(hidden['state'], 'unknown')
+        self.assertIsNone(hidden['remaining_after_batch'])
+        for active in ({'available': True, 'jobs': [{}]}, {'available': True, 'jobs': jobs, 'inaccessible_processes': 1}):
+            self.assertIsNone(workload(database, active, companies)['remaining_after_batch'])
+
+    def test_lookup_and_activity_name_fallback(self):
+        from monitor.state import company_lookup, operation_details, public_jobs
+        self.fixture()
+        self.assertEqual(company_lookup(self.db, [1, 3]), {1: {'name': 'One', 'processed': True}, 3: {'name': 'Three', 'processed': False}})
+        summary = parse_report({'selected_ids': [1, 3], 'companies': [{'company_id': 1}]})
+        job = {**summary, 'current_company': {'id': 3, 'name': ''}, 'report': 'a.json'}
+        active = {'available': True, 'jobs': [job]}
+        work, activity = operation_details({'remaining': 1}, active, {'jobs': []}, self.db)
+        self.assertEqual(job['current_company']['name'], 'Three')
+        self.assertEqual(job['last_completed']['company_name'], 'One')
+        self.assertEqual(activity['entries'][0]['company_name'], 'One')
+        self.assertEqual(work['remaining_after_batch'], 0)
+        public, _ = public_jobs(active, {'jobs': []})
+        self.assertNotIn('selected_ids', public['jobs'][0])
+        idle, activity = operation_details({'remaining': 1}, {'available': True, 'jobs': []},
+                                           {'jobs': [{**summary, 'name': 'a.json'}]}, self.db)
+        self.assertEqual(activity['source'], 'recent')
+        self.assertEqual(activity['entries'][0]['company_name'], 'One')
+
+    def test_activity_last_ten_and_malformed_subfields(self):
+        entries = [{'company_id': i, 'website': [], 'email_result': 'bad'} for i in range(20)]
+        report = parse_report({'selected_ids': list(range(20)), 'companies': entries})
+        self.assertEqual([e['company_id'] for e in report['activity']], list(range(19, 9, -1)))
+        self.assertIsNone(report['circuit_breaker'])
+        self.assertEqual(parse_report({'selected_ids': [], 'companies': []})['percent'], 0)
+        self.assertIsNone(parse_report({'selected_ids': [1], 'companies': [{'company_id': 2}]}))
+
+    def test_append_log_resets_old_breaker(self):
+        path = self.logs/'a.out'
+        path.write_text('Search circuit breaker stopped batch: old\n2 companies selected (hard limit 200). Report: logs/new.json\n[1/2] ID 3\n')
+        progress = log_progress(path)
+        self.assertFalse(progress['circuit_breaker'])
+        self.assertEqual(progress['current_company'], {'id': 3, 'name': ''})
+
+    def test_report_cache_only_reparses_changed_files(self):
+        from monitor.state import ReportCache
+        path = self.logs/'a.json'
+        path.write_text(json.dumps({'selected_ids': [1], 'companies': []}))
+        cache = ReportCache()
+        with patch('monitor.state.bounded_read', wraps=__import__('monitor.metrics', fromlist=['bounded_read']).bounded_read) as read:
+            first = cache.read(path)
+            first['selected_ids'].append(9)
+            self.assertEqual(cache.read(path)['selected_ids'], [1])
+            self.assertEqual(read.call_count, 1)
+            path.write_text(json.dumps({'selected_ids': [1], 'companies': [{'company_id': 1}]}))
+            self.assertEqual(cache.read(path)['processed'], 1)
+            self.assertEqual(read.call_count, 2)
+            path.write_text('{')
+            with self.assertRaises(ValueError):
+                cache.read(path)
+            with self.assertRaises(ValueError):
+                cache.read(path)
+            self.assertEqual(read.call_count, 3)
+
+    def test_database_cache_wal_and_attribution_reuse(self):
+        from monitor.state import DatabaseCache
+        self.fixture()
+        cache = DatabaseCache()
+        with patch('monitor.metrics.email_attribution', return_value={'attributable': True}) as attribution:
+            first = cache.collect(self.db)
+            self.assertEqual(first['emails'], 1)
+            self.assertIs(cache.collect(self.db), first)
+            # Simulate WAL changes; unchanged per-company inputs reuse attribution.
+            wal = Path(str(self.db)+'-wal'); wal.write_bytes(b'changed')
+            self.assertEqual(cache.collect(self.db)['emails'], 1)
+            self.assertEqual(attribution.call_count, 1)
+            wal.unlink()
+            conn = sqlite3.connect(self.db)
+            conn.execute("UPDATE email_discovery SET page_title='new' WHERE company_id=1")
+            conn.commit(); conn.close()
+            cache.collect(self.db)
+            self.assertEqual(attribution.call_count, 2)
+
+    def test_separate_cache_intervals_and_live_never_reads_database(self):
+        from monitor.state import SnapshotCache
+        clock = [10.0]
+        with patch('monitor.state.time.monotonic', side_effect=lambda: clock[0]):
+            cache = SnapshotCache(2.5)
+            calls = []
+            def collect():
+                calls.append(1)
+                return len(calls)
+            self.assertEqual(cache.get(collect), 1)
+            clock[0] += 2
+            self.assertEqual(cache.get(collect), 1)
+            clock[0] += 0.5
+            self.assertEqual(cache.get(collect), 2)
+        app = create_app({'TESTING': True, 'DB_PATH': self.db, 'LOGS_PATH': self.logs})
+        with patch('monitor.state.database_metrics') as db, patch('monitor.app.recent_jobs') as reports, patch('monitor.app.service_metrics') as services, patch('monitor.app.active_jobs', return_value={'available': True, 'jobs': []}) as processes:
+            client = app.test_client()
+            self.assertEqual(client.get('/api/live').status_code, 200)
+            client.get('/api/live')
+            processes.assert_called_once_with(self.logs, details=False)
+            db.assert_not_called(); reports.assert_not_called(); services.assert_not_called()
+            self.assertEqual(client.post('/api/live').status_code, 405)
+
+    def test_multiple_clients_share_one_collection(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from monitor.state import SnapshotCache
+        from threading import Barrier
+        cache = SnapshotCache(10)
+        barrier = Barrier(4)
+        calls = []
+        def client():
+            barrier.wait(timeout=2)
+            return cache.get(lambda: calls.append(1) or {'ok': True})
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: client(), range(4)))
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(all(r == {'ok': True} for r in results))
+
+    def test_service_checks_not_repeated_with_status_refresh(self):
+        self.fixture()
+        app = create_app({'TESTING': True, 'DB_PATH': self.db, 'LOGS_PATH': self.logs, 'CACHE_SECONDS': 0})
+        with patch('monitor.app.service_metrics', return_value=[]) as services, patch('monitor.app.active_jobs', return_value={'available': True, 'jobs': []}):
+            client = app.test_client()
+            for _ in range(3):
+                self.assertEqual(client.get('/api/status').status_code, 200)
+            services.assert_called_once()
