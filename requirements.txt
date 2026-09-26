@@ -9,3 +9,5 @@ lxml
 PyYAML
 
 ddgs>=9,<10
+
+Flask>=3.1,<4
