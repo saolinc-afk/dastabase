@@ -1,8 +1,9 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dastabase Monitor</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"><script defer src="{{ url_for('static', filename='monitor.js') }}"></script></head>
-<body><header><h1><span class="good">▸</span> DASTABASE <span class="muted">MONITOR</span></h1><span class="tag">READ ONLY / DUKE</span></header>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dastabase Monitor</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"><script defer src="{{ url_for('static', filename='easter_eggs.js') }}"></script><script defer src="{{ url_for('static', filename='monitor.js') }}"></script></head>
+<body><header><h1><span class="good">▸</span> DASTABASE <span class="muted">MONITOR</span></h1><span class="tag">ENGINE · {{ engine.engine_name }} {{ engine.engine_version }}</span></header>
 <div class="connections"><span id="connection" role="status">Operations: connecting…</span><span id="live-connection" role="status">System: connecting…</span></div>
+<div id="easter-egg" class="easter-egg" aria-hidden="true"></div>
 <main>
 <section><h2>01 / DATABASE</h2><div id="database"></div><progress id="progress" max="100" value="0" aria-label="Processing coverage"></progress><p class="muted">Processed = a discovery result exists; it does not imply successful enrichment.</p></section>
 <section><h2>02 / ENRICHMENT OUTPUT</h2><div id="results"></div><p class="muted">Latest result per company · current outreach attribution rules.</p></section>

@@ -6,6 +6,9 @@ const bytes = v => v == null ? 'N/A' : (v / 1073741824).toFixed(1) + ' GiB';
 const duration = v => v == null ? 'N/A' : [Math.floor(v/3600),Math.floor(v%3600/60),Math.floor(v%60)].map(x=>String(x).padStart(2,'0')).join(':');
 const percent = (used,total) => used == null || !total ? null : Math.min(100,Math.max(0,100*used/total));
 const tone = v => ['running','active','complete','VERIFIED'].includes(v) ? 'good' : ['ERROR','unhealthy','failed'].includes(v) ? 'error' : ['REVIEW','GROUP_REVIEW','interrupted','incomplete','circuit-breaker','stopped','starting'].includes(v) ? 'warn' : '';
+// Presentation only: API/report statuses and diagnostic text stay unchanged.
+const resultLabel = status => ({ERROR:'UNRESOLVED',GROUP_REVIEW:'GROUP REVIEW',NOT_FOUND:'NOT FOUND'}[status] || status);
+const companyLabel = company => company ? [company.id,company.name].filter(v=>v!=null && v!=='').join(' · ') || null : null;
 const localTime = value => {if(!value)return 'N/A';const date=new Date(value);return Number.isNaN(date.valueOf()) ? 'N/A' : date.toLocaleString();};
 function node(tag,value,cls=''){const n=document.createElement(tag);n.textContent=text(value);n.className=cls;return n;}
 function row(parent,label,value,cls=''){const r=node('div','','row'),n=node('span',value,'value '+cls);r.append(node('span',label),n);parent.append(r);return n;}
@@ -13,6 +16,7 @@ function bar(parent,value,label){if(value==null)return;const n=document.createEl
 const previous = new Map();
 function changed(id,value,render){const key=JSON.stringify(value);if(previous.get(id)===key)return;previous.set(id,key);const target=el(id),scroll=[target.scrollLeft,target.scrollTop];target.replaceChildren();render(target);target.scrollLeft=scroll[0];target.scrollTop=scroll[1];}
 let runtimes = new Map();
+const easterEggs = window.DastabaseEasterEggs?.create(el('easter-egg'));
 function renderStatus(data){
   const d=data.database;
   changed('database',d,box=>{
@@ -22,7 +26,7 @@ function renderStatus(data){
   });
   el('progress').value=d.percent || 0;
   changed('results',[d.statuses,d.email_companies,d.emails,d.email_note,d.other_statuses],box=>{
-    const labels={VERIFIED:'Verified websites',REVIEW:'Review',GROUP_REVIEW:'Group review',NOT_FOUND:'Not found',ERROR:'Errors'};
+    const labels={VERIFIED:'Verified websites',REVIEW:'Review',GROUP_REVIEW:'Group review',NOT_FOUND:'Not found',ERROR:'Unresolved'};
     for(const [status,count] of Object.entries(d.statuses))row(box,labels[status]||status,number(count),tone(status));
     if(d.other_statuses)row(box,'Other / legacy status',number(d.other_statuses),'warn');
     row(box,'Companies with usable emails',number(d.email_companies));row(box,'Usable email addresses',number(d.emails));
@@ -36,8 +40,8 @@ function renderStatus(data){
       const job=node('div','','job');job.append(node('div','● '+j.job_type,'good job-title'));
       row(job,'Batch',j.report);row(job,'Companies',`${number(j.processed)} / ${number(j.selected)}`);
       row(job,'Remaining',number(j.remaining));row(job,'Batch progress',j.percent == null ? 'N/A' : j.percent+'%');bar(job,j.percent,'Batch progress');
-      row(job,'Current ID',j.current_company?.id);row(job,'Current name',j.current_company?.name || null);
-      const last=j.last_completed;row(job,'Last result',last ? [last.company_id,last.company_name,last.status].filter(v=>v!=null).join(' · ') : null,last ? tone(last.status) : '');
+      row(job,'Current',companyLabel(j.current_company));
+      const last=j.last_completed;row(job,'Last',last ? [last.company_id,last.company_name,resultLabel(last.status)].filter(v=>v!=null).join(' · ') : null,last ? tone(last.status) : '');
       row(job,'PID',j.pid);runtimes.set(j.identity,row(job,'Runtime',duration(j.runtime_seconds)));
       row(job,'Circuit breaker',j.circuit_breaker == null ? 'N/A' : j.circuit_breaker ? 'TRIGGERED' : 'Not triggered',j.circuit_breaker ? 'warn' : '');box.append(job);
     }
@@ -55,7 +59,7 @@ function renderStatus(data){
     if(!data.activity.entries.length)box.append(node('p','No completed companies observed yet.','muted'));
     for(const event of data.activity.entries){const line=node('div','','event');
       line.append(node('span',event.status==='VERIFIED' ? '✓' : event.status==='ERROR' ? '×' : '·',tone(event.status)),node('span',event.company_id,'event-id'),node('span',event.company_name || 'Name unavailable','event-name'));
-      if(event.status)line.append(node('span',event.status,tone(event.status)));
+      if(event.status)line.append(node('span',resultLabel(event.status),tone(event.status)));
       if(event.domain)line.append(node('span',event.domain,'muted'));
       if(event.usable_emails!=null)line.append(node('span',`${event.usable_emails} emails`,'muted'));
       line.title=event.report;box.append(line);
@@ -64,11 +68,13 @@ function renderStatus(data){
   el('activity-note').textContent=(data.activity.source==='active' ? 'Active runner · ' : 'Recent runner · ')+data.activity.note;
   changed('recent',data.recent,box=>{
     const table=document.createElement('table'),head=document.createElement('tr');for(const h of ['REPORT','STATE','DONE / SELECTED','TIMESTAMP'])head.append(node('th',h));table.append(head);
-    for(const j of data.recent.jobs){const tr=document.createElement('tr');tr.append(node('td',j.name),node('td',j.status,tone(j.status)),node('td',`${j.processed} / ${j.selected}`),node('td',localTime(j.timestamp)));table.append(tr);}box.append(table);
+    for(const j of data.recent.jobs){const tr=document.createElement('tr');tr.append(node('td',j.name),node('td',resultLabel(j.status),tone(j.status)),node('td',`${j.processed} / ${j.selected}`),node('td',localTime(j.timestamp)));table.append(tr);}box.append(table);
     if(!data.recent.jobs.length)box.append(node('p',data.recent.note || 'No runner reports found.','muted'));
     if(data.recent.skipped)box.append(node('p',`${data.recent.skipped} unreadable or malformed reports skipped.`,'warn'));
   });
   changed('services',data.services,box=>{for(const s of data.services){row(box,s.name,s.status,tone(s.status));box.append(node('p',s.source,'muted'));}});
+  // Optional personality must never turn a successful operations refresh into a failure.
+  try { easterEggs?.observe(data); } catch (_) { /* Operational UI remains independent. */ }
 }
 function renderLive(data){
   const s=data.server;

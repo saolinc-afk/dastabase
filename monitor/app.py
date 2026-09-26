@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template
+from engine_identity import ENGINE_IDENTITY
 from monitor.metrics import ROOT, ServerMetrics, active_jobs, recent_jobs, service_metrics
 from monitor.state import (DatabaseCache, ReportCache, SnapshotCache, operation_details,
                            public_jobs, stamp)
@@ -33,7 +34,7 @@ def create_app(config=None):
 
     @app.get('/')
     def index():
-        return render_template('index.html')
+        return render_template('index.html', engine=ENGINE_IDENTITY)
 
     @app.get('/api/live')
     def live():

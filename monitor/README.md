@@ -294,3 +294,71 @@ fixture (no runner invoked, no database writes) for changing progress, runtime,
 activity, metric bars, phone layout and independent stale-refresh warnings.
 Native Linux process inspection uses a synthetic `/proc` tree in tests. Duke has
 not been accessed or deployed to as part of this iteration.
+
+## Product identity and presentation polish
+
+`engine_identity.py` is the sole authoritative identity source: an immutable
+`EngineIdentity` value with `engine_name="SPARROW"` and `engine_version="0.9.0"`.
+It has no runtime/storage side effects and is reusable by future product surfaces.
+For now only the monitor header consumes it: **ENGINE · SPARROW 0.9.0**. This is
+the Dastabase enrichment engine. APIs, database, exports and provenance formats
+are unchanged. Removing the header's READ ONLY badge does not alter security.
+
+The active job displays `Current: ID · name` and `Last: ID · name · result`, using
+only existing observed fields. Missing current company stays N/A. All batch
+counts, progress, PID, runtime, report and breaker information remain.
+
+The JavaScript `resultLabel` helper maps internal `ERROR` to `UNRESOLVED`,
+`GROUP_REVIEW` to `GROUP REVIEW`, and `NOT_FOUND` to `NOT FOUND` for display.
+The summary uses the matching title-case labels. Status colors still derive from
+the original status. API objects, report values and diagnostic text are untouched.
+No technical reason classifications were added: the current safe API projection
+does not provide them. A future detail view can extend presentation separately.
+
+## Subtle frontend moments
+
+`monitor/static/easter_eggs.js` is isolated from the backend. Its controller receives
+already-fetched operations snapshots; it has no fetch, storage, external assets,
+subprocesses, database access or polling loop. The normal 1s/2.5s polling and
+cached service checks remain unchanged. Its optional observer cannot fail the
+operations refresh. A fixed-height, muted text strip below the status row neither
+covers content nor shifts the grid when text appears. No sounds, focus changes,
+flashes, animation, or screen-reader announcements are introduced.
+
+Exact rules (all state is in memory for the current page session):
+
+- **Spaceship:** an observed active batch's completed count is exactly 42, with a
+  valid report reference and selected/processed counts. Once per report path.
+  Skipping from 41 to 43 does not trigger it. This is a processed count, not a
+  company ID or the inferred company currently in flight.
+- **Cookie:** a previously observed active batch crosses from below 100 to at
+  least 100 completed companies, once per report path. Alternatively, a previously
+  observed active batch below 100 appears in recent reports explicitly complete
+  at 100/100 after its worker exits. Historical completed batches on page load do
+  not trigger cookies. Count regressions never create new milestones.
+- **Rare motifs:** only when an active checkpoint advances, that worker's breaker
+  is explicitly not triggered and its last result is not ERROR, with process
+  visibility available. Evaluation occurs at most once a minute, and only after
+  20 minutes since page initialization or the last rare motif. One random draw:
+  dinosaur 0.05%, skis 0.20%, dove 1%, sailboat 1%; otherwise nothing (97.75%).
+  The dove is displayed alone. Skis use rarity, not season detection.
+- **All motifs:** displayed for six seconds, with a two-minute global cooldown.
+  Hidden pages suppress display. Milestones suppressed by visibility/cooldown are
+  consumed, not queued for a later surprise. At most one message is shown per
+  snapshot. Each actual display schedules just one expiration timeout.
+
+The report path is the session batch key, surviving worker PID changes or resumes.
+Reusing the same report path intentionally stays suppressed for the page session;
+without a reliable report reference, batch moments are omitted. Reloading/opening
+another page creates a new session; no persistence or cross-tab coordination is
+needed. Clock, random draw and expiry scheduler can be injected for deterministic
+browser tests. Most snapshots do only small map/count checks, with no randomness
+or timer creation.
+
+Polish validation (2026-09-26): **159 tests passed** in the complete suite,
+including deterministic Chromium tests for identity, compact company rendering,
+unchanged internal ERROR values, presentation labels, milestone deduplication,
+regressing counts, hidden/cooldown suppression, rare motifs and read-only routes.
+Desktop/390px phone fixture previews were visually checked. `git diff --check`
+passed. No production processes/services were contacted; no deployment, commit or
+push was performed.
