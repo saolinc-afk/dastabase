@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Dastabase Monitor</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"><script defer src="{{ url_for('static', filename='easter_eggs.js') }}"></script><script defer src="{{ url_for('static', filename='monitor.js') }}"></script></head>
-<body><header><h1><span class="good">▸</span> DASTABASE <span class="muted">MONITOR</span></h1><span class="tag">ENGINE · {{ engine.engine_name }} {{ engine.engine_version }}</span></header>
+<body><header><h1 class="monitor-brand"><img class="dastabase-logo" src="{{ url_for('static', filename='assets/dastabase-napis-prozorna-za-temno.svg') }}" width="727" height="167" alt="Dastabase"><span class="muted">MONITOR</span></h1><span class="tag">{{ engine.engine_name }} {{ engine.engine_version }}</span></header>
 <div class="connections"><span id="connection" role="status">Operations: connecting…</span><span id="live-connection" role="status">System: connecting…</span></div>
 <div id="easter-egg" class="easter-egg" aria-hidden="true"></div>
 <main>
