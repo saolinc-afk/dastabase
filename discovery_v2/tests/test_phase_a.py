@@ -15,7 +15,9 @@ from discovery_v2.eligibility import company_eligibility, normalize_legal_name
 from discovery_v2.evidence import EvidenceWriter, phone_value
 from discovery_v2.models import Config
 from discovery_v2.runner import main, run
-from discovery_v2.search import domain_query, queries
+from discovery_v2.search import (DDGSearch, SUCCESS_WITH_RESULTS, SUCCESS_ZERO_RESULTS,
+                                 SerperAPIError, SerperSearch, default_provider,
+                                 domain_query, queries)
 from discovery_v2.store import Store, digest, encode, read_manifest, snapshot
 
 COMPANY = dict(id=1, company_name='ALFA d.o.o.', tax_number='12345678',
@@ -72,6 +74,26 @@ class FakeFetcher:
         self.closed = True
 
 
+def json_response(payload, status=200):
+    r = requests.Response()
+    r.status_code = status
+    r.url = SerperSearch.endpoint
+    r.encoding = 'utf-8'
+    r.headers['Content-Type'] = 'application/json'
+    r._content = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+    return r
+
+
+class FakeSerperSession:
+    def __init__(self, payload, status=200):
+        self.response = json_response(payload, status)
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return self.response
+
+
 class PhaseATests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -122,6 +144,76 @@ class PhaseATests(unittest.TestCase):
         self.assertEqual([q for _, q in queries(COMPANY)], ['Podjetje ALFA d.o.o. kontakt', 'ALFA d.o.o. kontakt', 'Podjetje ALFA d.o.o. bizi.si'])
         self.assertEqual(queries(COMPANY, True)[0][1], 'Podjetje ALFA d.o.o. Ljubljana kontakt')
         self.assertEqual(domain_query('https://www.alfa.si/a'), ('DOMAIN_CONTACT', 'alfa.si kontakt'))
+
+    def test_serper_maps_organic_results_and_preserves_safe_payload(self):
+        secret = 'never-store-this-key'
+        query = 'Podjetje GSELMAN & GSELMAN d.o.o. kontakt čšž'
+        payload = {'organic': [
+            {'position': 2, 'title': 'GSELMAN & GSELMAN', 'link': 'https://gselman-gselman.si/kontakt/',
+             'snippet': 'Kontakt info@gselman-gselman.si'},
+            {'position': 4, 'title': 'Bizi', 'link': 'https://www.bizi.si/GSELMAN-GSELMAN/',
+             'snippet': 'Bistriška cesta 85, Poljčane'},
+        ], 'credits': 99}
+        session = FakeSerperSession(payload)
+        outcome = SerperSearch(secret, session=session).search(query, 6)
+
+        self.assertEqual(outcome.status, SUCCESS_WITH_RESULTS)
+        self.assertEqual([r['position'] for r in outcome.results], [2, 4])
+        self.assertEqual(outcome.results[0]['title'], 'GSELMAN & GSELMAN')
+        self.assertEqual(outcome.results[0]['url'], 'https://gselman-gselman.si/kontakt/')
+        self.assertEqual(outcome.results[0]['body'], 'Kontakt info@gselman-gselman.si')
+        self.assertEqual(outcome.results[0]['provider'], 'serper')
+        self.assertNotIn('credits', encode(outcome.results))
+        self.assertNotIn(secret, encode(outcome.results))
+        url, call = session.calls[0]
+        self.assertEqual(url, SerperSearch.endpoint)
+        self.assertEqual(call['json'], {'q': query, 'gl': 'si', 'hl': 'sl', 'num': 10})
+        self.assertEqual(call['headers']['X-API-KEY'], secret)
+
+    def test_serper_zero_results_and_http_failure_are_distinct(self):
+        zero = SerperSearch('test-key', session=FakeSerperSession({'organic': [], 'credits': 1})).search('nič', 6)
+        self.assertEqual(zero.status, SUCCESS_ZERO_RESULTS)
+        self.assertEqual(zero.results, ())
+        with self.assertRaises(requests.HTTPError):
+            SerperSearch('test-key', session=FakeSerperSession({'message': 'unavailable'}, 503)).search('test', 6)
+        with self.assertRaisesRegex(SerperAPIError, 'Serper API returned an error'):
+            SerperSearch('test-key', session=FakeSerperSession({'message': 'quota exhausted'})).search('test', 6)
+
+    def test_provider_selection_prefers_configured_serper_and_retains_ddgs(self):
+        self.assertIsInstance(default_provider({}), DDGSearch)
+        self.assertIsInstance(default_provider({'SERPER_API_KEY': 'configured'}), SerperSearch)
+        with patch('discovery.search_engine.search_ddg', return_value=[]):
+            self.assertEqual(DDGSearch().search('zero', 6).status, SUCCESS_ZERO_RESULTS)
+
+    def test_serper_stages_after_first_query_and_persists_provenance(self):
+        secret = 'integration-secret'
+        session = FakeSerperSession({'organic': [{
+            'position': 1, 'title': 'ALFA d.o.o.', 'link': 'https://alfa.si/',
+            'snippet': IDENTITY + ' info@alfa.si Tel: +386 1 234 5678'}], 'credits': 1})
+        provider = SerperSearch(secret, session=session)
+        self.execute(search=provider)
+
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(session.calls[0][1]['json']['q'], 'Podjetje ALFA d.o.o. kontakt')
+        diagnostics = json.loads(self.rows('discovery_attempts')[0]['diagnostics_json'])
+        self.assertEqual([q['status'] for q in diagnostics['queries']],
+                         ['COMPLETED', 'SKIPPED', 'SKIPPED', 'SKIPPED'])
+        self.assertEqual(diagnostics['queries'][0]['search_outcome'], SUCCESS_WITH_RESULTS)
+        evidence = next(e for e in self.rows('discovery_evidence') if e['source_kind'] == 'SEARCH_RESULT')
+        self.assertEqual((evidence['provider'], evidence['result_rank'], evidence['result_url'], evidence['title']),
+                         ('serper', 1, 'https://alfa.si/', 'ALFA d.o.o.'))
+        persisted = encode(self.rows('discovery_evidence')) + encode(diagnostics)
+        self.assertNotIn(secret, persisted)
+        self.assertNotIn('credits', persisted)
+
+    def test_serper_http_failure_is_recorded_failed_without_secret(self):
+        secret = 'failure-secret'
+        provider = SerperSearch(secret, session=FakeSerperSession({'message': 'unavailable'}, 503))
+        self.execute(search=provider, pages={})
+        diagnostics = json.loads(self.rows('discovery_attempts')[0]['diagnostics_json'])
+        self.assertEqual([q['search_outcome'] for q in diagnostics['queries'][:3]], ['FAILED'] * 3)
+        self.assertTrue(all(q['status'] == 'FAILED' for q in diagnostics['queries'][:3]))
+        self.assertNotIn(secret, encode(diagnostics) + encode(self.rows('discovery_evidence')))
 
     def test_bankruptcy_name_variants_are_ineligible_only_for_exact_marker(self):
         names = [

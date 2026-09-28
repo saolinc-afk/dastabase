@@ -30,7 +30,7 @@ class Config:
 class SearchProvider(Protocol):
     name: str
 
-    def search(self, query: str, max_results: int) -> list[dict]: ...
+    def search(self, query: str, max_results: int): ...
 
 
 class PageFetcher(Protocol):

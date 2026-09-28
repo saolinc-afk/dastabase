@@ -58,8 +58,10 @@ RUN_ID=$(.venv/bin/python -c 'import json; print(json.load(open("/tmp/dastabase-
   --run-id "$RUN_ID" --max-items 1
 ```
 
-This command uses DDGS and fresh HTTP sessions. It has **not** been run as part of
-Phase A implementation. Do not use the locked-200 or full population for this check.
+Search uses Serper when `SERPER_API_KEY` is present in the runner environment and
+DDGS otherwise. The key is used only as the `X-API-KEY` request header and is not
+stored in evidence or diagnostics. Do not use the locked-200 or full population
+for a small live check.
 There is no implicit “all companies” selection; `--ids` is mandatory at creation.
 Several IDs use `--ids 1,2,3`. Larger manifests are processed serially in chunks
 (`--batch-size 100`, maximum 200); a 500-company job does not require one transaction
@@ -80,7 +82,7 @@ the fetcher may cache a response to avoid fetching the same page repeatedly.
 
 ## Evidence and contact behavior
 
-Each attempt always schedules these three independent search types:
+Each attempt records these search types:
 
 | Query type | Query |
 | --- | --- |
@@ -89,9 +91,14 @@ Each attempt always schedules these three independent search types:
 | `LEGAL_COMPANY_DATABASE` | `Podjetje <legal company name> bizi.si` |
 | `DOMAIN_CONTACT` | `<likely official domain> kontakt` |
 
-The domain query runs once a likely eligible domain exists; otherwise its explicit
-skip reason is recorded. `--use-municipality` adds municipality to name queries.
-Default budgets: six results/query, four query types, eight website candidates,
+Serper executes them as escalation stages. It starts with
+`LEGAL_COMPANY_CONTACT`; once that evidence verifies an official website, later
+searches are skipped with explicit reasons. Otherwise it proceeds conservatively
+through the remaining name queries and, when useful, `DOMAIN_CONTACT`. DDGS keeps
+the original schedule of all three name queries before candidate evaluation. The
+domain query runs once a likely eligible domain exists; otherwise its explicit skip
+reason is recorded. `--use-municipality` adds municipality to name queries.
+Default budgets: six retained results/query, eight website candidates,
 36 HTTP requests and eight contact crawl pages per company. Candidate verification
 uses the existing stateless verifier plus narrowly corroborated v2 brand/subdomain
 rules behind `interfaces.py`; the old runner,

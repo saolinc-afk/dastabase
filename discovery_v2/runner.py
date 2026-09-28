@@ -14,7 +14,8 @@ from discovery_v2.contacts import resolve_contacts, select_default
 from discovery_v2.evidence import EvidenceWriter
 from discovery_v2.interfaces import RecordingFetcher, VERIFIER_VERSION, evaluate_website, new_fetcher
 from discovery_v2.models import Config, EXECUTION_MODE, JOB_TYPE
-from discovery_v2.search import DDGSearch, DOMAIN_CONTACT, domain_query, queries
+from discovery_v2.search import (DOMAIN_CONTACT, default_provider, domain_query, queries,
+                                 successful)
 from discovery_v2.store import Store, encode, now, read_manifest
 
 
@@ -40,12 +41,19 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
         counts['search_calls'] += 1
         checkpoint()
         try:
-            results = provider.search(query_text, config.results_per_query)
+            outcome = provider.search(query_text, config.results_per_query)
+            # Keep explicitly supplied legacy/test providers compatible.
+            if isinstance(outcome, list):
+                outcome = successful(outcome)
+            results = list(outcome.results)
             for rank, item in enumerate(results[:config.results_per_query], 1):
-                writer.search_result(item, query_type, query_text, provider.name, rank)
-            entry.update(status='COMPLETED', result_count=min(len(results), config.results_per_query))
+                position = item.get('position')
+                writer.search_result(item, query_type, query_text, provider.name,
+                                     position if isinstance(position, int) and position > 0 else rank)
+            entry.update(status='COMPLETED', search_outcome=outcome.status,
+                         result_count=min(len(results), config.results_per_query))
         except Exception as exc:
-            entry.update(status='FAILED', error=f'{type(exc).__name__}: {exc}')
+            entry.update(status='FAILED', search_outcome='FAILED', error=f'{type(exc).__name__}: {exc}')
         checkpoint()
 
     selected = None
@@ -97,24 +105,43 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
 
     completed = False
     try:
-        # Always execute name-based searches, even when guesses would verify.
-        for query in planned:
-            search(query)
-        for url in generate_candidates(company['company_name']):
-            writer.generated(url)
-        evaluate_candidates(max(1, config.max_candidates - 2))
+        if getattr(provider, 'staged', False):
+            # Serper credits are consumed progressively. A verified first-stage
+            # result is sufficient; unresolved companies retain the later query
+            # types as explicit escalation stages.
+            search(planned[0])
+            for url in generate_candidates(company['company_name']):
+                writer.generated(url)
+            evaluate_candidates(max(1, config.max_candidates - 2))
+            for query in planned[1:]:
+                if selected:
+                    entry = next(q for q in diagnostics['queries'] if q['query_type'] == query[0])
+                    entry.update(status='SKIPPED', reason='Verified official website from earlier search stage')
+                else:
+                    search(query)
+                    evaluate_candidates(max(1, config.max_candidates - 2))
+        else:
+            # Preserve the existing DDGS query schedule and evaluation order.
+            for query in planned:
+                search(query)
+            for url in generate_candidates(company['company_name']):
+                writer.generated(url)
+            evaluate_candidates(max(1, config.max_candidates - 2))
         # A likely domain may still be unverified. Never seed this from a publisher.
         likely = selected[2] if selected else next((c['url'] for c in diagnostics['website_candidates']
                     if c['status'] == 'REVIEW' and brand_match(company, c['url'])
                     and c.get('assessment', {}).get('relationship') != 'THIRD_PARTY'
                     and any(set(p.get('signals', [])) & {'company_name_exact', 'organization_name_exact', 'tax_exact', 'registration_exact'}
                             for p in c.get('assessment', {}).get('evidence', []))), None)
-        if likely:
+        if likely and not (getattr(provider, 'staged', False) and selected):
             search(domain_query(likely))
+        elif likely:
+            diagnostics['queries'][-1].update(status='SKIPPED', reason='Verified official website; no additional Serper query required')
         else:
             diagnostics['queries'][-1].update(status='SKIPPED', reason='No likely eligible official domain')
         evaluate_candidates(config.max_candidates)
-        if selected and diagnostics['queries'][-1]['status'] == 'SKIPPED':
+        if (selected and diagnostics['queries'][-1]['status'] == 'SKIPPED'
+                and not getattr(provider, 'staged', False)):
             search(domain_query(selected[2]))
         owner = selected[1]['ownership'] if selected else None
         contact_error_start = len(fetcher.errors)
@@ -172,7 +199,7 @@ def run(store, run_id, *, max_items=None, batch_size=100, provider=None,
         raise ValueError('batch_size must be 1..200; max_items must be positive')
     with store.exclusive_runner():
         _, config = store.validate_run(run_id)
-        provider = provider or DDGSearch()
+        provider = provider or default_provider()
         with store.conn:
             store.conn.execute("UPDATE discovery_attempts SET status='INTERRUPTED',finished_at=? WHERE run_id=? AND status='RUNNING'", (now(), run_id))
             store.conn.execute("UPDATE discovery_run_companies SET status='PENDING' WHERE run_id=? AND status='RUNNING'", (run_id,))
