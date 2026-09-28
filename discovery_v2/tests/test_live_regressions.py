@@ -7,7 +7,7 @@ from discovery_v2.evidence import EvidenceWriter, phone_value
 from discovery_v2.contacts import resolve_contacts, select_default, role
 from discovery_v2.interfaces import evaluate_website, ScopedFetcher
 from discovery_v2.candidates import brand_match, eligible, rank
-from test_phase_a import response, FakeFetcher
+from discovery_v2.tests.test_phase_a import response, FakeFetcher
 
 FIXTURE = json.loads(Path(__file__).with_name('fixtures').joinpath('live5.json').read_text())
 

@@ -577,7 +577,7 @@ class PhaseATests(unittest.TestCase):
         self.assertEqual(self.rows('discovery_attempts')[0]['status'], 'PARTIAL')
 
     def test_saved_docentric_gets_actual_evaluation_budget(self):
-        from test_live_regressions import FIXTURE
+        from discovery_v2.tests.test_live_regressions import FIXTURE
         company = FIXTURE['companies']['229']
         conn = sqlite3.connect(self.source)
         conn.execute('UPDATE companies_lite SET company_name=?,tax_number=?,registration_number=?,address=?,municipality=? WHERE id=1',
