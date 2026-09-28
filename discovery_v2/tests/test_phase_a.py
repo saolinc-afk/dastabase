@@ -215,6 +215,33 @@ class PhaseATests(unittest.TestCase):
         self.assertTrue(all(q['status'] == 'FAILED' for q in diagnostics['queries'][:3]))
         self.assertNotIn(secret, encode(diagnostics) + encode(self.rows('discovery_evidence')))
 
+    def test_serper_query_cap_stops_escalation_but_processes_first_evidence(self):
+        session = FakeSerperSession({'organic': [{
+            'position': 1, 'title': 'ALFA d.o.o.', 'link': 'https://alfa.si/',
+            'snippet': IDENTITY + ' info@alfa.si'}]})
+        run_id = self.create(config=Config(max_search_queries_per_company=1))
+        _, _, _, fetchers = self.execute(run_id, search=SerperSearch('mock-key', session=session), pages={})
+
+        self.assertEqual(len(session.calls), 1)
+        diagnostics = json.loads(self.rows('discovery_attempts')[0]['diagnostics_json'])
+        self.assertEqual([q['status'] for q in diagnostics['queries']],
+                         ['COMPLETED', 'SKIPPED', 'SKIPPED', 'SKIPPED'])
+        self.assertEqual([q.get('reason') for q in diagnostics['queries'][1:]],
+                         ['Search query budget exhausted'] * 3)
+        self.assertGreater(fetchers[0].requests, 0)
+        self.assertTrue(any(e['source_kind'] == 'SEARCH_RESULT' for e in self.rows('discovery_evidence')))
+        self.assertTrue(any(o['observation_type'] == 'EMAIL_CANDIDATE' for o in self.rows('discovery_observations')))
+
+    def test_serper_without_query_cap_preserves_staged_escalation(self):
+        session = FakeSerperSession({'organic': [{
+            'position': 1, 'title': 'Directory', 'link': 'https://example.org/alfa',
+            'snippet': 'Uncorroborated listing'}]})
+        self.execute(search=SerperSearch('mock-key', session=session), pages={})
+        self.assertEqual(len(session.calls), 3)
+        diagnostics = json.loads(self.rows('discovery_attempts')[0]['diagnostics_json'])
+        self.assertEqual([q['status'] for q in diagnostics['queries'][:3]], ['COMPLETED'] * 3)
+        self.assertEqual(diagnostics['queries'][3]['status'], 'SKIPPED')
+
     def test_bankruptcy_name_variants_are_ineligible_only_for_exact_marker(self):
         names = [
             'PICERIJA BUF d.o.o. - v stečaju',
@@ -405,12 +432,28 @@ class PhaseATests(unittest.TestCase):
             self.create(job_type='SUCCESSION')
         self.assertEqual(self.rows('discovery_runs'), [])
 
+    def test_cli_persists_search_query_cap_in_run_config(self):
+        target = self.root / 'capped-results.db'
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(['create', '--source', str(self.source), '--results', str(target),
+                '--namespace', 'x', '--ids', '1', '--max-search-queries-per-company', '1']), 0)
+        created = Store(target)
+        try:
+            config = json.loads(created.conn.execute('SELECT config_json FROM discovery_runs').fetchone()[0])
+            self.assertEqual(config['max_search_queries_per_company'], 1)
+        finally:
+            created.close()
+
     def test_invalid_manifest_and_config(self):
         for ids in ([], [1, 1], [999], [-1]):
             with self.assertRaises(ValueError):
                 read_manifest(self.source, ids, 'x')
         with self.assertRaises(ValueError):
             Config(max_http_requests=0)
+        for value in (0, -1, True, 1.5):
+            with self.assertRaises(ValueError):
+                Config(max_search_queries_per_company=value)
 
     def test_phone_raw_extension_and_no_invented_country(self):
         self.assertEqual(phone_value('01 234 5678 ext. 12'), '012345678;ext=12')

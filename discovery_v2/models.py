@@ -13,6 +13,7 @@ class Config:
     max_http_requests: int = 36
     max_contact_pages: int = 8
     use_municipality: bool = False
+    max_search_queries_per_company: int | None = None
 
     def __post_init__(self):
         for key, limit in (("results_per_query", 20), ("max_candidates", 30),
@@ -22,6 +23,10 @@ class Config:
                 raise ValueError(f"{key} must be between 1 and {limit}")
         if type(self.use_municipality) is not bool:
             raise ValueError("use_municipality must be boolean")
+        if (self.max_search_queries_per_company is not None
+                and (type(self.max_search_queries_per_company) is not int
+                     or self.max_search_queries_per_company < 1)):
+            raise ValueError("max_search_queries_per_company must be a positive integer")
 
     def as_dict(self):
         return asdict(self)

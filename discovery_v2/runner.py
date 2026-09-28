@@ -114,7 +114,11 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
                 writer.generated(url)
             evaluate_candidates(max(1, config.max_candidates - 2))
             for query in planned[1:]:
-                if selected:
+                if (config.max_search_queries_per_company is not None
+                        and counts['search_calls'] >= config.max_search_queries_per_company):
+                    entry = next(q for q in diagnostics['queries'] if q['query_type'] == query[0])
+                    entry.update(status='SKIPPED', reason='Search query budget exhausted')
+                elif selected:
                     entry = next(q for q in diagnostics['queries'] if q['query_type'] == query[0])
                     entry.update(status='SKIPPED', reason='Verified official website from earlier search stage')
                 else:
@@ -133,7 +137,12 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
                     and c.get('assessment', {}).get('relationship') != 'THIRD_PARTY'
                     and any(set(p.get('signals', [])) & {'company_name_exact', 'organization_name_exact', 'tax_exact', 'registration_exact'}
                             for p in c.get('assessment', {}).get('evidence', []))), None)
-        if likely and not (getattr(provider, 'staged', False) and selected):
+        staged_budget_exhausted = (getattr(provider, 'staged', False)
+            and config.max_search_queries_per_company is not None
+            and counts['search_calls'] >= config.max_search_queries_per_company)
+        if staged_budget_exhausted:
+            diagnostics['queries'][-1].update(status='SKIPPED', reason='Search query budget exhausted')
+        elif likely and not (getattr(provider, 'staged', False) and selected):
             search(domain_query(likely))
         elif likely:
             diagnostics['queries'][-1].update(status='SKIPPED', reason='Verified official website; no additional Serper query required')
@@ -254,6 +263,7 @@ def main(argv=None):
     create.add_argument('--job-type', choices=[JOB_TYPE], default=JOB_TYPE)
     create.add_argument('--execution-mode', choices=[EXECUTION_MODE], default=EXECUTION_MODE)
     create.add_argument('--use-municipality', action='store_true')
+    create.add_argument('--max-search-queries-per-company', type=int)
     for name in ('run', 'resume'):
         command = commands.add_parser(name, help='Execute pending/failed companies in this run only (network)')
         command.add_argument('--results', required=True)
@@ -266,7 +276,9 @@ def main(argv=None):
         if args.command == 'create':
             descriptor, companies = read_manifest(args.source, [int(i) for i in args.ids.split(',')], args.namespace)
             store = Store(args.results, source=args.source, create=True)
-            result = {'run_id': store.create_run(descriptor, companies, Config(use_municipality=args.use_municipality), args.job_type, args.execution_mode)}
+            config = Config(use_municipality=args.use_municipality,
+                max_search_queries_per_company=args.max_search_queries_per_company)
+            result = {'run_id': store.create_run(descriptor, companies, config, args.job_type, args.execution_mode)}
         else:
             store = Store(args.results)
             result = run(store, args.run_id, max_items=args.max_items, batch_size=args.batch_size)

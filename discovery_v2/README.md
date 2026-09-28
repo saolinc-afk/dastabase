@@ -62,6 +62,18 @@ Search uses Serper when `SERPER_API_KEY` is present in the runner environment an
 DDGS otherwise. The key is used only as the `X-API-KEY` request header and is not
 stored in evidence or diagnostics. Do not use the locked-200 or full population
 for a small live check.
+
+For a credit-capped Serper validation, add the immutable run setting at creation:
+
+```sh
+.venv/bin/python -m discovery_v2 create \
+  --source database/dastabase_lite.db --namespace frozen-sparrow09 \
+  --results /tmp/dastabase-discovery-v2-small.sqlite3 --ids 1 \
+  --max-search-queries-per-company 1
+```
+
+The cap counts search API calls per company. It does not reduce website or contact
+page fetch budgets. Omit it to retain normal staged escalation.
 There is no implicit “all companies” selection; `--ids` is mandatory at creation.
 Several IDs use `--ids 1,2,3`. Larger manifests are processed serially in chunks
 (`--batch-size 100`, maximum 200); a 500-company job does not require one transaction
