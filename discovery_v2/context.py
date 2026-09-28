@@ -3,10 +3,13 @@ import re
 from bs4 import BeautifulSoup, Comment
 from discovery.ownership import entity_context, legal_conflict, legal_form, contains_name, text, name
 
-OTHER = ('distribut', 'reseller', 'partner', 'supervisory', 'regulator', 'nadzorni',
-         'informacijski pooblasc', 'website by', 'developed by', 'designed by',
-         'izdelava splet', 'powered by', 'foreign branch', 'podruznica')
-CONTACT = ('kontakt', 'contact', 'poklicite', 'pisite nam', 'company info', 'podatki o podjetju', 'trgovina')
+OTHER = ('distribut', 'reseller', 'partner', 'supervisory', 'regulator', 'nadzorn',
+         'informacijsk pooblasc', 'website by', 'developed by', 'designed by',
+         'izdelava splet', 'powered by')
+RELATED_ENTITY = ('subsidiary', 'related entity', 'hcerinska', 'hčerinska', 'foreign branch',
+                  'podruznica', 'podružnica')
+CONTACT = ('kontakt', 'contact', 'poklicite', 'pisite nam', 'telefon', 'phone', 'mobilni',
+           'company info', 'podatki o podjetju', 'trgovina')
 
 
 def visible_soup(html):
@@ -47,11 +50,17 @@ def contact_context(node, company, soup):
     ancestry = ' '.join(' '.join(p.get('class', [])) + ' ' + p.get('id', '') for p in node.parents if p.name not in ('body', 'html'))
     ancestor_headings = ' '.join(h.get_text(' ', strip=True) for p in node.parents if p.name in ('section', 'article') for h in p.find_all(['h2', 'h3', 'h4', 'h5', 'h6'], recursive=False))
     boundary_label = text(heading + ' ' + ancestry + ' ' + ancestor_headings)
-    foreign = any(word in boundary_label for word in OTHER)
-    foreign |= any(word in text(publication) for word in OTHER if word not in ('partner', 'distribut', 'reseller'))
-    foreign |= bool(legal_form(heading) and sorted(name(heading).split()) != sorted(name(company['company_name']).split()))
     page_identity = entity_context(company, soup.get_text(' ', strip=True))
     target = entity_context(company, publication + ' ' + heading) and not legal_conflict(company, publication)
+    foreign = any(word in boundary_label for word in OTHER)
+    foreign |= any(word in text(publication) for word in OTHER if word not in ('partner', 'distribut', 'reseller'))
+    # A target entity's own office/branch can publish an attributable additional
+    # contact. A subsidiary/related section without explicit target identity cannot.
+    relationship_context = any(word in boundary_label for word in RELATED_ENTITY)
+    relationship_context |= any(word in text(publication) for word in RELATED_ENTITY)
+    foreign |= relationship_context and not target
+    foreign |= bool(legal_form(heading) and not target
+                    and sorted(name(heading).split()) != sorted(name(company['company_name']).split()))
     return publication, dict(target_entity=target, other_entity=foreign,
         single_entity_page=page_identity, contact_section=any(w in label for w in CONTACT),
         headings=[heading] if heading else [], explicit_company=target)

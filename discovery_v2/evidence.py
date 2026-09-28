@@ -14,6 +14,9 @@ from discovery_v2.store import encode, now
 
 URL_RE = re.compile(r'https?://[^\s<>"\)]+|(?<![@\w.-])(?:www\.)?[\w-]+\.(?:si|com|eu|net|org)(?:/[^\s<>"\)]*)?', re.I)
 PHONE_RE = re.compile(r'(?:tel(?:efon)?|phone|mobil(?:ni)?)\s*[:.]?\s*(\+?\d[\d ()/.-]{5,}\d(?:\s*(?:ext\.?|int\.?|x)\s*\d+)?)', re.I)
+IDENTIFIER_RE = re.compile(
+    r'(?<!\w)(?P<label>mati[čc]na(?:\s+[šs]tevilka)?|registration(?:\s+number)?|company\s+id|'
+    r'dav[čc]na(?:\s+[šs]tevilka)?|vat|id\s+za\s+ddv)(?!\w)\s*[:.]?\s*(?:SI\s*)?(?P<value>\d[\d .-]{5,}\d)', re.I)
 
 
 def phone_value(raw):
@@ -24,7 +27,10 @@ def phone_value(raw):
     if not 7 <= len(digits) <= 15:
         return None
     # Preserve national format; the company location is not numbering evidence.
-    number = ('+' if parts[0].lstrip().startswith('+') else '') + digits
+    international = parts[0].lstrip().startswith('+') or digits.startswith('00')
+    if digits.startswith('00'):
+        digits = digits[2:]
+    number = ('+' if international else '') + digits
     return number + (';ext=' + re.sub(r'\D', '', parts[1]) if len(parts) == 2 else '')
 
 
@@ -61,6 +67,46 @@ class EvidenceWriter:
             self.observe(evidence_id, 'BUSINESS_DESCRIPTION', text, locator=locator,
                          candidate=True, interpretation='Unclassified source wording; not an actual-business assertion')
 
+    def identity_identifiers(self, evidence_id, publication, locator):
+        """Record only explicitly labelled numeric identity claims needed by P0."""
+        for match in IDENTIFIER_RE.finditer(publication):
+            label = text_value(match.group('label'))
+            digits = re.sub(r'\D', '', match.group('value'))
+            kind = 'TAX_NUMBER' if any(word in label for word in ('davcna', 'vat', 'ddv')) else 'REGISTRATION_NUMBER'
+            self.observe(evidence_id, kind, match.group('value'), digits,
+                         method='labelled_identifier', locator=locator,
+                         label=match.group('label'), candidate=True)
+
+    def phone(self, evidence_id, raw, normalized, locator, publication, method='text', **value):
+        digits = re.sub(r'\D', '', normalized.split(';', 1)[0])
+        raw_digits = re.sub(r'\D', '', re.split(r'(?:;ext=|\bext\.?\s*|\bint\.?\s*|\bx\s*)(?=\d)',
+                                                    unquote(raw), maxsplit=1, flags=re.I)[0])
+        known = {}
+        for kind, field in (('TAX_NUMBER', 'tax_number'), ('REGISTRATION_NUMBER', 'registration_number')):
+            number = re.sub(r'\D', '', str(self.company.get(field) or ''))
+            if number:
+                known[number] = (kind, {'kind': 'IDENTITY_SNAPSHOT', 'field': field})
+        for observation in self.observations:
+            if observation['observation_type'] in ('TAX_NUMBER', 'REGISTRATION_NUMBER'):
+                known.setdefault(re.sub(r'\D', '', observation['normalized_value']), (
+                    observation['observation_type'],
+                    {'kind': 'OBSERVATION', 'observation_id': observation['observation_id']}))
+        labelled = None
+        for match in IDENTIFIER_RE.finditer(publication):
+            if re.sub(r'\D', '', match.group('value')) in (digits, raw_digits):
+                labelled = match.group('label')
+                break
+        matched = digits if digits in known else raw_digits if raw_digits in known else None
+        if matched or labelled:
+            kind, source = known.get(matched, ('NUMERIC_IDENTIFIER', {'kind': 'LOCAL_LABEL'}))
+            return self.observe(evidence_id, 'PHONE_EXCLUSION', raw, normalized,
+                method='numeric_identity_exclusion', locator=locator,
+                exclusion_reason='MATCHES_' + kind,
+                matched_identity_source=source, identifier_label=labelled,
+                publication=publication, **value)
+        return self.observe(evidence_id, 'PHONE_CANDIDATE', raw, normalized,
+                            method=method, locator=locator, publication=publication, **value)
+
     def search_result(self, item, query_type, query_text, provider, rank):
         url = item.get('url') or item.get('href') or ''
         title, body = item.get('title') or '', item.get('body') or item.get('snippet') or ''
@@ -70,6 +116,7 @@ class EvidenceWriter:
             result_host=urlsplit(normalize_url(url) or '').hostname or '', title=title,
             snippet_body=body, payload=item)
         text = title + '\n' + body
+        self.identity_identifiers(evidence_id, text, 'title/snippet')
         for candidate in dict.fromkeys([url] + URL_RE.findall(text)):
             normalized = normalize_url(candidate.rstrip('.,;'))
             if normalized:
@@ -84,8 +131,9 @@ class EvidenceWriter:
             raw = match.group(1)
             normalized = phone_value(raw)
             if normalized:
-                self.observe(evidence_id, 'PHONE_CANDIDATE', raw, normalized, method='search_snippet', locator='title/snippet',
-                             source_url=url, publication=text, source_kind='SEARCH_RESULT', identity_match=entity_specific(self.company, text))
+                self.phone(evidence_id, raw, normalized, 'title/snippet', text,
+                           method='search_snippet', source_url=url, source_kind='SEARCH_RESULT',
+                           identity_match=entity_specific(self.company, text))
         self.incidental(evidence_id, text, 'title/snippet')
         return evidence_id
 
@@ -106,6 +154,7 @@ class EvidenceWriter:
             final_url=response.url, http_status=response.status_code, title=title,
             content_hash=key[1], snippet_body=visible, payload={'html': response.text})
         self.pages[key] = evidence_id
+        self.identity_identifiers(evidence_id, visible, 'visible_text')
         self.incidental(evidence_id, visible, 'visible_text')
         for a in soup.find_all('a', href=True):
             publication, block = contact_context(a, self.company, soup)
@@ -119,16 +168,17 @@ class EvidenceWriter:
                 normalized = phone_value(a['href'])
                 if normalized:
                     shown = phone_value(a.get_text(' ', strip=True))
-                    self.observe(evidence_id, 'PHONE_CANDIDATE', a['href'], normalized, method='tel', locator='a[href=' + a['href'] + ']',
-                        source_url=response.url, publication=publication, block=block, title=title,
+                    self.phone(evidence_id, a['href'], normalized, 'a[href=' + a['href'] + ']', publication,
+                        method='tel', source_url=response.url, block=block, title=title,
                         display_conflict=bool(shown and shown != normalized), source_kind='FETCHED_PAGE')
         for index, node in enumerate(soup.find_all(string=True)):
             if node.find_parent('a') and node.find_parent('a').get('href', '').lower().startswith(('mailto:', 'tel:')):
                 continue
             publication, block = contact_context(node, self.company, soup)
-            common = dict(source_url=response.url, publication=publication, block=block, title=title, source_kind='FETCHED_PAGE')
+            common = dict(source_url=response.url, block=block, title=title, source_kind='FETCHED_PAGE')
             for email in sorted(extract_emails(str(node))):
-                self.observe(evidence_id, 'EMAIL_CANDIDATE', email, email, locator=f'text_node:{index}', **common)
+                self.observe(evidence_id, 'EMAIL_CANDIDATE', email, email, locator=f'text_node:{index}',
+                             publication=publication, **common)
             phone_text = str(node)
             if any(w in (publication + ' ' + ' '.join(block.get('headings', []))).lower() for w in ('pokličite', 'telefon', 'phone', 'call us')) and re.fullmatch(r'[+\d ()/.-]+', phone_text.strip()):
                 phone_text = 'Tel: ' + phone_text
@@ -136,5 +186,11 @@ class EvidenceWriter:
                 raw = match.group(1)
                 normalized = phone_value(raw)
                 if normalized:
-                    self.observe(evidence_id, 'PHONE_CANDIDATE', raw, normalized, locator=f'text_node:{index}', **common)
+                    self.phone(evidence_id, raw, normalized, f'text_node:{index}', publication, **common)
         return evidence_id
+
+
+def text_value(value):
+    import unicodedata
+    value = ''.join(c for c in unicodedata.normalize('NFKD', value.lower()) if not unicodedata.combining(c))
+    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', value).split())

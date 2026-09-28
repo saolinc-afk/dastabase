@@ -19,6 +19,18 @@ ROLE_PREFIXES = {
     'MARKETING': ('marketing', 'trzenje'),
 }
 
+GENERAL = ('glavni', 'main', 'centrala', 'switchboard', 'centralni', 'splošni', 'splosni')
+GENERAL_EMAIL = ('general company contact', 'general contact', 'splošni kontakt', 'splosni kontakt',
+                 'glavni kontakt', 'centralni kontakt')
+OFFICE = ('pisarna', 'office', 'recepcija', 'reception', 'tajništvo', 'tajnistvo')
+SALES = ('prodaja', 'sales', 'komerciala')
+DEPARTMENT = ('oddelek', 'department', 'servis', 'support', 'računovodstvo', 'racunovodstvo', 'nabava', 'marketing')
+PERSON_MOBILE = ('mobilni', 'mobile', 'gsm', 'direktor', 'vodja', 'manager')
+TRANSACTIONAL = ('vračil', 'vracil', 'returns', 'reklamacij', 'orders', 'naročil', 'narocil', 'transaction')
+LEGAL = ('zasebnost', 'privacy', 'legal', 'pravna', 'gdpr', 'pooblaščen', 'pooblascen')
+FOREIGN_OFFICE = ('foreign office', 'foreign branch', 'podružnica', 'podruznica', 'subsidiary',
+                  'office in', 'pisarna v', 'foreign market', 'tuji trg', 'mednarodn', 'international')
+
 
 def role(value, kind, company=None):
     if kind == 'PHONE':
@@ -79,18 +91,85 @@ def resolve_contacts(company, observations, owner, responses):
         decisions = [(observation, *attribution(company, observation, owner, responses, corroborated)) for observation in items]
         primary, status, reason = min(decisions, key=lambda d: (order[d[1]], not d[0]['value'].get('block', {}).get('explicit_company'), not d[0]['value'].get('block', {}).get('contact_section')))
         contact_role = role(normalized, kind, company)
+        # Default ranking may use only contexts that independently passed
+        # attribution. Search candidates and rejected publications cannot lend
+        # a stronger role to an otherwise attributable contact.
+        ranking_items = [o for o, s, _ in decisions if s == 'ATTRIBUTED'] or [primary]
+        ranking = ranking_context(company, kind, normalized, ranking_items, contact_role)
         contacts.append(dict(contact_id=uid(), contact_type=kind, raw_value=primary['raw_value'],
             normalized_value=normalized, primary_observation_id=primary['observation_id'],
             supporting_observation_ids_json=encode([o['observation_id'] for o in items]),
             attribution_status=status, attribution_reason=reason, rule_version=RULE_VERSION,
             roles_json=encode([contact_role]), role_basis_json=encode({
-                'basis': 'email local-part hint' if kind == 'EMAIL' else 'unclassified phone',
+                'basis': 'email local-part and publication context' if kind == 'EMAIL' else 'phone publication context',
+                'default_rank': ranking['rank'], 'ranking_reasons': ranking['reasons'],
+                'ranking_observation_id': ranking['ranking_observation_id'],
+                'country_context': ranking.get('country_context'),
                 'not_person_identity': True,
                 'explicit_company': bool(primary['value'].get('block', {}).get('explicit_company')),
                 'contact_section': bool(primary['value'].get('block', {}).get('contact_section')),
                 'observation_assessments': [{'observation_id': o['observation_id'], 'status': s, 'reason': r} for o, s, r in decisions]}),
             person_name=None, person_title=None, department=None, person_context_evidence_json='{}'))
     return contacts
+
+
+def ranking_context(company, kind, normalized, observations, contact_role):
+    contexts = []
+    for observation in observations:
+        value = observation.get('value') or {}
+        headings = ' '.join(value.get('block', {}).get('headings', []))
+        contexts.append(text(value.get('publication', '') + ' ' + headings))
+    if kind == 'EMAIL':
+        choices = []
+        for index, (observation, context) in enumerate(zip(observations, contexts)):
+            if any(w in context for w in TRANSACTIONAL): choice = 60, 'transactional/returns context'
+            elif any(w in context for w in LEGAL): choice = 50, 'privacy/legal context'
+            elif contact_role == 'PERSON': choice = 40, 'named-person mailbox'
+            elif any(w in context for w in GENERAL_EMAIL): choice = 0, 'explicit general company contact'
+            elif any(w in context for w in OFFICE): choice = 10, 'office/reception context'
+            elif contact_role == 'GENERAL': choice = 15, 'general mailbox role'
+            elif contact_role == 'SALES' or any(w in context for w in SALES): choice = 20, 'sales context'
+            elif contact_role not in ('UNKNOWN', 'GENERAL'): choice = 30, 'department context'
+            else: choice = 25, 'unclassified company mailbox'
+            choices.append((*choice, index, observation['observation_id']))
+        rank, reason, _, observation_id = min(choices, key=lambda item: (item[0], item[2]))
+        return {'rank': rank, 'reasons': [reason], 'ranking_observation_id': observation_id}
+
+    number = normalized.split(';', 1)[0]
+    international = number.startswith('+')
+    target_country = '386'  # Discovery v2 currently operates on Slovenian source entities.
+    foreign = international and not number.startswith('+' + target_country)
+    target_country_match = (not foreign) if international else None
+    choices = []
+    for index, (observation, context) in enumerate(zip(observations, contexts)):
+        explicit_general = any(w in context for w in GENERAL)
+        if explicit_general: rank, reason = 0, 'labelled main telephone/switchboard'
+        elif any(w in context for w in OFFICE): rank, reason = 10, 'office/reception telephone'
+        elif any(w in context for w in SALES): rank, reason = 30, 'sales telephone'
+        elif any(w in context for w in DEPARTMENT): rank, reason = 40, 'department telephone'
+        elif any(w in context for w in PERSON_MOBILE): rank, reason = 50, 'employee/mobile context'
+        else: rank, reason = 20, 'general unlabeled company telephone'
+        target = bool((observation.get('value') or {}).get('block', {}).get('target_entity'))
+        foreign_context = any(w in context for w in FOREIGN_OFFICE)
+        reasons = [reason]
+        if foreign or (target_country_match is None and foreign_context):
+            if explicit_general and target:
+                reasons.append('foreign number explicitly labelled as target entity primary/general contact')
+            else:
+                rank += 100
+                reasons.append('foreign or unknown-country number lacks explicit target-entity primary/general context')
+            if foreign_context and not (explicit_general and target):
+                rank += 50
+                reasons.append('foreign office/market context')
+        elif target_country_match is True:
+            rank -= 2
+            reasons.append('target-country telephone context')
+        choices.append((rank, reasons, foreign_context, index, observation['observation_id']))
+    rank, reasons, foreign_context, _, observation_id = min(choices, key=lambda item: (item[0], item[3]))
+    return {'rank': rank, 'reasons': reasons, 'ranking_observation_id': observation_id,
+            'country_context': {'normalized_international_number': number if international else None,
+                                'target_country_match': target_country_match,
+                                'foreign_context': foreign_context}}
 
 
 def select_default(contacts, kind):
@@ -102,7 +181,7 @@ def select_default(contacts, kind):
     def rank(c):
         roles = json.loads(c['roles_json'])
         basis = json.loads(c.get('role_basis_json', '{}'))
-        category = 0 if 'GENERAL' in roles else (2 if 'UNKNOWN' in roles else 1)
+        category = basis.get('default_rank', 0 if 'GENERAL' in roles else (2 if 'UNKNOWN' in roles else 1))
         return category, not basis.get('explicit_company'), not basis.get('contact_section'), c['normalized_value']
     selected = min(candidates, key=rank)
     return selected['contact_id']
