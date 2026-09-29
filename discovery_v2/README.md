@@ -308,3 +308,33 @@ fixture, never the original temporary database. Remaining limits: CSS computed v
 external stylesheets and JavaScript-rendered content are not evaluated; context,
 roles and branding remain conservative heuristics. Source-specific adapters and
 live provider relevance/recall tuning remain outside this correction checkpoint.
+
+## Read-only CRM CSV export
+
+`discovery_v2.export` joins canonical company fields from `dastabase_lite.db`
+with accepted results from one or more isolated Discovery v2 databases:
+
+```sh
+python -m discovery_v2.export \
+  --source database/dastabase_lite.db \
+  --results /path/to/pilot20/results.sqlite3 \
+  --results /path/to/batch100/results.sqlite3 \
+  --output companies.csv
+```
+
+All SQLite inputs use URI `mode=ro` plus `PRAGMA query_only=ON`. The exporter
+never changes source or result data. `--company-id ID` may be repeated to select
+canonical companies explicitly. `--run-id RESULTS_DB=RUN_ID` restricts a result
+database when it contains multiple runs.
+
+For duplicate companies, the default `--precedence newest` accepts only a unique
+newest timezone-aware `discovery_company_results.completed_at`. Missing, invalid,
+or tied timestamps fail instead of guessing. `--precedence input-order` is an
+explicit caller decision that gives the first `--results` source priority;
+multiple ambiguous runs inside that source still require reliable timestamps or
+an explicit `--run-id`. Filesystem modification times are never used.
+
+Only `VERIFIED`, `HIGH`, and `MEDIUM` official websites are exported. Email and
+phone values come only from the result's explicit default contact IDs and must
+resolve to an `ATTRIBUTED` contact of the correct type. Evidence and observation
+IDs are retained as provenance columns.
