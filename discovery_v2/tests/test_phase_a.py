@@ -419,6 +419,100 @@ class PhaseATests(unittest.TestCase):
         self.assertTrue(any(row['source_kind'] == 'GENERATED_CANDIDATE'
                             for row in self.rows('discovery_evidence')))
 
+    def test_directory_snippet_url_is_verified_as_separate_candidate(self):
+        hinted = 'http://www.gek.si/'
+        search = FakeSearch([{
+            'url': 'https://www.bizi.si/alfa', 'title': 'ALFA d.o.o. - Bizi',
+            'body': f'{IDENTITY} Spletna stran: {hinted}',
+        }])
+        run_id = self.create(config=Config(max_search_queries_per_company=1))
+        run_id, _, provider, fetchers = self.execute(
+            run_id, search=search,
+            pages={hinted: response(HTML, 'https://www.gek.si/')})
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertIn(hinted, fetchers[0].calls)
+        result = self.store.current_results(run_id)[0]
+        self.assertEqual(result['official_website'], 'https://www.gek.si/')
+        candidate = next(o for o in self.rows('discovery_observations')
+                         if o['observation_type'] == 'WEBSITE_CANDIDATE'
+                         and o['normalized_value'] == hinted)
+        value = json.loads(candidate['value_json'])
+        self.assertEqual(candidate['extraction_method'], 'snippet_url')
+        self.assertEqual(value['candidate_origin'], 'SNIPPET_URL')
+        self.assertEqual(value['source_result_rank'], 1)
+
+    def test_directory_company_email_domain_is_candidate_but_public_mail_is_not(self):
+        company_domain = 'https://ekamant.si/'
+        search = FakeSearch([{
+            'url': 'https://www.bizi.si/alfa', 'title': 'ALFA d.o.o. - Bizi',
+            'body': f'{IDENTITY} ekamant@ekamant.si something@siol.net',
+        }])
+        run_id = self.create(config=Config(max_search_queries_per_company=1))
+        run_id, _, provider, fetchers = self.execute(
+            run_id, search=search, pages={company_domain: response(HTML, company_domain)})
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertIn(company_domain, fetchers[0].calls)
+        candidates = [o for o in self.rows('discovery_observations')
+                      if o['observation_type'] == 'WEBSITE_CANDIDATE']
+        company_candidate = next(o for o in candidates
+                                 if o['normalized_value'] == company_domain)
+        self.assertEqual(company_candidate['extraction_method'], 'email_domain')
+        self.assertEqual(json.loads(company_candidate['value_json'])['candidate_origin'],
+                         'SNIPPET_EMAIL_DOMAIN')
+        self.assertFalse(any(o['normalized_value'] == 'https://siol.net/'
+                             for o in candidates))
+        self.assertEqual(self.store.current_results(run_id)[0]['official_website'],
+                         company_domain)
+
+    def test_entity_specific_direct_subdomain_can_verify_on_different_parent_brand(self):
+        subdomain = 'https://alfa.parent-brand.si/alfa/'
+        search = FakeSearch([{
+            'url': subdomain, 'title': 'ALFA d.o.o.', 'body': IDENTITY,
+        }])
+        run_id = self.create(config=Config(max_search_queries_per_company=1))
+        run_id, _, provider, _ = self.execute(
+            run_id, search=search, pages={subdomain: response(HTML, subdomain)})
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(self.store.current_results(run_id)[0]['official_website'],
+                         subdomain)
+
+    def test_email_derived_direct_brand_competes_with_international_candidate(self):
+        international = 'https://alfa-abrasives.eu/'
+        derived = 'https://alfa.si/'
+        search = FakeSearch([
+            {'url': international, 'title': 'ALFA international', 'body': IDENTITY},
+            {'url': 'https://www.bizi.si/alfa', 'title': 'ALFA d.o.o. - Bizi',
+             'body': f'{IDENTITY} info@alfa.si'},
+        ])
+        pages = {
+            international: response(HTML, international),
+            derived: response(HTML, derived),
+        }
+        run_id = self.create(config=Config(max_search_queries_per_company=1))
+        run_id, _, provider, fetchers = self.execute(
+            run_id, search=search, pages=pages)
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertIn(international, fetchers[0].calls)
+        self.assertIn(derived, fetchers[0].calls)
+        self.assertEqual(self.store.current_results(run_id)[0]['official_website'], derived)
+
+    def test_direct_first_party_result_still_verifies_with_one_query(self):
+        direct = 'https://k-print.si/'
+        search = FakeSearch([{
+            'url': direct, 'title': 'ALFA d.o.o. Kontakt',
+            'body': f'{IDENTITY} info@k-print.si',
+        }])
+        run_id = self.create(config=Config(max_search_queries_per_company=1))
+        run_id, _, provider, _ = self.execute(
+            run_id, search=search, pages={direct: response(HTML, direct)})
+
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(self.store.current_results(run_id)[0]['official_website'], direct)
+
     def test_empty_search_has_diagnostics_and_domain_skip(self):
         self.execute(search=FakeSearch([]), pages={})
         diagnostics = json.loads(self.rows('discovery_attempts')[0]['diagnostics_json'])

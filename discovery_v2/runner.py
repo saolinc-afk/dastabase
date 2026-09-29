@@ -66,6 +66,7 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
         result_rank = source.get('result_rank')
         return (observation['extraction_method'] == 'domain_guess',
                 not observation.get('value', {}).get('identity_match', False),
+                observation['extraction_method'] not in ('snippet_url', 'email_domain'),
                 result_rank if isinstance(result_rank, int) and result_rank > 0 else 10_000,
                 rank(company, observation))
 

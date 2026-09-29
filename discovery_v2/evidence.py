@@ -20,6 +20,10 @@ OBFUSCATED_EMAIL_RE = re.compile(
     r'([A-Z0-9.-]+)\s*(?:\[dot\]|\(dot\)|\.)\s*([A-Z]{2,63})(?![\w.-])', re.I)
 CONTACT_NUMBER_LABEL_RE = re.compile(
     r'\b(telefaks|telefax|facsimile|faks|fax|telefon|tel|phone|mobil(?:ni)?)\b', re.I)
+PUBLIC_EMAIL_DOMAINS = frozenset({
+    'gmail.com', 'hotmail.com', 'outlook.com', 'live.com', 'yahoo.com',
+    'icloud.com', 'me.com', 'siol.net', 't-2.net', 'amis.net', 'aol.com',
+})
 
 
 def phone_value(raw):
@@ -153,11 +157,25 @@ class EvidenceWriter:
         for candidate in dict.fromkeys([url] + URL_RE.findall(text)):
             normalized = normalize_url(candidate.rstrip('.,;'))
             if normalized:
+                direct = candidate == url
                 self.observe(evidence_id, 'WEBSITE_CANDIDATE', candidate, normalized,
-                             method='search_url' if candidate == url else 'snippet_url', locator='result_url' if candidate == url else 'title/snippet', title=title, body=body, identity_match=entity_specific(self.company, text))
+                             method='search_url' if direct else 'snippet_url',
+                             locator='result_url' if direct else 'title/snippet',
+                             title=title, body=body,
+                             identity_match=entity_specific(self.company, text),
+                             candidate_origin='DIRECT_SEARCH_RESULT' if direct else 'SNIPPET_URL',
+                             source_result_url=url, source_result_rank=rank)
         for email in sorted(extract_emails(text)):
-            if entity_specific(self.company, text):
-                self.observe(evidence_id, 'WEBSITE_CANDIDATE', email, 'https://' + email.rsplit('@', 1)[1] + '/', method='email_domain', locator='title/snippet', identity_match=True)
+            email_domain = email.rsplit('@', 1)[1].lower()
+            if (entity_specific(self.company, text)
+                    and email_domain not in PUBLIC_EMAIL_DOMAINS
+                    and not blocks_official('https://' + email_domain + '/')):
+                self.observe(evidence_id, 'WEBSITE_CANDIDATE', email,
+                             'https://' + email_domain + '/', method='email_domain',
+                             locator='title/snippet', identity_match=True,
+                             candidate_origin='SNIPPET_EMAIL_DOMAIN',
+                             source_result_url=url, source_result_rank=rank,
+                             source_email=email)
             self.observe(evidence_id, 'EMAIL_CANDIDATE', email, email, method='search_snippet', locator='title/snippet',
                          source_url=url, publication=text, source_kind='SEARCH_RESULT', identity_match=entity_specific(self.company, text))
         for match in PHONE_RE.finditer(text):

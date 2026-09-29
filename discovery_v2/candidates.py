@@ -44,10 +44,11 @@ def primary_rank(company, observation, assessment, evidence_row=None):
     return (
         not direct,
         {'VERIFIED': 0, 'HIGH': 1, 'MEDIUM': 2}.get(assessment.get('status'), 3),
+        not brand_match(company, scope),
         observation.get('extraction_method') == 'domain_guess',
         not observation.get('value', {}).get('identity_match', False),
+        observation.get('extraction_method') in ('snippet_url', 'email_domain'),
         result_rank if isinstance(result_rank, int) and result_rank > 0 else 10_000,
-        not brand_match(company, scope),
         not normalize_domain(scope).endswith('.si'),
         len(scope),
     )

@@ -182,7 +182,7 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(lineage['source_run_id'], self.source_run)
         self.assertEqual(lineage['replay_mode'], 'OFFLINE_REPLAY')
         self.assertTrue(lineage['network_disabled'])
-        self.assertEqual(lineage['engine_version'], 'discovery-v2-phase-a-4')
+        self.assertEqual(lineage['engine_version'], 'discovery-v2-phase-a-5')
         self.assertTrue(destination.exists())
 
     def test_source_and_destination_must_differ_and_destination_is_new(self):

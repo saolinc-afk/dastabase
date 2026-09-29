@@ -122,6 +122,11 @@ All returned search results within budget are saved with query, rank, provider,
 URL/host, title, snippet, timestamps and full provider payload **before** official
 website eligibility filtering. Observations include website/domain, email, phone,
 identity matches, explicit SKD wording and unclassified descriptive source wording.
+Explicit URLs and non-public email domains found inside entity-specific snippets
+become separately attributed website candidates. Their observation records retain
+the source result URL and rank; they still require normal fetch and ownership
+verification. Public mailbox providers such as Gmail, Outlook and Siol never seed
+website candidates.
 Generated domain guesses have `GENERATED_CANDIDATE` evidence so even hypotheses
 have an origin. Fetched HTML, visible text, final URL and content hash are retained.
 
