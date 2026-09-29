@@ -38,10 +38,10 @@ class OwnershipHarness:
                                    'body': body + '; Website ' + url},
                                   'LEGAL_COMPANY_CONTACT', 'offline', 'fixture', rank)
 
-    def page(self, html, url=DOMAIN):
+    def page(self, html, url=DOMAIN, requested_url=None):
         page = response(html, url)
         self.responses[url] = page
-        self.writer.page(url, page)
+        self.writer.page(requested_url or url, page)
 
     def decide(self, url=DOMAIN, legacy_result=None):
         return evaluate(self.company, url, self.writer,
@@ -312,6 +312,54 @@ class NamedRuleTests(unittest.TestCase):
         decision = sub.decide(url)
         self.assertEqual(decision['rule_id'], 'OWN-05_SUBSIDIARY_SCOPE')
         self.assertEqual(decision['verification_scope'], url)
+
+    def test_exact_entity_on_company_subdomain_is_scoped_not_standalone(self):
+        company = {**COMPANY, 'company_name': 'EKOREL d.o.o.',
+                   'address': 'Cesta 7, 1000 Ljubljana'}
+        h = OwnershipHarness(company); url = 'https://ekorel.parent.si/kontakt/'
+        h.page('<section>EKOREL d.o.o.; Cesta 7, 1000 Ljubljana</section>'
+               '<footer>PARENT HOLDING d.o.o.</footer>', url)
+        decision = h.decide(url)
+        self.assertEqual(decision['status'], 'VERIFIED')
+        self.assertEqual(decision['rule_id'], 'OWN-07_SCOPED_ENTITY_PAGE')
+        self.assertEqual(decision['relationship'], 'ENTITY_PAGE_ON_GROUP_DOMAIN')
+        self.assertEqual(decision['verification_scope'], url)
+        self.assertNotIn('CONFLICTING_LEGAL_ENTITY', decision['blockers'])
+
+    def test_exact_entity_page_on_group_host_is_scoped(self):
+        h = OwnershipHarness(); url = 'https://group.example/skupina/alfa-stroji/'
+        h.page('<section>ALFA STROJI d.o.o.; VAT: 12345678; '
+               'Glavna ulica 12, 1000 Ljubljana</section>', url)
+        decision = h.decide(url)
+        self.assertEqual(decision['rule_id'], 'OWN-07_SCOPED_ENTITY_PAGE')
+        self.assertEqual(decision['relationship'], 'ENTITY_PAGE_ON_GROUP_DOMAIN')
+        self.assertEqual(decision['verification_scope'], url)
+
+    def test_scoped_entity_page_still_rejects_local_conflicting_entity(self):
+        h = OwnershipHarness(); url = 'https://group.example/skupina/alfa-stroji/'
+        h.page('<section>ALFA STROJI d.o.o.; VAT: 12345678; '
+               'Website operated by BETA HOLDING d.o.o.</section>', url)
+        decision = h.decide(url)
+        self.assertEqual(decision['status'], 'REVIEW')
+        self.assertIn('CONFLICTING_LEGAL_ENTITY', decision['blockers'])
+
+    def test_company_domain_redirect_uses_final_canonical_scope(self):
+        h = OwnershipHarness(); requested = 'https://alfa-stroji.si/'
+        final = 'https://alfa-machines.com/kontakt/'
+        h.page('<section>ALFA STROJI d.o.o.; Glavna ulica 12, '
+               '1000 Ljubljana</section>', final, requested_url=requested)
+        decision = h.decide(requested)
+        self.assertEqual(decision['status'], 'VERIFIED')
+        self.assertEqual(decision['verification_scope'], final)
+
+    def test_timeout_does_not_beat_verified_international_candidate(self):
+        h = OwnershipHarness(); weak = 'https://alfa-stroji.si/'
+        strong = 'https://alfa-abrasives.eu/legal/'
+        h.failures[weak] = ['read timeout']
+        h.page('<section>ALFA STROJI d.o.o.; VAT: 12345678</section>', strong)
+        self.assertEqual(h.decide(weak)['status'], 'REVIEW')
+        self.assertEqual(h.decide(weak)['fetch_state']['status'], 'TIMEOUT')
+        self.assertEqual(h.decide(strong)['status'], 'VERIFIED')
 
     def test_related_foreign_entity_and_implied_brand_remain_review(self):
         related = OwnershipHarness(); related.page('<h1>BETA GmbH</h1><p>Foreign subsidiary</p>')

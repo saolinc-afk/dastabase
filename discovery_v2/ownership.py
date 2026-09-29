@@ -10,6 +10,7 @@ from discovery.ownership import scope_url, canonical_path, in_scope, page_type, 
 from discovery_v2.identity import fold, normalize_legal_name
 
 RELATIONSHIPS = ('STANDALONE', 'BRAND_OF_ENTITY', 'SUBSIDIARY_ON_GROUP_DOMAIN',
+                 'ENTITY_PAGE_ON_GROUP_DOMAIN',
                  'GROUP_PARENT', 'RELATED_ENTITY', 'AMBIGUOUS', 'UNRELATED')
 TRUSTED_ENTITY_HOSTS = ('bizi.si', 'companywall.si', 'companywall.eu', 'ebonitete.si')
 GROUP_WORDS = ('member of group', 'part of group', 'član skupine', 'clan skupine',
@@ -54,6 +55,7 @@ RULES = {
     'OWN-04_MULTISOURCE_ENTITY_DOMAIN': 'STANDALONE',
     'OWN-05_SUBSIDIARY_SCOPE': 'SUBSIDIARY_ON_GROUP_DOMAIN',
     'OWN-06_SUPPORTED_BRAND': 'BRAND_OF_ENTITY',
+    'OWN-07_SCOPED_ENTITY_PAGE': 'ENTITY_PAGE_ON_GROUP_DOMAIN',
 }
 
 CONFIDENCE_RULES = {
@@ -75,6 +77,20 @@ def _domain_name_match(company, url):
     target = ''.join(name(company.get('company_name', '')).split())
     labels = normalize_domain(url).split('.')[:-1]
     return len(target) >= 3 and any(re.sub(r'[^a-z0-9]', '', label) == target for label in labels)
+
+
+def _company_specific_subdomain(company, url):
+    """A target-named tenant below a differently named registrable host."""
+    labels = normalize_domain(url).split('.')
+    target = ''.join(name(company.get('company_name', '')).split())
+    return (len(labels) >= 3 and len(target) >= 3
+            and any(re.sub(r'[^a-z0-9]', '', label) == target for label in labels[:-2]))
+
+
+def _company_specific_path(company, url):
+    target = ''.join(name(company.get('company_name', '')).split())
+    path = re.sub(r'[^a-z0-9]', '', fold(urlsplit(url).path))
+    return len(target) >= 3 and target in path
 
 
 def publisher_id(host):
@@ -222,8 +238,17 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
     legacy_result = legacy_result or {}
     domain = normalize_domain(candidate_url)
     rows, observations = writer.evidence_rows, writer.observations
+    # A recorded response requested from the candidate is the only authority
+    # for following a cross-domain canonical redirect. Once established, the
+    # verifier's subsequent pages on that final host belong to this assessment.
+    redirect_domains = {normalize_domain(row.get('final_url') or '') for row in rows.values()
+        if row.get('source_kind') == 'FETCHED_PAGE'
+        and normalize_domain(row.get('requested_url') or '') == domain
+        and row.get('final_url')
+        and normalize_domain(row.get('final_url') or '') != domain}
+    accepted_domains = {domain} | redirect_domains
     fetched = {eid: row for eid, row in rows.items() if row.get('source_kind') == 'FETCHED_PAGE'
-               and normalize_domain(row.get('final_url') or '') == domain}
+               and normalize_domain(row.get('final_url') or '') in accepted_domains}
     links = [o for o in observations if o['observation_type'] == 'WEBSITE_CANDIDATE'
              and normalize_domain(o['normalized_value']) == domain]
     relevant = set(fetched) | {o['evidence_id'] for o in links}
@@ -243,8 +268,9 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
         or any(page_classification(row) in UNSELECTABLE_PAGE_CLASSES for row in candidate_rows))
     if candidate_is_third_party:
         blockers.append('THIRD_PARTY_PAGE')
-    if conflicts: blockers.append('EXACT_IDENTIFIER_CONFLICT')
-    if blocks_official(candidate_url): blockers.append('DISALLOWED_PUBLISHER_DOMAIN')
+    if blocks_official(candidate_url) or any(blocks_official(row.get('final_url') or '')
+                                             for row in fetched.values()):
+        blockers.append('DISALLOWED_PUBLISHER_DOMAIN')
     if any('parked_domain' in p.get('signals', []) for p in legacy_result.get('evidence', [])) or any(
             any(marker in fold(row.get('snippet_body')) for marker in
                 ('domain for sale', 'domain is for sale', 'buy this domain', 'domena je naprodaj', 'sedo domain parking'))
@@ -276,8 +302,10 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
                      for row in fetched.values())
     for (eid, block_id), local in blocks.items():
         row = fetched[eid]; url = row['final_url']
+        evaluation_scope = (scope_url(url) if normalize_domain(url) in redirect_domains
+                            else candidate_url)
         # Never preserve authority from a pre-redirect path or borrow sibling evidence.
-        if not in_scope(url, candidate_url): continue
+        if not in_scope(url, evaluation_scope): continue
         if row.get('http_status') != 200 or classifications[eid] in UNSELECTABLE_PAGE_CLASSES: continue
         legal = _exact(local, 'LEGAL_NAME')
         identifiers = _exact(local, 'TAX_NUMBER', 'REGISTRATION_NUMBER')
@@ -288,7 +316,15 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
         brand = [o for o in relationships if o['normalized_value'] == 'BRAND_OF_ENTITY']
         aliases = [o for o in local if o['observation_type'] == 'ALIAS' and o['value'].get('verification_status') == 'ALIAS_SUPPORTED']
         # Treat other explicit legal names conservatively even on subsidiary pages.
-        other_names = [o for o in claims if o['evidence_id'] == eid and o['observation_type'] == 'ALIAS'
+        scoped_entity_page = ((group_seen and _company_specific_path(company, url))
+                              or _company_specific_subdomain(company, url))
+        # A parent footer is expected on a bounded entity page and does not
+        # redefine that page's subject. Only a block that identifies the target
+        # can authorize it or contradict its identity.
+        if scoped_entity_page and not legal:
+            continue
+        conflict_pool = local if scoped_entity_page else claims
+        other_names = [o for o in conflict_pool if o['evidence_id'] == eid and o['observation_type'] == 'ALIAS'
                        and o['value'].get('verification_status') == 'UNVERIFIED'
                        and o['value'].get('qualifiers', {}).get('block_id')]
         # Regex captures may include the affirmative operator prefix. An exact
@@ -299,6 +335,9 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
         other_names = [o for o in other_names if _material_conflicting_entity(company, o)]
         if other_names:
             blockers.append('CONFLICTING_LEGAL_ENTITY'); continue
+        conflict_ids = {o['observation_id'] for o in conflicts}
+        if any(o['observation_id'] in conflict_ids for o in local):
+            blockers.append('EXACT_IDENTIFIER_CONFLICT'); continue
         # Keep the fetched URL's encoded path. Decoding reserved characters
         # here can turn an entity tenant into a query and broaden scope to '/'.
         scope = scope_url(url, (urlsplit(url).path or '/').rstrip('/') + '/')
@@ -307,6 +346,12 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
         if group and operator and legal and (identifiers or address) and canonical_path(url) != '/':
             rule = 'OWN-05_SUBSIDIARY_SCOPE'; authorization_basis = 'EXPLICIT_OPERATOR'
             identity = legal + (identifiers or address); relation = group
+        elif scoped_entity_page and legal and (identifiers or address):
+            # This authorizes only the exact target's bounded page/tenant. It
+            # deliberately makes no claim that the target operates the parent
+            # host, and it never composes identity across blocks or pages.
+            rule = 'OWN-07_SCOPED_ENTITY_PAGE'; authorization_basis = 'STRONG_SCOPED_ENTITY_PAGE'
+            identity = legal + (identifiers or address)
         elif group_seen and not (operator and canonical_path(url) == '/'):
             continue
         elif operator and legal:
@@ -339,7 +384,10 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
                 supporting_observation_ids=sorted({o['observation_id'] for o in witnesses}),
                 supporting_evidence_ids=sorted({o['evidence_id'] for o in witnesses}),
                 context={'evidence_id': eid, 'block_id': block_id, 'source_url': url,
-                         'source_host': domain, 'page_classification': classifications[eid]}))
+                         'source_host': normalize_domain(url),
+                         'page_classification': classifications[eid]}))
+    if conflicts and not any(c['rule_id'] == 'OWN-07_SCOPED_ENTITY_PAGE' for c in candidates):
+        blockers.append('EXACT_IDENTIFIER_CONFLICT')
     blockers = sorted(set(blockers))
     selected = min(candidates, key=lambda c: (c['verification_scope'], c['rule_id'], c['context']['block_id'])) if candidates and not blockers else {}
 
