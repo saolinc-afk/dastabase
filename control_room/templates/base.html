@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}Control Room{% endblock %} · Dastabase</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='control_room.css') }}">
+  <script defer src="{{ url_for('static', filename='control_room.js') }}"></script>
+</head>
+<body>
+<header>
+  <a class="brand" href="{{ url_for('overview') }}"><strong>dastabase_</strong><span>CONTROL ROOM</span></a>
+  <div class="model"><span>MODEL</span><strong>{{ engine.engine_name }} v{{ engine.engine_version }}</strong></div>
+</header>
+<nav>{% for endpoint,label in [('overview','OVERVIEW'),('enrich','ENRICH'),('jobs','JOBS'),('data','DATA')] %}<a href="{{ url_for(endpoint) }}" class="{{ 'active' if page == endpoint else '' }}">{{ label }}</a>{% endfor %}</nav>
+<main>{% block content %}{% endblock %}</main>
+<footer>&gt; control room foundation · persistent jobs · local orchestration</footer>
+</body></html>

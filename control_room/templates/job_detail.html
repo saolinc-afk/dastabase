@@ -1,0 +1,12 @@
+{% extends 'base.html' %}{% block title %}{{ job.display_id }}{% endblock %}
+{% block content %}
+<div class="page-title"><span>03</span><h1>{{ job.display_id }}</h1><i>_</i></div>
+<section class="detail" data-job-id="{{ job.job_id }}">
+  <div class="job-heading"><strong data-field="name">{{ job.display_name }}</strong><span class="status status-{{ job.status|lower }}" data-field="status">{{ job.status }}</span></div>
+  <div class="progress-label"><span data-field="progress">{{ job.processed_company_count }} / {{ job.selected_company_count }}</span><span data-field="percent">{{ job.percent }}%</span></div><progress max="100" value="{{ job.percent }}"></progress>
+  <div class="grid metrics"><div><small>EMAILS</small><b data-field="emails">{{ job.emails_found }}</b></div><div><small>WEBSITES</small><b data-field="websites">{{ job.websites_found }}</b></div><div><small>PHONES</small><b data-field="phones">{{ job.phones_found }}</b></div></div>
+  <div class="facts"><div><span>Created</span><b>{{ job.created_at }}</b></div><div><span>Started</span><b data-field="started">{{ job.started_at or 'N/A' }}</b></div><div><span>Finished</span><b data-field="finished">{{ job.finished_at or 'N/A' }}</b></div><div><span>Worker heartbeat</span><b data-field="heartbeat">{{ job.worker_heartbeat_at or 'N/A' }}</b></div></div>
+  {% if job.error_message %}<p class="error" data-field="error">{{ job.error_code }} · {{ job.error_message }}</p>{% else %}<p class="error" data-field="error"></p>{% endif %}
+  <h2>EVENT LOG</h2><div class="terminal" data-events>{% for event in events %}<div>&gt; {{ event.created_at|clock }} {{ event.message }}</div>{% endfor %}</div>
+</section>
+{% endblock %}

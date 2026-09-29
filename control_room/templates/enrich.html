@@ -1,0 +1,20 @@
+{% extends 'base.html' %}{% block title %}Enrich{% endblock %}
+{% block content %}
+<div class="page-title"><span>02</span><h1>ENRICH</h1><i>_</i></div>
+<section class="form-card">
+  <h2>NEW FAKE ENRICHMENT</h2>
+  <p class="muted">Foundation demo only. No network, Serper, Discovery database, or canonical database writes.</p>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <form method="post">
+    <label>JOB NAME<input name="display_name" maxlength="120" required value="Foundation demo"></label>
+    <label>NUMBER OF FAKE COMPANIES<input name="company_count" type="number" min="1" max="1000" value="100" required></label>
+    <fieldset><legend>MODULES</legend>
+      <label class="module"><input type="checkbox" checked disabled> Discovery + Contacts <span>ACTIVE</span></label>
+      <label class="module disabled"><input type="checkbox" disabled> Company Profile <span>COMING SOON</span></label>
+      <label class="module disabled"><input type="checkbox" disabled> Succession <span>COMING SOON</span></label>
+      <label class="module disabled"><input type="checkbox" disabled> People &amp; Decision Makers <span>COMING SOON</span></label>
+    </fieldset>
+    <button type="submit">START ENRICHMENT</button>
+  </form>
+</section>
+{% endblock %}

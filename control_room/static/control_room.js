@@ -1,0 +1,9 @@
+'use strict';
+const root=document.querySelector('[data-job-id]');
+const field=(name,value)=>{const target=root?.querySelector(`[data-field="${name}"]`);if(target)target.textContent=value ?? 'N/A'};
+const duration=v=>v==null?'N/A':new Date(v).toLocaleString();
+function render(payload){if(!root||!payload.job)return;const j=payload.job;
+ field('name',j.display_name);field('status',j.status);const status=root.querySelector('[data-field="status"]');if(status)status.className=`status status-${j.status.toLowerCase()}`;field('progress',`${j.processed_company_count} / ${j.selected_company_count}`);field('percent',`${j.percent}%`);field('emails',j.emails_found);field('websites',j.websites_found);field('phones',j.phones_found);field('started',duration(j.started_at));field('finished',duration(j.finished_at));field('heartbeat',duration(j.worker_heartbeat_at));field('error',j.error_message?`${j.error_code} · ${j.error_message}`:'');
+ const bar=root.querySelector('progress');if(bar)bar.value=j.percent||0;const events=root.querySelector('[data-events]');if(events){events.replaceChildren(...payload.events.map(e=>{const n=document.createElement('div');n.textContent=`> ${new Date(e.created_at).toLocaleTimeString()} ${e.message}`;return n}));events.scrollTop=events.scrollHeight}}
+async function poll(){if(!root)return;try{const id=root.dataset.jobId;const url=root.id==='current-job'?'/api/current-job':`/api/jobs/${encodeURIComponent(id)}`;const response=await fetch(url,{cache:'no-store',signal:AbortSignal.timeout(10000)});if(response.ok)render(await response.json())}catch(_){}setTimeout(poll,1500)}
+poll();

@@ -1,0 +1,7 @@
+{% extends 'base.html' %}{% block title %}Jobs{% endblock %}
+{% block content %}
+<div class="page-title"><span>03</span><h1>JOBS</h1><i>_</i></div>
+<section class="table-card"><div class="scroll"><table><thead><tr><th>JOB</th><th>NAME</th><th>MODULE</th><th>STATUS</th><th>PROGRESS</th><th>RESULTS</th><th>STARTED</th><th>DURATION</th><th>ACTION</th></tr></thead><tbody>
+{% for job in jobs %}<tr><td>{{ job.display_id }}</td><td>{{ job.display_name }}</td><td>Discovery</td><td class="status status-{{ job.status|lower }}">{{ job.status }}</td><td>{{ job.processed_company_count }} / {{ job.selected_company_count }}</td><td>{{ job.emails_found }} emails · {{ job.websites_found }} websites · {{ job.phones_found }} phones</td><td>{{ job.started_at|clock }}</td><td>{{ job.duration_seconds|duration }}</td><td><a href="{{ url_for('job_detail',job_id=job.job_id) }}">VIEW</a></td></tr>{% else %}<tr><td colspan="9" class="muted">No persistent jobs yet.</td></tr>{% endfor %}
+</tbody></table></div></section>
+{% endblock %}

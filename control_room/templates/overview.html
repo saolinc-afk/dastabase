@@ -1,0 +1,25 @@
+{% extends 'base.html' %}{% block title %}Overview{% endblock %}
+{% block content %}
+<div class="page-title"><span>01</span><h1>OVERVIEW</h1><i>_</i></div>
+<div class="grid metrics">
+  <section><h2>COMPANIES</h2><strong>{{ database.total if database.available else 'N/A' }}</strong><p>canonical records</p></section>
+  <section><h2>EMAILS</h2><strong>{{ database.email_companies if database.available else 'N/A' }}</strong><p>companies with usable email</p></section>
+  <section><h2>WEBSITES</h2><strong>{{ database.statuses.VERIFIED if database.available else 'N/A' }}</strong><p>verified SPARROW websites</p></section>
+</div>
+<div class="grid services">
+  <section><h2>DATABASE</h2><div class="state {{ 'good' if database.available else 'bad' }}">● {{ 'ONLINE' if database.available else 'UNAVAILABLE' }}</div></section>
+  <section><h2>CONTROL ROOM</h2><div class="state good">● ONLINE</div></section>
+  <section><h2>WORKER</h2><div id="worker-state" class="state {{ 'good' if worker.status == 'ONLINE' else 'muted' }}">● {{ worker.status }}</div></section>
+  <section><h2>DISCOVERY V2</h2><div class="state {{ 'good' if discovery.available else 'muted' }}">● {{ discovery.run_status if discovery.available else 'NO RUN' }}</div></section>
+</div>
+<section class="current" id="current-job"{% if job %} data-job-id="{{ job.job_id }}"{% endif %}>
+  <h2>CURRENT JOB</h2>
+  {% if job %}
+  <div class="job-heading"><a href="{{ url_for('job_detail',job_id=job.job_id) }}">{{ job.display_id }}</a><strong data-field="name">{{ job.display_name }}</strong><span class="status status-{{ job.status|lower }}" data-field="status">{{ job.status }}</span></div>
+  <div class="progress-label"><span data-field="progress">{{ job.processed_company_count }} / {{ job.selected_company_count }}</span><span data-field="percent">{{ job.percent }}%</span></div>
+  <progress max="100" value="{{ job.percent }}"></progress>
+  <div class="result-line"><span><b data-field="emails">{{ job.emails_found }}</b> emails</span><span><b data-field="websites">{{ job.websites_found }}</b> websites</span><span><b data-field="phones">{{ job.phones_found }}</b> phones</span></div>
+  <div class="terminal" data-events>{% for event in events %}<div>&gt; {{ event.created_at|clock }} {{ event.message }}</div>{% endfor %}</div>
+  {% else %}<p class="muted">No jobs yet. Start a fake enrichment from ENRICH.</p>{% endif %}
+</section>
+{% endblock %}
