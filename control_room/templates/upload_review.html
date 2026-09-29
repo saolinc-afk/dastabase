@@ -1,0 +1,21 @@
+{% extends 'base.html' %}{% block title %}Review matches{% endblock %}
+{% block content %}
+<div class="page-title"><span>02</span><h1>ENRICH / REVIEW</h1><i>_</i></div>
+<div class="grid metrics review-metrics">
+ {% for status in ['MATCHED','AMBIGUOUS','NOT_FOUND'] %}<section><h2>{{ status|replace('_',' ') }}</h2><strong>{{ summary.counts.get(status,0) }}</strong></section>{% endfor %}
+</div>
+<section class="table-card">
+ <div class="review-nav">{% for status in ['ALL','MATCHED','AMBIGUOUS','NOT_FOUND','EXCLUDED'] %}<a class="{{ 'active' if selected_filter == status else '' }}" href="{{ url_for('upload_review',upload_id=upload.upload_id,status=status) }}">{{ status|replace('_',' ') }}</a>{% endfor %}<a class="confirm-link" href="{{ url_for('upload_confirm',upload_id=upload.upload_id) }}">CONFIRM →</a></div>
+ <div class="scroll"><table class="review-table"><thead><tr><th>ROW / INPUT</th><th>STATUS</th><th>CANONICAL MATCH / CANDIDATES</th><th>METHOD</th><th>ACTION</th></tr></thead><tbody>
+ {% for row in rows %}<tr>
+  <td><b>#{{ row.row_number }}</b>{% for key,value in row.input.items() %}{% if value %}<div><small>{{ key }}</small> {{ value }}</div>{% endif %}{% endfor %}</td>
+  <td class="status status-{{ row.match_status|lower }}">{{ row.match_status }}</td>
+  <td>{% if row.selected_company %}<b>{{ row.selected_company.company_name }}</b><div>ID {{ row.selected_company.id }} · {{ row.selected_company.tax_number or 'no tax' }} · {{ row.selected_company.municipality or '' }}</div>{% endif %}
+   {% if row.match_status == 'AMBIGUOUS' %}{% for candidate in row.candidates %}<div class="candidate"><b>{{ candidate.company.company_name }}</b><span>ID {{ candidate.company_id }} · {{ candidate.company.tax_number or 'no tax' }} · {{ candidate.company.municipality or '' }}{% if candidate.similarity is not none %} · {{ '%.1f'|format(candidate.similarity*100) }}%{% endif %}</span>
+    <form method="post" action="{{ url_for('upload_select_candidate',upload_id=upload.upload_id,row_number=row.row_number,company_id=candidate.company_id) }}"><button type="submit">USE THIS COMPANY</button></form></div>{% endfor %}{% endif %}
+  </td><td>{{ row.match_method or (row.candidates[0].match_method if row.candidates else '—') }}</td>
+  <td>{% if row.match_status != 'EXCLUDED' %}<form method="post" action="{{ url_for('upload_decision',upload_id=upload.upload_id,row_number=row.row_number) }}"><input type="hidden" name="action" value="exclude"><button class="secondary">EXCLUDE</button></form>{% endif %}</td>
+ </tr>{% else %}<tr><td colspan="5" class="muted">No rows in this filter.</td></tr>{% endfor %}
+ </tbody></table></div>
+</section>
+{% endblock %}

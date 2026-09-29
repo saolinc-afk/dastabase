@@ -13,5 +13,5 @@
 </header>
 <nav>{% for endpoint,label in [('overview','OVERVIEW'),('enrich','ENRICH'),('jobs','JOBS'),('data','DATA')] %}<a href="{{ url_for(endpoint) }}" class="{{ 'active' if page == endpoint else '' }}">{{ label }}</a>{% endfor %}</nav>
 <main>{% block content %}{% endblock %}</main>
-<footer>&gt; control room foundation · persistent jobs · local orchestration</footer>
+<footer>&gt; control room · persistent uploads · reviewed manifests · local orchestration</footer>
 </body></html>

@@ -1,0 +1,16 @@
+{% extends 'base.html' %}{% block title %}Map upload{% endblock %}
+{% block content %}
+<div class="page-title"><span>02</span><h1>ENRICH / MAP</h1><i>_</i></div>
+<section class="form-card wide">
+  <h2>&gt; UPLOAD ACCEPTED</h2>
+  <div class="facts"><div><span>File</span><b>{{ upload.original_filename }}</b></div><div><span>Rows</span><b>{{ upload.row_count }}</b></div><div><span>Format</span><b>{{ upload.format }}</b></div><div><span>Worksheet</span><b>{{ upload.worksheet_name or 'N/A' }}</b></div></div>
+  <p class="muted">Confirm the source columns. Company name is optional when a tax or registration number is mapped.</p>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <form method="post">
+    {% for field in fields %}<label>{{ field|replace('_',' ')|upper }}
+      <select name="{{ field }}"><option value="">NOT MAPPED</option>{% for header in upload.headers %}<option value="{{ loop.index0 }}" {{ 'selected' if suggestions.get(field) == loop.index0 else '' }}>{{ header }}</option>{% endfor %}</select>
+    </label>{% endfor %}
+    <button type="submit">RUN MATCHING</button>
+  </form>
+</section>
+{% endblock %}
