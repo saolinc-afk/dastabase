@@ -11,10 +11,11 @@ class FakeEnrichmentAdapter:
     def run(self, job, progress):
         total = job['selected_company_count']
         step = max(1, total//10)
-        processed = 0
+        processed = job.get('processed_company_count', 0)
         while processed < total:
             processed = min(total, processed+step)
             if self.fail_at is not None and processed >= self.fail_at:
                 raise RuntimeError('Deterministic fake adapter failure')
             progress(processed, processed//2, processed*3//4, processed//3)
             self.sleeper(self.delay)
+        return 'COMPLETED'

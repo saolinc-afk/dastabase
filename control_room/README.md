@@ -25,6 +25,7 @@ Configuration:
 | `CONTROL_ROOM_WORKER_STALE` | `15` seconds |
 | `CONTROL_ROOM_UPLOAD_MAX_BYTES` | `20971520` (20 MiB) |
 | `CONTROL_ROOM_UPLOAD_MAX_ROWS` | `5000` |
+| `CONTROL_ROOM_REAL_DISCOVERY_MAX_COMPANIES` | `10` |
 
 Run from the repository root in two terminals using the same database setting.
 
@@ -67,4 +68,21 @@ the first selected row for each company ID once.
 Uploaded files use generated names, mode `0600`, and live outside static files.
 CSV supports UTF-8, UTF-8 BOM, Windows-1250, comma, semicolon, and tab input.
 XLSX parsing uses the first visible worksheet with `read_only=True` and
-`data_only=True`. Upload-created jobs continue to use the fake adapter.
+`data_only=True`.
+
+## Discovery v2 jobs
+
+Upload jobs explicitly select either `FAKE` or `DISCOVERY_V2` at confirmation.
+The explicitly styled live start action confirms the selected live mode, and
+jobs must remain within the configured company limit. Discovery execution always enables municipality context and sets
+the maximum Serper query count to one per company.
+
+Each live job uses a generated directory under `jobs/<job-id>/` containing its
+immutable manifest, isolated Discovery result database, accepted Discovery CSV,
+and row-preserving upload reconciliation CSV. The Control Room persists the
+Discovery run ID before execution. A stale job resumes that run and refuses to
+create a replacement run when results already exist.
+
+The worker requires `SERPER_API_KEY` for live jobs. The key is passed directly
+to the existing Discovery v2 Serper provider and is never persisted by Control
+Room.

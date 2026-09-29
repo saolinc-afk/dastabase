@@ -61,8 +61,8 @@ def snapshot(path, namespace):
 
 def read_manifest(source, ids, namespace):
     ids = list(ids)
-    if not ids or len(set(ids)) != len(ids) or any(type(i) is not int or i < 1 for i in ids):
-        raise ValueError("Supply unique positive company IDs explicitly")
+    if not ids or len(set(ids)) != len(ids) or any(type(i) is not int or i < 0 for i in ids):
+        raise ValueError("Supply unique nonnegative company IDs explicitly")
     descriptor = snapshot(source, namespace)
     conn = readonly(source)
     try:

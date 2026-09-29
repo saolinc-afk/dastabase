@@ -22,8 +22,25 @@ class JobRepository:
         conn = self._connect()
         try:
             conn.executescript(Path(__file__).with_name('schema.sql').read_text())
+            self._migrate_adapter_columns(conn)
+            conn.execute('PRAGMA user_version=3')
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate_adapter_columns(conn):
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(control_jobs)')}
+        additions = {
+            'execution_adapter': "TEXT NOT NULL DEFAULT 'FAKE' CHECK(execution_adapter IN ('FAKE','DISCOVERY_V2'))",
+            'discovery_run_id': 'TEXT',
+            'completed_company_count': 'INTEGER NOT NULL DEFAULT 0',
+            'partial_company_count': 'INTEGER NOT NULL DEFAULT 0',
+            'failed_company_count': 'INTEGER NOT NULL DEFAULT 0',
+            'ineligible_company_count': 'INTEGER NOT NULL DEFAULT 0',
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                conn.execute(f'ALTER TABLE control_jobs ADD COLUMN {name} {definition}')
 
     def _migrate_job_limit(self):
         """Expand the v1 job bound without discarding existing jobs/events."""
@@ -50,7 +67,9 @@ class JobRepository:
                 phones_found INTEGER NOT NULL DEFAULT 0 CHECK(phones_found >= 0),
                 error_code TEXT, error_message TEXT,
                 CHECK(processed_company_count <= selected_company_count))''')
-            columns = ','.join(row[1] for row in conn.execute('PRAGMA table_info(control_jobs)'))
+            source_columns = [item[1] for item in conn.execute('PRAGMA table_info(control_jobs)')]
+            target_columns = {item[1] for item in conn.execute('PRAGMA table_info(control_jobs_v2)')}
+            columns = ','.join(name for name in source_columns if name in target_columns)
             conn.execute(f'INSERT INTO control_jobs_v2({columns}) SELECT {columns} FROM control_jobs')
             conn.execute('DROP TABLE control_jobs')
             conn.execute('ALTER TABLE control_jobs_v2 RENAME TO control_jobs')
@@ -250,7 +269,8 @@ class JobRepository:
         finally:
             conn.close()
 
-    def create_upload_job(self, upload_id, display_name):
+    def create_upload_job(self, upload_id, display_name, execution_adapter='FAKE',
+                          real_company_limit=10, live_confirmed=False):
         name = str(display_name or '').strip()
         if not 1 <= len(name) <= 120:
             raise ValueError('Job name must be between 1 and 120 characters')
@@ -267,10 +287,19 @@ class JobRepository:
                 unique.setdefault(row['selected_company_id'], row)
             if not unique:
                 raise ValueError('Select at least one canonical company')
+            if execution_adapter not in ('FAKE','DISCOVERY_V2'):
+                raise ValueError('Invalid execution adapter')
+            if execution_adapter == 'DISCOVERY_V2':
+                if not live_confirmed:
+                    raise ValueError('Confirm that live web discovery may use Serper')
+                if len(unique) > real_company_limit:
+                    raise ValueError(f'Live Discovery is limited to {real_company_limit} companies; '
+                                     f'{len(unique)} were selected')
             job_id = uuid.uuid4().hex; created = now()
             conn.execute('''INSERT INTO control_jobs(job_id,display_name,input_kind,module,status,created_at,
-                queued_at,selected_company_count) VALUES (?,?,?,?,?,?,?,?)''',
-                (job_id,name,'UPLOAD','DISCOVERY_CONTACTS','QUEUED',created,created,len(unique)))
+                queued_at,selected_company_count,execution_adapter) VALUES (?,?,?,?,?,?,?,?,?)''',
+                (job_id,name,'UPLOAD','DISCOVERY_CONTACTS','QUEUED',created,created,len(unique),
+                 execution_adapter))
             conn.execute("UPDATE upload_rows SET match_status='EXCLUDED',selected=0,match_method=COALESCE(match_method,'UNRESOLVED_EXCLUDED') WHERE upload_id=? AND match_status IN ('AMBIGUOUS','NOT_FOUND')",(upload_id,))
             snapshot_rows = conn.execute('SELECT * FROM upload_rows WHERE upload_id=? ORDER BY row_number',
                                          (upload_id,)).fetchall()
@@ -300,6 +329,78 @@ class JobRepository:
         try:
             return [dict(row) for row in conn.execute(
                 'SELECT * FROM job_items WHERE job_id=? ORDER BY item_position',(job_id,))]
+        finally:
+            conn.close()
+
+    def selected_company_ids(self, job_id):
+        return [row['company_id'] for row in self.job_items(job_id) if row['selected'] == 1]
+
+    def set_discovery_run(self, job_id, run_id):
+        conn = self._connect()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('SELECT discovery_run_id FROM control_jobs WHERE job_id=?',(job_id,)).fetchone()
+            if not row:
+                raise ValueError('Unknown job')
+            if row['discovery_run_id'] and row['discovery_run_id'] != run_id:
+                raise ValueError('Discovery run is already fixed for this job')
+            conn.execute('UPDATE control_jobs SET discovery_run_id=? WHERE job_id=?',(run_id,job_id))
+            if not row['discovery_run_id']:
+                self._event(conn,job_id,'DISCOVERY_RUN_CREATED','Discovery v2 run created',
+                            details={'run_id':run_id})
+            conn.commit()
+        except BaseException:
+            conn.rollback(); raise
+        finally:
+            conn.close()
+
+    def update_discovery_progress(self, job_id, counts, worker_id):
+        processed = sum(counts.get(key,0) for key in ('COMPLETED','PARTIAL','FAILED','INELIGIBLE'))
+        conn = self._connect()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('SELECT * FROM control_jobs WHERE job_id=?',(job_id,)).fetchone()
+            if not row or row['status'] != 'RUNNING':
+                raise ValueError('Discovery progress requires a running job')
+            if processed > row['selected_company_count']:
+                raise ValueError('Discovery progress exceeds selected manifest')
+            conn.execute('''UPDATE control_jobs SET processed_company_count=?,completed_company_count=?,
+                partial_company_count=?,failed_company_count=?,ineligible_company_count=?,
+                emails_found=?,websites_found=?,phones_found=?,worker_id=?,worker_heartbeat_at=?
+                WHERE job_id=?''',(processed,counts.get('COMPLETED',0),counts.get('PARTIAL',0),
+                counts.get('FAILED',0),counts.get('INELIGIBLE',0),counts.get('emails',0),
+                counts.get('websites',0),counts.get('phones',0),worker_id,now(),job_id))
+            conn.commit()
+        except BaseException:
+            conn.rollback(); raise
+        finally:
+            conn.close()
+
+    def add_artifact(self, job_id, artifact_type, relative_path, size_bytes, sha256):
+        artifact_id = uuid.uuid4().hex
+        conn = self._connect()
+        try:
+            conn.execute('''INSERT INTO job_artifacts(artifact_id,job_id,artifact_type,relative_path,
+                created_at,size_bytes,sha256) VALUES (?,?,?,?,?,?,?) ON CONFLICT(job_id,artifact_type)
+                DO UPDATE SET relative_path=excluded.relative_path,created_at=excluded.created_at,
+                size_bytes=excluded.size_bytes,sha256=excluded.sha256''',
+                (artifact_id,job_id,artifact_type,relative_path,now(),size_bytes,sha256))
+        finally:
+            conn.close()
+
+    def artifacts(self, job_id):
+        conn = self._connect()
+        try:
+            return [dict(row) for row in conn.execute(
+                'SELECT * FROM job_artifacts WHERE job_id=? ORDER BY created_at',(job_id,))]
+        finally:
+            conn.close()
+
+    def get_artifact(self, artifact_id):
+        conn = self._connect()
+        try:
+            row = conn.execute('SELECT * FROM job_artifacts WHERE artifact_id=?',(artifact_id,)).fetchone()
+            return dict(row) if row else None
         finally:
             conn.close()
 
@@ -375,14 +476,35 @@ class JobRepository:
         finally:
             conn.close()
 
-    def claim_oldest(self, worker_id):
+    def claim_oldest(self, worker_id, stale_seconds=30):
         conn = self._connect()
         try:
             conn.execute('BEGIN IMMEDIATE')
-            active = conn.execute("SELECT 1 FROM control_jobs WHERE status IN ('STARTING','RUNNING') LIMIT 1").fetchone()
+            active = conn.execute("SELECT * FROM control_jobs WHERE status IN ('STARTING','RUNNING') ORDER BY job_number LIMIT 1").fetchone()
             if active is not None:
+                try:
+                    active_age = (datetime.now(timezone.utc)-datetime.fromisoformat(
+                        active['worker_heartbeat_at'])).total_seconds()
+                except (TypeError,ValueError):
+                    active_age = float('inf')
+                worker = conn.execute('SELECT * FROM control_workers WHERE worker_id=?',
+                                      (active['worker_id'],)).fetchone()
+                online = False
+                if worker and worker['status'] == 'ONLINE':
+                    try:
+                        age = (datetime.now(timezone.utc)-datetime.fromisoformat(worker['heartbeat_at'])).total_seconds()
+                        online = age <= stale_seconds
+                    except (TypeError,ValueError):
+                        pass
+                if online or active_age <= stale_seconds:
+                    conn.commit(); return None
+                timestamp = now()
+                conn.execute("UPDATE control_jobs SET status='STARTING',worker_id=?,worker_heartbeat_at=? WHERE job_id=?",
+                             (worker_id,timestamp,active['job_id']))
+                self._event(conn,active['job_id'],'WORKER_RECOVERED','stale job claimed for recovery',
+                            level='WARNING',details={'worker_id':worker_id})
                 conn.commit()
-                return None
+                return self.get_job(active['job_id'])
             row = conn.execute("SELECT * FROM control_jobs WHERE status='QUEUED' ORDER BY job_number LIMIT 1").fetchone()
             if row is None:
                 conn.commit()
@@ -441,6 +563,9 @@ class JobRepository:
                 VALUES (?,?,?,?) ON CONFLICT(worker_id) DO UPDATE SET
                 heartbeat_at=excluded.heartbeat_at,status=excluded.status''',
                 (worker_id, timestamp, timestamp, status))
+            if status == 'ONLINE':
+                conn.execute("UPDATE control_jobs SET worker_heartbeat_at=? WHERE worker_id=? AND status IN ('STARTING','RUNNING')",
+                             (timestamp,worker_id))
         finally:
             conn.close()
 

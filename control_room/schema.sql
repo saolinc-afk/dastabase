@@ -22,6 +22,12 @@ CREATE TABLE IF NOT EXISTS control_jobs (
     phones_found INTEGER NOT NULL DEFAULT 0 CHECK(phones_found >= 0),
     error_code TEXT,
     error_message TEXT,
+    execution_adapter TEXT NOT NULL DEFAULT 'FAKE' CHECK(execution_adapter IN ('FAKE','DISCOVERY_V2')),
+    discovery_run_id TEXT,
+    completed_company_count INTEGER NOT NULL DEFAULT 0,
+    partial_company_count INTEGER NOT NULL DEFAULT 0,
+    failed_company_count INTEGER NOT NULL DEFAULT 0,
+    ineligible_company_count INTEGER NOT NULL DEFAULT 0,
     CHECK(processed_company_count <= selected_company_count)
 );
 
@@ -101,6 +107,18 @@ CREATE TABLE IF NOT EXISTS job_items (
     FOREIGN KEY(upload_id,upload_row_number) REFERENCES upload_rows(upload_id,row_number)
 );
 
+CREATE TABLE IF NOT EXISTS job_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES control_jobs(job_id) ON DELETE CASCADE,
+    artifact_type TEXT NOT NULL CHECK(artifact_type IN
+        ('DISCOVERY_RESULTS_DB','DISCOVERY_EXPORT','UPLOAD_RECONCILIATION','MANIFEST','LOG')),
+    relative_path TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL CHECK(size_bytes >= 0),
+    sha256 TEXT NOT NULL,
+    UNIQUE(job_id,artifact_type)
+);
+
 CREATE INDEX IF NOT EXISTS control_jobs_queue
 ON control_jobs(status, job_number);
 
@@ -110,5 +128,6 @@ ON job_events(job_id, sequence DESC);
 CREATE INDEX IF NOT EXISTS upload_rows_status ON upload_rows(upload_id,match_status,row_number);
 CREATE INDEX IF NOT EXISTS match_candidates_row ON match_candidates(upload_id,row_number,rank);
 CREATE INDEX IF NOT EXISTS job_items_job ON job_items(job_id,item_position);
+CREATE INDEX IF NOT EXISTS job_artifacts_job ON job_artifacts(job_id,artifact_type);
 
-PRAGMA user_version=2;
+PRAGMA user_version=3;

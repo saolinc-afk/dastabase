@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, redirect, render_template, request, url_for
+from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
 
 from engine_identity import ENGINE_IDENTITY
 from monitor.metrics import database_metrics, discovery_v2_metrics
@@ -50,6 +50,8 @@ def create_app(config=None):
             Path.home()/'.local/share/dastabase-control')),
         UPLOAD_MAX_BYTES=int(os.environ.get('CONTROL_ROOM_UPLOAD_MAX_BYTES', str(20*1024*1024))),
         UPLOAD_MAX_ROWS=int(os.environ.get('CONTROL_ROOM_UPLOAD_MAX_ROWS', '5000')),
+        REAL_DISCOVERY_MAX_COMPANIES=int(os.environ.get(
+            'CONTROL_ROOM_REAL_DISCOVERY_MAX_COMPANIES','10')),
     )
     if config:
         app.config.update(config)
@@ -227,12 +229,15 @@ def create_app(config=None):
         error = None
         if request.method == 'POST':
             try:
-                job = repository.create_upload_job(upload_id,request.form.get('display_name'))
+                adapter = request.form.get('execution_adapter','FAKE')
+                job = repository.create_upload_job(upload_id,request.form.get('display_name'),adapter,
+                    app.config['REAL_DISCOVERY_MAX_COMPANIES'],
+                    live_confirmed=adapter == 'DISCOVERY_V2')
                 return redirect(url_for('job_detail',job_id=job['job_id']),code=303)
             except ValueError as exc:
                 error = str(exc)
         return render_template('upload_confirm.html',page='enrich',upload=upload,summary=summary,
-            error=error),400 if error else 200
+            error=error,real_limit=app.config['REAL_DISCOVERY_MAX_COMPANIES']),400 if error else 200
 
     @app.get('/jobs')
     def jobs():
@@ -245,7 +250,23 @@ def create_app(config=None):
         if job is None:
             abort(404)
         return render_template('job_detail.html', page='jobs', job=job,
-                               events=repository.events(job_id))
+                               events=repository.events(job_id),artifacts=repository.artifacts(job_id))
+
+    @app.get('/jobs/<job_id>/artifacts/<artifact_id>')
+    def download_artifact(job_id,artifact_id):
+        artifact = repository.get_artifact(artifact_id)
+        if not artifact or artifact['job_id'] != job_id or artifact['artifact_type'] not in (
+                'DISCOVERY_EXPORT','UPLOAD_RECONCILIATION'):
+            abort(404)
+        root = Path(app.config['CONTROL_STORAGE_ROOT']).expanduser().resolve()
+        candidate = root/artifact['relative_path']
+        try:
+            path = candidate.resolve(strict=True)
+        except OSError:
+            abort(404)
+        if not path.is_relative_to(root) or candidate.is_symlink():
+            abort(404)
+        return send_file(path,as_attachment=True,download_name=path.name)
 
     @app.get('/data')
     def data():
@@ -257,6 +278,7 @@ def create_app(config=None):
         if job is None:
             abort(404)
         return jsonify(job=job, events=repository.events(job_id, 30),
+            artifacts=repository.artifacts(job_id),
             worker=repository.worker_status(app.config['WORKER_STALE_SECONDS']))
 
     @app.get('/api/current-job')

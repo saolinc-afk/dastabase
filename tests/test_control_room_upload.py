@@ -230,6 +230,7 @@ class UploadWorkflowTests(unittest.TestCase):
         repository=JobRepository(old); repository.initialize()
         self.assertEqual(repository.get_job('old')['display_name'],'Old')
         self.assertEqual(repository.events('old')[0]['event_code'],'OLD')
+        self.assertEqual(repository.get_job('old')['execution_adapter'],'FAKE')
 
 
 if __name__ == '__main__': unittest.main()

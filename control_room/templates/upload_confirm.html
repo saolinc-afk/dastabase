@@ -6,6 +6,9 @@
  <div class="facts"><div><span>File</span><b>{{ upload.original_filename }}</b></div><div><span>Rows</span><b>{{ upload.row_count }}</b></div><div><span>Matched rows</span><b>{{ summary.counts.get('MATCHED',0) }}</b></div><div><span>Excluded / unresolved</span><b>{{ upload.row_count-summary.counts.get('MATCHED',0) }}</b></div><div><span>Selected unique companies</span><b>{{ summary.selected_unique }}</b></div><div><span>Module</span><b>Discovery + Contacts</b></div></div>
  <p class="muted">Repeated rows for the same canonical company remain in the upload record. The queued manifest contains that company once. Any unresolved rows are excluded when the job is created.</p>
  {% if error %}<p class="error">{{ error }}</p>{% endif %}
- {% if upload.status == 'CONFIRMED' %}<p class="state good">● THIS UPLOAD HAS ALREADY BEEN QUEUED</p>{% else %}<form method="post"><label>JOB NAME<input name="display_name" maxlength="120" value="{{ upload.original_filename }}" required></label><button type="submit">START ENRICHMENT</button></form>{% endif %}
+ {% if upload.status == 'CONFIRMED' %}<p class="state good">● THIS UPLOAD HAS ALREADY BEEN QUEUED</p>{% else %}<form method="post"><label>JOB NAME<input name="display_name" maxlength="120" value="{{ upload.original_filename }}" required></label>
+ <fieldset data-execution-mode><legend>EXECUTION MODE</legend><label class="module"><input type="radio" name="execution_adapter" value="FAKE" checked> FAKE / TEST <span>NO NETWORK</span></label><label class="module live"><input type="radio" name="execution_adapter" value="DISCOVERY_V2"> DISCOVERY V2 / LIVE <span>LIVE</span></label></fieldset>
+ <div class="live-warning" data-live-warning hidden><b>LIVE DISCOVERY</b><p>Uses live web discovery and may consume API credits. Max 1 search query/company. Current live job limit: {{ real_limit }} companies.</p></div>
+ <button type="submit" data-start-enrichment>START ENRICHMENT</button></form>{% endif %}
 </section>
 {% endblock %}

@@ -241,8 +241,8 @@ def build_rows(source, results, company_ids=None, precedence='newest', run_ids=N
         raise ValueError(f'Run selection supplied for an unknown results database: {unknown_filters}')
     selected = resolve_candidates(all_candidates, precedence)
     requested_ids = set(company_ids) if company_ids is not None else set(selected)
-    if company_ids is not None and any(type(value) is not int or value < 1 for value in requested_ids):
-        raise ValueError('Company IDs must be positive integers')
+    if company_ids is not None and any(type(value) is not int or value < 0 for value in requested_ids):
+        raise ValueError('Company IDs must be nonnegative integers')
     _, companies = canonical_companies(source, requested_ids)
     rows = []
     for company_id in sorted(requested_ids):
