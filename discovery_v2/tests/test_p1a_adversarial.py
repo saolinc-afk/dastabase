@@ -77,6 +77,74 @@ class AdversarialTests(unittest.TestCase):
         h=OwnershipHarness(); h.page('<footer>'+IDENTITY+'; member of group</footer>', 'https://group.example/')
         self.assertFalse(h.decide('https://group.example/')['verified'])
 
+    def test_real_writer_shape_scopes_target_container_away_from_parent_footer(self):
+        company = {**COMPANY, 'company_name': 'EKOREL d.o.o.',
+                   'address': 'Cesta 7, 1000 Ljubljana'}
+        h = OwnershipHarness(company)
+        url = 'https://ekorel.parent.si/kontaktne-osebe-ekorel/'
+        html = ('<main><h1>EKOREL d.o.o.</h1><div>Cesta 7</div>'
+                '<div>1000 Ljubljana</div></main>'
+                '<footer>PARENT HOLDING d.o.o.</footer>')
+        fetcher = RecordingFetcher(FakeFetcher({url: response(html, url)}), h.writer)
+        result = evaluate_website(company, url, fetcher)
+        self.assertEqual(result['status'], 'VERIFIED')
+        self.assertEqual(result['p1a']['rule_id'], 'OWN-07_SCOPED_ENTITY_PAGE')
+        self.assertEqual(result['relationship'], 'ENTITY_PAGE_ON_GROUP_DOMAIN')
+        self.assertNotIn('CONFLICTING_LEGAL_ENTITY', result['p1a']['blockers'])
+        witness_blocks = {o['value'].get('qualifiers', {}).get('block_id')
+                          for o in h.writer.observations
+                          if o['observation_id'] in result['p1a']['identity_evidence']}
+        self.assertEqual(len(witness_blocks), 1)
+
+    def test_real_writer_shape_preserves_duplicate_redirect_association(self):
+        company = {**COMPANY, 'company_name': 'GEN OVE d.o.o.'}
+        h = OwnershipHarness(company)
+        candidate = 'https://gek.si/'
+        root = 'https://www.gen-energija.si/'
+        entity = 'https://www.gen-energija.si/gen/skupina-gen/gen-ove/'
+        root_html = f'<a href="{entity}">Podjetje GEN OVE</a>'
+        entity_html = ('<main><h1>GEN OVE d.o.o.</h1><div>VAT: 12345678</div>'
+                       '<div>Glavna ulica 12, 1000 Ljubljana</div></main>')
+        # A previous candidate already recorded the same canonical root. The
+        # later gek.si assessment must retain its own redirect association.
+        h.writer.page(root, response(root_html, root))
+        fetcher = RecordingFetcher(FakeFetcher({
+            candidate: response(root_html, root),
+            entity: response(entity_html, entity),
+        }), h.writer)
+        result = evaluate_website(company, candidate, fetcher)
+        self.assertEqual(result['status'], 'VERIFIED')
+        self.assertEqual(result['p1a']['rule_id'], 'OWN-07_SCOPED_ENTITY_PAGE')
+        self.assertEqual(result['verified_scope'], entity)
+        redirect_rows = [row for row in h.writer.evidence_rows.values()
+                         if row.get('requested_url') == candidate
+                         and row.get('final_url') == root]
+        self.assertEqual(len(redirect_rows), 1)
+
+    def test_real_writer_shape_same_block_conflicting_operator_still_blocks(self):
+        h = OwnershipHarness(); url = 'https://group.example/skupina/alfa-stroji/'
+        html = ('<main><p>ALFA STROJI d.o.o.; VAT: 12345678; '
+                'Website operated by BETA HOLDING d.o.o.</p></main>')
+        fetcher = RecordingFetcher(FakeFetcher({url: response(html, url)}), h.writer)
+        result = evaluate_website(h.company, url, fetcher)
+        self.assertEqual(result['status'], 'REVIEW')
+        self.assertIn('CONFLICTING_LEGAL_ENTITY', result['p1a']['blockers'])
+
+    def test_real_writer_shape_canonical_redirect_uses_standalone_confidence(self):
+        company = {**COMPANY, 'company_name': 'MARUŠIČ d.o.o.'}
+        h = OwnershipHarness(company)
+        candidate = 'https://marusic.si/'
+        final = 'https://marusic-beechwood.com/'
+        html = ('<main><h1>MARUŠIČ d.o.o.</h1><div>Glavna ulica 12</div>'
+                '<div>1000 Ljubljana</div></main>')
+        fetcher = RecordingFetcher(FakeFetcher({candidate: response(html, final)}), h.writer)
+        result = evaluate_website(company, candidate, fetcher)
+        self.assertEqual(result['status'], 'HIGH')
+        self.assertEqual(result['relationship'], 'STANDALONE')
+        self.assertEqual(result['p1a']['confidence_rule_id'],
+                         'CONF-01_LEGAL_ADDRESS_CONVERGENCE')
+        self.assertEqual(result['verified_scope'], final)
+
     def test_parent_identifier_conflict(self):
         h=OwnershipHarness(); url='https://group.example/right/'
         h.page('<section>'+IDENTITY+'; VAT: 12345678; member of group</section><footer>Registration: 1111111</footer>',url)

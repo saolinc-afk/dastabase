@@ -194,7 +194,15 @@ class EvidenceWriter:
         return self.observe(evidence_id, 'WEBSITE_CANDIDATE', url, method='domain_guess', locator='requested_url')
 
     def page(self, requested_url, response):
-        key = (response.url, hashlib.sha256(response.text.encode()).hexdigest())
+        # The same final page can be reached through several candidates. Keep
+        # each requested-to-final association: ownership evaluation uses it to
+        # prove that a cross-domain canonical response belongs to that candidate.
+        content_hash = hashlib.sha256(response.text.encode()).hexdigest()
+        association_hash = hashlib.sha256(
+            normalize_url(requested_url).encode()).hexdigest()
+        # Keep the historical two-item ``pages`` key contract: callers use the
+        # first item as the final page URL when collecting scoped evidence.
+        key = (response.url, content_hash + ':' + association_hash)
         if key in self.pages:
             return self.pages[key]
         original = BeautifulSoup(response.text, 'html.parser')
@@ -203,12 +211,14 @@ class EvidenceWriter:
         visible = soup.get_text(' ', strip=True)
         evidence_id = self.evidence('FETCHED_PAGE', 'UNASSESSED', requested_url=requested_url,
             final_url=response.url, http_status=response.status_code, title=title,
-            content_hash=key[1], snippet_body=visible, payload={'html': response.text})
+            content_hash=content_hash, snippet_body=visible, payload={'html': response.text})
         self.pages[key] = evidence_id
         self.identity_identifiers(evidence_id, visible, 'visible_text')
         # Preserve page-wide observations, but authorize only bounded contexts.
-        block_tags = ['section', 'footer', 'address', 'p', 'li', 'div', 'h1', 'h2', 'h3']
+        block_tags = ['main', 'article', 'section', 'footer', 'address', 'p', 'li',
+                      'div', 'h1', 'h2', 'h3']
         units = soup.find_all(block_tags)
+        emitted_publications = set()
         for index, unit in enumerate(units):
             # Prefer the smallest semantic publication. A container must not
             # launder identity/operator facts from separate child blocks.
@@ -217,6 +227,7 @@ class EvidenceWriter:
             publication = unit.get_text(' ', strip=True)
             if not publication or len(publication) > 1200:
                 continue
+            emitted_publications.add((unit.name, publication))
             block_id = f'identity_block:{index}'
             items = extract_claims(self.company, publication) + relationship_claims(self.company, publication)
             for item in items:
@@ -224,6 +235,49 @@ class EvidenceWriter:
                     context=publication, block_tag=unit.name)
                 self.observe(evidence_id, item['kind'], item['raw'], item['normalized'],
                     method='bounded_identity', locator=block_id, **item['value'])
+
+        # Real contact/legal cards commonly put the name and address in separate
+        # child elements. Preserve their nearest semantic container as one
+        # bounded publication. Never use a container containing a footer, and
+        # never promote a container unless it itself has the complete strong
+        # identity combination required by ownership rules.
+        composite_index = 0
+        for unit in units:
+            if (unit.name not in ('main', 'article') or not unit.find(block_tags)
+                    or unit.find('footer')):
+                continue
+            publication = unit.get_text(' ', strip=True)
+            if (not publication or len(publication) > 1200
+                    or (unit.name, publication) in emitted_publications):
+                continue
+            items = extract_claims(self.company, publication) + relationship_claims(self.company, publication)
+            exact = {item['kind'] for item in items
+                     if item['value'].get('verification_status') == 'EXACT_MATCH'}
+            if 'LEGAL_NAME' not in exact or not exact.intersection(
+                    ('ADDRESS', 'TAX_NUMBER', 'REGISTRATION_NUMBER')):
+                continue
+            # Prefer the smallest complete semantic container so a broad page
+            # wrapper cannot combine independent identity sections.
+            child_complete = False
+            for child in unit.find_all(block_tags):
+                if child is unit or child.name == 'footer' or child.find('footer'):
+                    continue
+                child_items = extract_claims(self.company, child.get_text(' ', strip=True))
+                child_exact = {item['kind'] for item in child_items
+                               if item['value'].get('verification_status') == 'EXACT_MATCH'}
+                if ('LEGAL_NAME' in child_exact and child_exact.intersection(
+                        ('ADDRESS', 'TAX_NUMBER', 'REGISTRATION_NUMBER'))):
+                    child_complete = True
+                    break
+            if child_complete:
+                continue
+            block_id = f'identity_container:{composite_index}'
+            composite_index += 1
+            for item in items:
+                item['value']['qualifiers'].update(block_id=block_id, source_url=response.url,
+                    context=publication, block_tag=unit.name)
+                self.observe(evidence_id, item['kind'], item['raw'], item['normalized'],
+                    method='bounded_identity_container', locator=block_id, **item['value'])
 
         self.incidental(evidence_id, visible, 'visible_text')
         for a in soup.find_all('a', href=True):

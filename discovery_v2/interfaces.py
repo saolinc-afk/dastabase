@@ -78,6 +78,7 @@ class RecordingFetcher:
         if response is not None:
             self.writer.page(url, response)
             self.responses[response.url] = response
+            self.responses[url] = response
             self.failures.pop(url, None)
         elif len(self.errors) > before:
             # Keep diagnostics when a later contact crawl sees the cached failure.

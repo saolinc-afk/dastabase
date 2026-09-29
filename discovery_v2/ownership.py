@@ -316,7 +316,7 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
         brand = [o for o in relationships if o['normalized_value'] == 'BRAND_OF_ENTITY']
         aliases = [o for o in local if o['observation_type'] == 'ALIAS' and o['value'].get('verification_status') == 'ALIAS_SUPPORTED']
         # Treat other explicit legal names conservatively even on subsidiary pages.
-        scoped_entity_page = ((group_seen and _company_specific_path(company, url))
+        scoped_entity_page = (_company_specific_path(company, url)
                               or _company_specific_subdomain(company, url))
         # A parent footer is expected on a bounded entity page and does not
         # redefine that page's subject. Only a block that identifies the target
@@ -396,7 +396,10 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
         safe_blocks = {(eid, block_id): local for (eid, block_id), local in blocks.items()
                        if rows[eid].get('http_status') == 200
                        and classifications[eid] not in UNSELECTABLE_PAGE_CLASSES
-                       and in_scope(rows[eid].get('final_url') or '', candidate_url)}
+                       and (in_scope(rows[eid].get('final_url') or '', candidate_url)
+                            or (normalize_domain(rows[eid].get('final_url') or '') in redirect_domains
+                                and in_scope(rows[eid].get('final_url') or '',
+                                             scope_url(rows[eid].get('final_url') or ''))))}
         bounded_legal = [(key, o) for key, local in safe_blocks.items()
                          for o in _exact(local, 'LEGAL_NAME')]
         other_entities = [o for (eid, _), local in safe_blocks.items() for o in local
