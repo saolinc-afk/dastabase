@@ -20,7 +20,9 @@ def eligible(company, url, title='', body=''):
     label = text(url + ' ' + title + ' ' + body[:400])
     excluded = ('mojedelo', 'bettercareer', 'job portal', 'jobs', 'izkusnje zaposlenih',
                 'novice', 'news', 'company profile', 'business directory', 'company directory')
-    return not blocks_official(url) and page_type(url, title, body) not in ('THIRD_PARTY', 'PROFILE', 'GROUP') and not any(w in label for w in excluded)
+    # Group candidates reach the relationship-aware evaluator; group roots still
+    # cannot verify without an exact bounded subsidiary rule.
+    return not blocks_official(url) and page_type(url, title, body) not in ('THIRD_PARTY', 'PROFILE') and not any(w in label for w in excluded)
 
 
 def rank(company, observation):

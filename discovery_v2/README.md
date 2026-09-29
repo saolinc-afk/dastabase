@@ -200,6 +200,65 @@ or source-database update is implemented.
 Phase A limitations: the frozen ownership code remains unchanged, with a narrow
 v2 adapter for corroborated brand/subdomain relationships;
 search provider quality/budgets and live contact recall remain unbenchmarked.
+
+## Phase B P1A ownership
+
+Discovery v2 derives evidence-backed legal-name, alias, address, municipality,
+tax-number and registration-number observations without adding a claims table.
+The observation `value_json` records comparison status, confidence and typed
+qualifiers against the immutable run identity snapshot.
+
+Website ownership is decided only by named `OWN-01` through `OWN-06` rules.
+Relationship state is explicit (`STANDALONE`, `BRAND_OF_ENTITY`,
+`SUBSIDIARY_ON_GROUP_DOMAIN`, `GROUP_PARENT`, `RELATED_ENTITY`, `AMBIGUOUS`, or
+`UNRELATED`). Exact identifier conflicts, publisher domains, parked domains,
+unsupported shared tenants and unbounded group roots prevent verification.
+Fetch state is recorded separately and never counts as negative identity
+evidence. P1A never verifies without a successful, recorded first-party fetch;
+directory/search evidence can corroborate an explicit entity-to-domain link but
+cannot independently authorize a website.
+
+First-party authorization records an explicit `authorization_basis`. Existing
+rules may use bounded `EXPLICIT_OPERATOR` evidence. OWN-01 and OWN-02 may also use
+`STRONG_LEGAL_PAGE` on a fetched contact or legal page when one semantic block
+contains the exact legal name plus, respectively, an exact registered identifier
+or exact full address. This alternative never applies to unknown, editorial,
+directory, group or subsidiary contexts and does not create synthetic operator
+evidence. Name/address/identifier predicates used by a rule are bound to the same
+semantic identity block. Tenant and subsidiary verification retains the exact
+fetched path, and a verified result is re-derived from persisted evidence at both
+runner and store boundaries.
+
+Below strict `VERIFIED`, deterministic confidence rules may retain a first-party
+scope as `HIGH` or `MEDIUM`. These rules require bounded exact legal identity plus
+named combinations of address, contact/legal page role, company-domain email,
+legal-name/domain agreement and entity-specific search linkage. They do not use
+numeric scores or repeated-source counts. Identifier conflicts, other legal
+entities, foreign/related office context, group ambiguity, blocked publishers,
+parked domains, editorial pages and directories remain hard vetoes. Contacts from
+HIGH or MEDIUM scopes still pass the independent contact-attribution and default
+selection rules.
+
+## Phase B P1B offline replay
+
+Replay reads an existing Discovery v2 artifact through a read-only SQLite
+connection, rebuilds observations with the current extractors, and evaluates only
+recorded search results and fetched HTML. Its fetch adapter has no network
+implementation; any requested URL absent from the artifact makes that candidate
+remain `REVIEW`. Replay writes a new destination database and a sibling
+`.replay.json` lineage file containing the source path and SHA-256, source and
+destination run IDs, current versions, replay timestamp, and the explicit
+`OFFLINE_REPLAY`/network-disabled flags.
+
+```sh
+.venv/bin/python -m discovery_v2 replay \
+  --source-results /path/to/source-results.sqlite3 \
+  --source-run-id SOURCE_RUN_ID \
+  --results /path/to/new-replay.sqlite3
+```
+
+The source and destination must be different files, and the destination must not
+already exist. Replay verifies the source hash before and after execution.
 No source-specific company-database adapters, obfuscated-email extraction, full
 person enrichment, activity classification or production publishing are included.
 

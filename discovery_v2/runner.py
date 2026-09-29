@@ -13,6 +13,7 @@ from discovery.domain_generator import normalize_domain
 from discovery_v2.contacts import resolve_contacts, select_default
 from discovery_v2.evidence import EvidenceWriter
 from discovery_v2.interfaces import RecordingFetcher, VERIFIER_VERSION, evaluate_website, new_fetcher
+from discovery_v2.ownership import validate_assessment, usable
 from discovery_v2.models import Config, EXECUTION_MODE, JOB_TYPE
 from discovery_v2.search import (DOMAIN_CONTACT, default_provider, domain_query, queries,
                                  successful)
@@ -58,11 +59,17 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
 
     selected = None
     evaluated = set()
-    evaluated_hosts = set()
+    terminal_hosts = set()
+
+    def path_priority(observation):
+        path = normalize_url(observation['normalized_value']).split('?', 1)[0].rstrip('/').lower()
+        specific = any('/' + marker in path for marker in
+                       ('kontakt', 'contact', 'o-nas', 'about', 'legal', 'impress', 'podjetj'))
+        return (0 if specific else 1, rank(company, observation))
 
     def evaluate_candidates(limit):
         nonlocal selected
-        ordered = sorted((o for o in writer.observations if o['observation_type'] == 'WEBSITE_CANDIDATE'), key=lambda o: rank(company, o))
+        ordered = sorted((o for o in writer.observations if o['observation_type'] == 'WEBSITE_CANDIDATE'), key=path_priority)
         reserved = []
         hosts = set()
         for observation in ordered:
@@ -84,23 +91,28 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
                 diagnostics['website_candidates'].append({'url': url, 'observation_id': observation['observation_id'],
                     'status': 'INELIGIBLE', 'reason': 'Third-party/disallowed official website'})
                 continue
-            if normalize_domain(url) in evaluated_hosts:
+            if normalize_domain(url) in terminal_hosts:
                 continue
             if observation['extraction_method'] != 'domain_guess' and not brand_match(company, url) and not observation.get('value', {}).get('identity_match'):
                 continue
             used = sum(c['status'] != 'INELIGIBLE' for c in diagnostics['website_candidates'])
-            if selected or used >= limit:
+            if (selected and selected[1]['status'] == 'VERIFIED') or used >= limit:
                 continue
             evaluated.add(url)
-            evaluated_hosts.add(normalize_domain(url))
             assessment = evaluator(company, url, fetcher)
+            if usable(assessment) and not validate_assessment(company, url, assessment, writer, fetcher):
+                raise ValueError('Invalid P1A ownership authorization')
             entry = {'url': url, 'observation_id': observation['observation_id'], 'status': assessment['status'], 'assessment': assessment}
             diagnostics['website_candidates'].append(entry)
+            if assessment['status'] == 'VERIFIED':
+                terminal_hosts.add(normalize_domain(url))
             # Defence in depth: an adapter's Boolean cannot authorize a publisher URL.
             scope = assessment.get('verified_scope') or assessment.get('ownership', {}).get('scope')
-            if (assessment.get('verified') and assessment.get('ownership', {}).get('status') == 'VERIFIED'
+            if (usable(assessment) and assessment.get('ownership', {}).get('status') == assessment.get('status')
                     and scope and normalize_url(scope) and not blocks_official(scope)):
-                selected = (observation, assessment, scope)
+                priority = {'VERIFIED': 0, 'HIGH': 1, 'MEDIUM': 2}
+                if selected is None or priority[assessment['status']] < priority[selected[1]['status']]:
+                    selected = (observation, assessment, scope)
             checkpoint()
 
     completed = False
@@ -168,6 +180,8 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
                     soup = BeautifulSoup(response.text, 'html.parser')
                     queue.extend(u for u in internal_identity_links(response.url, soup) if u not in visited and u not in queue and in_scope(u, scope))
                 checkpoint()
+        if selected and not validate_assessment(company, selected[0]['normalized_value'], selected[1], writer, fetcher):
+            raise ValueError('P1A authorization invalidated by later evidence')
         contacts = resolve_contacts(company, writer.observations, owner, fetcher.responses)
         relevant_errors = fetcher.errors[contact_error_start:] if selected else fetcher.errors
         if selected:
@@ -180,11 +194,13 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
         # Commit useful assessments as PARTIAL; resume must retry incomplete work.
         diagnostics['completeness'] = {'complete': not has_errors, 'retryable': has_errors, 'errors': transport_errors}
         diagnostics['error'] = 'Discovery incomplete; partial evidence retained' if has_errors else None
-        website_status = 'VERIFIED' if selected else ('REVIEW' if has_errors or any(c['status'] in ('REVIEW', 'GROUP_REVIEW') for c in diagnostics['website_candidates']) else 'NOT_FOUND')
+        website_status = selected[1]['status'] if selected else ('REVIEW' if has_errors or any(c['status'] in ('REVIEW', 'GROUP_REVIEW') for c in diagnostics['website_candidates']) else 'NOT_FOUND')
         website_evidence = []
         if selected:
             website_evidence = [selected[0]['evidence_id']] + list(dict.fromkeys(
                 evidence_id for (url, _), evidence_id in writer.pages.items() if in_scope(url, selected[2])))
+            website_evidence += selected[1].get('p1a', {}).get('supporting_evidence_ids', [])
+            website_evidence = list(dict.fromkeys(website_evidence))
         result = dict(website_status=website_status, official_website=selected[2] if selected else None,
             verified_scope=selected[2] if selected else None, website_observation_id=selected[0]['observation_id'] if selected else None,
             website_evidence_ids_json=encode(website_evidence),
@@ -270,6 +286,10 @@ def main(argv=None):
         command.add_argument('--run-id', required=True)
         command.add_argument('--max-items', type=int)
         command.add_argument('--batch-size', type=int, default=100)
+    replay_command = commands.add_parser('replay', help='Replay recorded evidence offline into a new database')
+    replay_command.add_argument('--source-results', required=True)
+    replay_command.add_argument('--source-run-id', required=True)
+    replay_command.add_argument('--results', required=True)
     args = parser.parse_args(argv)
     store = None
     try:
@@ -279,9 +299,12 @@ def main(argv=None):
             config = Config(use_municipality=args.use_municipality,
                 max_search_queries_per_company=args.max_search_queries_per_company)
             result = {'run_id': store.create_run(descriptor, companies, config, args.job_type, args.execution_mode)}
-        else:
+        elif args.command in ('run', 'resume'):
             store = Store(args.results)
             result = run(store, args.run_id, max_items=args.max_items, batch_size=args.batch_size)
+        else:
+            from discovery_v2.replay import replay
+            result = replay(args.source_results, args.source_run_id, args.results)
         print(encode(result))
         return 1 if result.get('failed') or result.get('partial') else 0
     except (ValueError, OSError, sqlite3.Error) as exc:

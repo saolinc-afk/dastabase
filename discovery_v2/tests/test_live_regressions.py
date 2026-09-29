@@ -85,7 +85,7 @@ class LiveEvidenceTests(unittest.TestCase):
         company=FIXTURE['companies']['6512']
         self.assertTrue(brand_match(company,url))
         result=evaluate_website(company,url,FakeFetcher({url:response(FIXTURE['pages'][url],url)}))
-        self.assertTrue(result['verified'])
+        self.assertFalse(result['verified'])
 
     def test_brand_alone_never_establishes_ownership(self):
         company=dict(company_name='BETA ALFA d.o.o.')
@@ -119,13 +119,13 @@ class ScopedFailureTests(unittest.TestCase):
                 self.assertEqual(fetcher.requests,2)
         finally:fetcher.close()
 
-    def test_supported_company_subdomain_requires_independent_identity(self):
+    def test_writerless_subdomain_requires_recorded_operator_evidence(self):
         company=dict(company_name='EXAMPLE d.o.o.',tax_number='12345678',address='Main 10',municipality='Ljubljana')
         url='https://product.example.si/'
         rich='<title>Example</title><h1>Example d.o.o.</h1><p>SI12345678 Main 10 Ljubljana</p>'
         result=evaluate_website(company,url,FakeFetcher({url:response(rich,url)}))
-        self.assertTrue(result['verified'])
-        self.assertEqual(result['verified_scope'],url)
+        self.assertFalse(result['verified'])
+        self.assertIsNone(result['verified_scope'])
         weak=evaluate_website(company,url,FakeFetcher({url:response('<title>Example</title><p>EXAMPLE d.o.o.</p>',url)}))
         self.assertFalse(weak['verified'])
 

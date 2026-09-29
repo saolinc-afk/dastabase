@@ -75,7 +75,8 @@ def page_type(url, title='', visible='', signals=()):
         return 'THIRD_PARTY'
     if domain_policy and domain_policy.policy == GROUP_REVIEW:
         return 'GROUP'
-    structural = ('/business/', '/ddv/', '/exhibitor', 'exhibitor-search', '/searchdealer', '/prodajno-mesto/')
+    structural = ('/business/', '/ddv/', '/podjetja/', '/exhibitor',
+                  'exhibitor-search', '/searchdealer', '/prodajno-mesto/')
     strong = ('business directory', 'company directory', 'company database', 'baza podjetij',
               'poslovni imenik', 'seznam davcnih zavezancev', 'iskanje davcnih zavezancev',
               'profil kompanije', 'company listing', 'exhibitor', 'supplier report')

@@ -10,13 +10,11 @@ from discovery.email_discovery import extract_emails, mailto_emails
 from discovery_v2.context import contact_context, visible_soup, entity_specific
 from discovery.ownership import entity_context
 from discovery_v2 import RULE_VERSION
+from discovery_v2.identity import IDENTIFIER_RE, extract_claims, support_aliases, relationship_claims
 from discovery_v2.store import encode, now
 
 URL_RE = re.compile(r'https?://[^\s<>"\)]+|(?<![@\w.-])(?:www\.)?[\w-]+\.(?:si|com|eu|net|org)(?:/[^\s<>"\)]*)?', re.I)
 PHONE_RE = re.compile(r'(?:tel(?:efon)?|phone|mobil(?:ni)?)\s*[:.]?\s*(\+?\d[\d ()/.-]{5,}\d(?:\s*(?:ext\.?|int\.?|x)\s*\d+)?)', re.I)
-IDENTIFIER_RE = re.compile(
-    r'(?<!\w)(?P<label>mati[čc]na(?:\s+[šs]tevilka)?|registration(?:\s+number)?|company\s+id|'
-    r'dav[čc]na(?:\s+[šs]tevilka)?|vat|id\s+za\s+ddv)(?!\w)\s*[:.]?\s*(?:SI\s*)?(?P<value>\d[\d .-]{5,}\d)', re.I)
 
 
 def phone_value(raw):
@@ -38,12 +36,16 @@ class EvidenceWriter:
     def __init__(self, store, context, company):
         self.store, self.context, self.company = store, context, company
         self.observations = []
+        self.evidence_rows = {}
         self.pages = {}
 
     def evidence(self, kind, source_class, **fields):
         payload = fields.pop('payload', {})
-        return self.store.record('discovery_evidence', self.context, source_kind=kind,
+        evidence_id = self.store.record('discovery_evidence', self.context, source_kind=kind,
             source_class=source_class, observed_at=now(), evidence_payload_json=encode(payload), **fields)
+        self.evidence_rows[evidence_id] = dict(evidence_id=evidence_id, source_kind=kind,
+            source_class=source_class, evidence_payload=payload, **fields)
+        return evidence_id
 
     def observe(self, evidence_id, kind, raw, normalized=None, method='text', locator='body', **value):
         fields = dict(evidence_id=evidence_id, observation_type=kind, raw_value=raw,
@@ -68,14 +70,10 @@ class EvidenceWriter:
                          candidate=True, interpretation='Unclassified source wording; not an actual-business assertion')
 
     def identity_identifiers(self, evidence_id, publication, locator):
-        """Record only explicitly labelled numeric identity claims needed by P0."""
-        for match in IDENTIFIER_RE.finditer(publication):
-            label = text_value(match.group('label'))
-            digits = re.sub(r'\D', '', match.group('value'))
-            kind = 'TAX_NUMBER' if any(word in label for word in ('davcna', 'vat', 'ddv')) else 'REGISTRATION_NUMBER'
-            self.observe(evidence_id, kind, match.group('value'), digits,
-                         method='labelled_identifier', locator=locator,
-                         label=match.group('label'), candidate=True)
+        """Emit the focused P1A identity claims used by ownership and P0."""
+        for item in support_aliases(extract_claims(self.company, publication)):
+            self.observe(evidence_id, item['kind'], item['raw'], item['normalized'],
+                         method='structured_identity', locator=locator, **item['value'])
 
     def phone(self, evidence_id, raw, normalized, locator, publication, method='text', **value):
         digits = re.sub(r'\D', '', normalized.split(';', 1)[0])
@@ -87,7 +85,7 @@ class EvidenceWriter:
             if number:
                 known[number] = (kind, {'kind': 'IDENTITY_SNAPSHOT', 'field': field})
         for observation in self.observations:
-            if observation['observation_type'] in ('TAX_NUMBER', 'REGISTRATION_NUMBER'):
+            if observation['observation_type'] in ('TAX_NUMBER', 'REGISTRATION_NUMBER', 'NUMERIC_IDENTIFIER'):
                 known.setdefault(re.sub(r'\D', '', observation['normalized_value']), (
                     observation['observation_type'],
                     {'kind': 'OBSERVATION', 'observation_id': observation['observation_id']}))
@@ -155,6 +153,25 @@ class EvidenceWriter:
             content_hash=key[1], snippet_body=visible, payload={'html': response.text})
         self.pages[key] = evidence_id
         self.identity_identifiers(evidence_id, visible, 'visible_text')
+        # Preserve page-wide observations, but authorize only bounded contexts.
+        block_tags = ['section', 'footer', 'address', 'p', 'li', 'div', 'h1', 'h2', 'h3']
+        units = soup.find_all(block_tags)
+        for index, unit in enumerate(units):
+            # Prefer the smallest semantic publication. A container must not
+            # launder identity/operator facts from separate child blocks.
+            if unit.find(block_tags):
+                continue
+            publication = unit.get_text(' ', strip=True)
+            if not publication or len(publication) > 1200:
+                continue
+            block_id = f'identity_block:{index}'
+            items = extract_claims(self.company, publication) + relationship_claims(self.company, publication)
+            for item in items:
+                item['value']['qualifiers'].update(block_id=block_id, source_url=response.url,
+                    context=publication, block_tag=unit.name)
+                self.observe(evidence_id, item['kind'], item['raw'], item['normalized'],
+                    method='bounded_identity', locator=block_id, **item['value'])
+
         self.incidental(evidence_id, visible, 'visible_text')
         for a in soup.find_all('a', href=True):
             publication, block = contact_context(a, self.company, soup)
@@ -188,9 +205,3 @@ class EvidenceWriter:
                 if normalized:
                     self.phone(evidence_id, raw, normalized, f'text_node:{index}', publication, **common)
         return evidence_id
-
-
-def text_value(value):
-    import unicodedata
-    value = ''.join(c for c in unicodedata.normalize('NFKD', value.lower()) if not unicodedata.combining(c))
-    return ' '.join(re.sub(r'[^a-z0-9]+', ' ', value).split())

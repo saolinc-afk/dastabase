@@ -23,7 +23,7 @@ from discovery_v2.store import Store, digest, encode, read_manifest, snapshot
 COMPANY = dict(id=1, company_name='ALFA d.o.o.', tax_number='12345678',
                registration_number='7654321', address='Glavna ulica 12, 1000 Ljubljana', municipality='Ljubljana')
 IDENTITY = 'ALFA d.o.o. Davčna številka SI12345678 Glavna ulica 12, 1000 Ljubljana'
-HTML = f'''<title>ALFA</title><h1>ALFA d.o.o.</h1><p>{IDENTITY}</p>
+HTML = f'''<title>ALFA</title><h1>ALFA d.o.o.</h1><section>Website operated by {IDENTITY}</section>
 <section><h2>ALFA d.o.o.</h2><p>Kontakti</p>
 <a href="mailto:info@legacy.si">info@legacy.si</a>
 <a href="mailto:prodaja@alfa.si">prodaja@alfa.si</a>
@@ -475,7 +475,11 @@ class PhaseATests(unittest.TestCase):
         self.execute(pages={'https://alfa.si/': response(html)})
         contacts = {c['normalized_value']: c for c in self.rows('discovery_contacts')}
         for value in ('other@alfa.si', '+38619999999', 'agency@alfa.si'):
-            self.assertEqual(contacts[value]['attribution_status'], 'REJECTED')
+            self.assertNotEqual(contacts[value]['attribution_status'], 'ATTRIBUTED')
+        result = self.rows('discovery_company_results')[0]
+        self.assertEqual(result['website_status'], 'REVIEW')
+        self.assertIsNone(result['default_email_contact_id'])
+        self.assertIsNone(result['default_phone_contact_id'])
 
     def test_conflicting_visible_link_contact_rejected(self):
         html = HTML + '<section><h2>ALFA d.o.o.</h2><a href="mailto:wrong@alfa.si">visible@alfa.si</a></section>'
@@ -591,7 +595,7 @@ class PhaseATests(unittest.TestCase):
         self.assertFalse(any('/beta/' in u for u in fetchers[0].calls))
 
     def test_no_entity_contact_page_does_not_attribute_same_domain(self):
-        home = f'<title>ALFA</title><h1>ALFA d.o.o.</h1><p>{IDENTITY}</p><a href="/kontakt">Kontakt</a>'
+        home = f'<title>ALFA</title><h1>ALFA d.o.o.</h1><section>Website operated by {IDENTITY}</section><a href="/kontakt">Kontakt</a>'
         page = '<p><a href="mailto:unknown@alfa.si">unknown@alfa.si</a></p><p>Tel: 01 999 9999</p>'
         self.execute(search=FakeSearch([]), pages={'https://alfa.si/': response(home), 'https://alfa.si/kontakt': response(page, 'https://alfa.si/kontakt')})
         contacts = self.rows('discovery_contacts')

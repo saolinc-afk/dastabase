@@ -3,8 +3,9 @@
 Never imports its runner, database helpers or website-result reuse path.
 """
 from discovery.website_verifier import Fetcher, RULE_VERSION, verify
+from discovery_v2.ownership import evaluate
 
-VERIFIER_VERSION = RULE_VERSION + "+v2-brand-2"
+VERIFIER_VERSION = RULE_VERSION + "+v2-p1a-1"
 
 
 def new_fetcher(config):
@@ -12,30 +13,25 @@ def new_fetcher(config):
 
 
 def evaluate_website(company, url, fetcher):
-    result = verify(company, url, fetcher=fetcher)
-    if result.get('verified'):
-        return result
-    from discovery_v2.candidates import brand_match, eligible
-    from discovery.ownership import scope_url, name, text
-    from discovery.domain_generator import normalize_domain
-    for page in result.get('evidence', []):
-        page_url = page['page_url']
-        signals = set(page.get('signals', []))
-        facts = page.get('ownership', {})
-        labels = normalize_domain(page_url).split('.')
-        branded_parent = brand_match(company, 'https://' + '.'.join(labels[-2:]) + '/')
-        strong = bool(signals & {'tax_exact', 'registration_exact'}) and bool(signals & {'street_address_exact', 'postal_locality_exact'})
-        strong |= {'company_name_exact', 'street_address_exact', 'postal_locality_exact'} <= signals
-        if (strong and branded_parent and brand_match(company, page_url) and eligible(company, page_url, page.get('page_title', ''))
-                and facts.get('page_type') == 'COMPANY_PAGE' and (facts.get('site_brand_match') or set(name(company['company_name']).split()) <= set(text(page.get('page_title', '')).split()))
-                and not facts.get('legal_conflict') and not page.get('third_party')
-                and result.get('relationship') not in ('THIRD_PARTY', 'GROUP_PARENT')):
-            scope = scope_url(page_url)
-            owner = dict(status='VERIFIED', scope=scope, relationship='LEGAL_ENTITY',
-                         reasons=['V2 brand tokens/subdomain with strong independent identity'],
-                         ownership_evidence=[dict(page_url=page_url, basis='v2_corroborated_brand', scope=scope)])
-            result.update(verified=True, status='VERIFIED', verified_scope=scope, final_url=scope, ownership=owner)
-            return result
+    legacy = verify(company, url, fetcher=fetcher)
+    writer = getattr(fetcher, 'writer', None)
+    if writer is None:
+        return {**legacy, 'verified': False, 'status': 'REVIEW', 'relationship': 'AMBIGUOUS',
+                'verified_scope': None,
+                'ownership': {'status': 'REVIEW', 'scope': None, 'relationship': 'AMBIGUOUS'},
+                'p1a': {'rule_id': None, 'blockers': ['NO_PERSISTED_EVIDENCE_CONTEXT']}}
+    decision = evaluate(company, url, writer, fetcher, legacy)
+    scope = decision['verification_scope']
+    result = {**legacy, 'verified': decision['verified'], 'status': decision['status'],
+              'usable': decision['usable'],
+              'relationship': decision['relationship'], 'verified_scope': scope,
+              'final_url': scope or legacy.get('final_url') or url, 'p1a': decision,
+              'ownership': {'status': decision['status'] if decision['usable'] else 'REVIEW',
+                            'scope': scope, 'relationship': decision['relationship'],
+                            'reasons': ([decision['rule_id']] if decision['rule_id'] else
+                                        [decision['confidence_rule_id']] if decision['confidence_rule_id'] else
+                                        decision['blockers']),
+                            'ownership_evidence': decision['supporting_evidence_ids']}}
     return result
 
 

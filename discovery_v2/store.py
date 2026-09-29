@@ -81,7 +81,7 @@ def read_manifest(source, ids, namespace):
 
 
 class Store:
-    def __init__(self, path, source=None, create=False):
+    def __init__(self, path, source=None, create=False, require_new=False):
         original = Path(path).absolute()
         self.path = original.resolve()
         if original.is_symlink() or (self.path.exists() and self.path.stat().st_nlink > 1):
@@ -91,6 +91,8 @@ class Store:
         if source and self.path == Path(source).resolve():
             raise ValueError("Result database must differ from input source")
         exists = self.path.exists()
+        if require_new and exists:
+            raise ValueError("Result database must be a new file")
         if exists:
             check = readonly(self.path)
             try:
@@ -225,6 +227,7 @@ class Store:
                                     (context['attempt_id'], context['run_id'], context['company_id'])).fetchone()
         if not attempt or attempt[0] != 'RUNNING':
             raise ValueError("Attempt is not running")
+        self._validate_website(context, result)
         with self.conn:
             for contact in contacts:
                 refs = json.loads(contact['supporting_observation_ids_json'])
@@ -243,22 +246,58 @@ class Store:
                     if not selected or selected['contact_type'] != kind.upper() or selected['attribution_status'] != 'ATTRIBUTED' or 'PERSON' in json.loads(selected['roles_json']):
                         raise ValueError("Defaults require an attributed company contact of the correct type")
             self._check_refs('discovery_evidence', 'evidence_id', json.loads(result['website_evidence_ids_json']), context)
-            if result['official_website'] and (result['website_status'] != 'VERIFIED' or not result['website_observation_id']):
-                raise ValueError("Official websites require verified observation provenance")
+            if result['official_website'] and (result['website_status'] not in ('VERIFIED', 'HIGH', 'MEDIUM')
+                                               or not result['website_observation_id']):
+                raise ValueError("Usable websites require candidate observation provenance")
             if result['official_website']:
                 observation = self.conn.execute('SELECT observation_type,evidence_id FROM discovery_observations WHERE observation_id=?',
                                                 (result['website_observation_id'],)).fetchone()
                 evidence_refs = json.loads(result['website_evidence_ids_json'])
                 if not observation or observation[0] != 'WEBSITE_CANDIDATE' or observation[1] not in evidence_refs:
                     raise ValueError("Website provenance must include the candidate observation's evidence")
-                if not any(self.conn.execute("SELECT 1 FROM discovery_evidence WHERE evidence_id=? AND source_kind='FETCHED_PAGE'", (ref,)).fetchone()
-                           for ref in evidence_refs):
-                    raise ValueError("Verified websites require fetched-page evidence")
             self.insert('discovery_company_results', dict(result_id=uid(), **context, **result, completed_at=now()))
             status = "PARTIAL" if result["contact_outcome"] == "INCOMPLETE" else "COMPLETED"
             self.conn.execute("UPDATE discovery_attempts SET status=?,finished_at=? WHERE attempt_id=?", (status, now(), context["attempt_id"]))
             self.conn.execute("UPDATE discovery_run_companies SET status=?,selected_attempt_id=? WHERE run_id=? AND company_id=?",
                               (status, context['attempt_id'], context['run_id'], context['company_id']))
+
+    def _validate_website(self, context, result):
+        from types import SimpleNamespace
+        from discovery.domain_generator import normalize_url
+        from discovery_v2.ownership import validate_assessment
+        usable_status = result.get('website_status') in ('VERIFIED', 'HIGH', 'MEDIUM')
+        if not usable_status:
+            if result.get('official_website') or result.get('verified_scope'):
+                raise ValueError('Unverified result cannot carry an official scope')
+            return
+        if not result.get('official_website') or result.get('official_website') != result.get('verified_scope'):
+            raise ValueError('Verified result requires a consistent official scope')
+        args = (context['run_id'], context['company_id'], context['attempt_id'])
+        rows = {}
+        for stored in self.conn.execute('SELECT * FROM discovery_evidence WHERE run_id=? AND company_id=? AND attempt_id=?', args):
+            row = dict(stored)
+            row['evidence_payload'] = json.loads(row['evidence_payload_json'])
+            rows[row['evidence_id']] = row
+        observations = []
+        for stored in self.conn.execute('SELECT * FROM discovery_observations WHERE run_id=? AND company_id=? AND attempt_id=? ORDER BY rowid', args):
+            row = dict(stored); row['value'] = json.loads(row['value_json']); observations.append(row)
+        candidate = next((o for o in observations if o['observation_id'] == result.get('website_observation_id')
+                          and o['observation_type'] == 'WEBSITE_CANDIDATE'), None)
+        assessment = json.loads(result['website_assessment_json'])
+        selected = next((c for c in assessment.get('candidates', [])
+                         if c.get('observation_id') == result.get('website_observation_id')), {})
+        decision = selected.get('assessment', {})
+        company = json.loads(self.conn.execute('SELECT identity_snapshot_json FROM discovery_run_companies WHERE run_id=? AND company_id=?', args[:2]).fetchone()[0])
+        writer = SimpleNamespace(evidence_rows=rows, observations=observations)
+        fetcher = SimpleNamespace(responses={r['final_url']: True for r in rows.values()
+                                  if r['source_kind'] == 'FETCHED_PAGE'}, failures={})
+        if (not candidate or normalize_url(selected.get('url')) != normalize_url(candidate['normalized_value']) or
+                result['verified_scope'] != decision.get('verified_scope') or
+                not validate_assessment(company, candidate['normalized_value'], decision, writer, fetcher)):
+            raise ValueError('Verified website requires a valid persisted P1A rule and witnesses')
+        evidence_refs = set(json.loads(result['website_evidence_ids_json']))
+        if not set(decision['p1a']['supporting_evidence_ids']) <= evidence_refs:
+            raise ValueError('Missing decisive website evidence')
 
     def current_results(self, run_id):
         return [dict(r) for r in self.conn.execute("""SELECT r.* FROM discovery_company_results r

@@ -55,8 +55,8 @@ def attribution(company, observation, owner, responses, corroborated=False):
     if value.get('source_kind') != 'FETCHED_PAGE':
         return 'CANDIDATE', 'Search observation requires independent entity/contact corroboration'
     source_url = value['source_url']
-    if not owner or owner.get('status') != 'VERIFIED' or not in_scope(source_url, owner.get('scope', '')):
-        return 'UNCERTAIN', 'No verified first-party scope for this publication'
+    if not owner or owner.get('status') not in ('VERIFIED', 'HIGH', 'MEDIUM') or not in_scope(source_url, owner.get('scope', '')):
+        return 'UNCERTAIN', 'No usable first-party scope for this publication'
     response = responses[source_url]
     signals = score_page(company, response)
     if signals.get('third_party') or signals.get('rejected') or signals.get('ownership', {}).get('legal_conflict'):
