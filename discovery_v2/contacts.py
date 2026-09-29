@@ -5,11 +5,13 @@ from collections import defaultdict
 
 from discovery.ownership import in_scope, legal_conflict, text
 from discovery.website_verifier import score_page
+from discovery.domain_generator import normalize_domain
 from discovery_v2 import RULE_VERSION
 from discovery_v2.store import encode, uid
 
 ROLE_PREFIXES = {
-    'GENERAL': ('info', 'office', 'kontakt', 'contact', 'hello', 'tajnistvo'),
+    'GENERAL': ('info', 'office', 'kontakt', 'contact', 'hello', 'tajnistvo',
+                'reception', 'recepcija', 'secretariat', 'sekretariat'),
     'SALES': ('sales', 'prodaja', 'komerciala'),
     'MANAGEMENT': ('uprava', 'management', 'direktor', 'direkcija'),
     'PURCHASING': ('nabava', 'purchasing', 'procurement'),
@@ -17,6 +19,8 @@ ROLE_PREFIXES = {
     'HR': ('hr', 'kadrovska', 'zaposlitev'),
     'SUPPORT': ('support', 'podpora', 'servis'),
     'MARKETING': ('marketing', 'trzenje'),
+    'PRIVACY': ('dpo', 'gdpr', 'privacy', 'zasebnost'),
+    'RETURNS': ('returns', 'return', 'reklamacije', 'pritozbe', 'complaints'),
 }
 
 GENERAL = ('glavni', 'main', 'centrala', 'switchboard', 'centralni', 'splošni', 'splosni')
@@ -28,6 +32,7 @@ DEPARTMENT = ('oddelek', 'department', 'servis', 'support', 'računovodstvo', 'r
 PERSON_MOBILE = ('mobilni', 'mobile', 'gsm', 'direktor', 'vodja', 'manager')
 TRANSACTIONAL = ('vračil', 'vracil', 'returns', 'reklamacij', 'orders', 'naročil', 'narocil', 'transaction')
 LEGAL = ('zasebnost', 'privacy', 'legal', 'pravna', 'gdpr', 'pooblaščen', 'pooblascen')
+PRIVACY = LEGAL + ('dpo', 'varstvo podatkov', 'osebnih podatkov', 'data protection')
 FOREIGN_OFFICE = ('foreign office', 'foreign branch', 'podružnica', 'podruznica', 'subsidiary',
                   'office in', 'pisarna v', 'foreign market', 'tuji trg', 'mednarodn', 'international')
 
@@ -73,6 +78,11 @@ def attribution(company, observation, owner, responses, corroborated=False):
         return 'ATTRIBUTED', 'Explicit target-entity contact on verified scope'
     if block.get('single_entity_page') and block.get('contact_section'):
         return 'ATTRIBUTED', 'First-party company contact section on verified scope'
+    if (observation['observation_type'] == 'EMAIL_CANDIDATE'
+            and block.get('single_entity_page')
+            and normalize_domain('https://' + observation['normalized_value'].rsplit('@', 1)[-1])
+                == normalize_domain(owner.get('scope', ''))):
+        return 'ATTRIBUTED', 'First-party domain mailbox on single-entity verified scope'
     if block.get('single_entity_page') and corroborated:
         return 'ATTRIBUTED', 'First-party publication corroborated by independent entity-specific search evidence'
     return 'UNCERTAIN', 'Contact lacks sufficient target-entity context'
@@ -86,7 +96,6 @@ def resolve_contacts(company, observations, owner, responses):
     contacts = []
     order = {'ATTRIBUTED': 0, 'CANDIDATE': 1, 'UNCERTAIN': 2, 'REJECTED': 3}
     for (kind, normalized), items in sorted(groups.items()):
-        from discovery.domain_generator import normalize_domain
         corroborated = any(o['value'].get('source_kind') == 'SEARCH_RESULT' and o['value'].get('identity_match') and (not owner or normalize_domain(o['value'].get('source_url', '')) != normalize_domain(owner.get('scope', ''))) for o in items)
         decisions = [(observation, *attribution(company, observation, owner, responses, corroborated)) for observation in items]
         primary, status, reason = min(decisions, key=lambda d: (order[d[1]], not d[0]['value'].get('block', {}).get('explicit_company'), not d[0]['value'].get('block', {}).get('contact_section')))
@@ -95,6 +104,7 @@ def resolve_contacts(company, observations, owner, responses):
         # attribution. Search candidates and rejected publications cannot lend
         # a stronger role to an otherwise attributable contact.
         ranking_items = [o for o, s, _ in decisions if s == 'ATTRIBUTED'] or [primary]
+        contact_role = contextual_role(kind, contact_role, ranking_items)
         ranking = ranking_context(company, kind, normalized, ranking_items, contact_role)
         contacts.append(dict(contact_id=uid(), contact_type=kind, raw_value=primary['raw_value'],
             normalized_value=normalized, primary_observation_id=primary['observation_id'],
@@ -118,16 +128,20 @@ def ranking_context(company, kind, normalized, observations, contact_role):
     for observation in observations:
         value = observation.get('value') or {}
         headings = ' '.join(value.get('block', {}).get('headings', []))
-        contexts.append(text(value.get('publication', '') + ' ' + headings))
+        contexts.append(text(value.get('local_label', '') + ' ' +
+                             value.get('publication', '') + ' ' + headings))
     if kind == 'EMAIL':
         choices = []
         for index, (observation, context) in enumerate(zip(observations, contexts)):
-            if any(w in context for w in TRANSACTIONAL): choice = 60, 'transactional/returns context'
-            elif any(w in context for w in LEGAL): choice = 50, 'privacy/legal context'
+            publication = text((observation.get('value') or {}).get('publication', ''))
+            if contact_role in ('PRIVACY', 'LEGAL'): choice = 50, 'privacy/legal-only contact'
+            elif contact_role == 'RETURNS' or any(w in context for w in TRANSACTIONAL): choice = 60, 'transactional/returns context'
+            elif contact_role in ('HR', 'ACCOUNTING', 'SUPPORT', 'MARKETING', 'PURCHASING'): choice = 70, 'specialized department contact'
             elif contact_role == 'PERSON': choice = 40, 'named-person mailbox'
             elif any(w in context for w in GENERAL_EMAIL): choice = 0, 'explicit general company contact'
             elif any(w in context for w in OFFICE): choice = 10, 'office/reception context'
             elif contact_role == 'GENERAL': choice = 15, 'general mailbox role'
+            elif any(w in publication for w in PRIVACY): choice = 50, 'privacy/legal context'
             elif contact_role == 'SALES' or any(w in context for w in SALES): choice = 20, 'sales context'
             elif contact_role not in ('UNKNOWN', 'GENERAL'): choice = 30, 'department context'
             else: choice = 25, 'unclassified company mailbox'
@@ -142,6 +156,9 @@ def ranking_context(company, kind, normalized, observations, contact_role):
     target_country_match = (not foreign) if international else None
     choices = []
     for index, (observation, context) in enumerate(zip(observations, contexts)):
+        local_label = text((observation.get('value') or {}).get('local_label', ''))
+        if local_label:
+            context = local_label
         explicit_general = any(w in context for w in GENERAL)
         if explicit_general: rank, reason = 0, 'labelled main telephone/switchboard'
         elif any(w in context for w in OFFICE): rank, reason = 10, 'office/reception telephone'
@@ -173,8 +190,10 @@ def ranking_context(company, kind, normalized, observations, contact_role):
 
 
 def select_default(contacts, kind):
+    specialized = {'PERSON', 'PRIVACY', 'LEGAL', 'RETURNS', 'ACCOUNTING', 'HR',
+                   'SUPPORT', 'MARKETING', 'PURCHASING', 'VENDOR'}
     candidates = [c for c in contacts if c['contact_type'] == kind and c['attribution_status'] == 'ATTRIBUTED'
-                  and c['roles_json'] != encode(['PERSON'])]
+                  and not specialized.intersection(json.loads(c['roles_json']))]
     if not candidates:
         return None
     # Stable across result ordering and UUIDs. General mailboxes precede departments.
@@ -185,3 +204,21 @@ def select_default(contacts, kind):
         return category, not basis.get('explicit_company'), not basis.get('contact_section'), c['normalized_value']
     selected = min(candidates, key=rank)
     return selected['contact_id']
+
+
+def contextual_role(kind, contact_role, observations):
+    if kind != 'EMAIL':
+        return contact_role
+    publications = [text((o.get('value') or {}).get('local_label', '') + ' ' +
+                         (o.get('value') or {}).get('publication', ''))
+                    for o in observations]
+    context = text(' '.join((o.get('value') or {}).get('local_label', '') + ' ' +
+                            (o.get('value') or {}).get('publication', '') + ' ' +
+                            ' '.join((o.get('value') or {}).get('block', {}).get('headings', []))
+                            for o in observations))
+    if contact_role != 'UNKNOWN':
+        return contact_role
+    if publications and all(any(word in publication for word in PRIVACY)
+                            for publication in publications):
+        return 'PRIVACY'
+    return contact_role

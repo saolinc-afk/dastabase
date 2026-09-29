@@ -15,6 +15,11 @@ from discovery_v2.store import encode, now
 
 URL_RE = re.compile(r'https?://[^\s<>"\)]+|(?<![@\w.-])(?:www\.)?[\w-]+\.(?:si|com|eu|net|org)(?:/[^\s<>"\)]*)?', re.I)
 PHONE_RE = re.compile(r'(?:tel(?:efon)?|phone|mobil(?:ni)?)\s*[:.]?\s*(\+?\d[\d ()/.-]{5,}\d(?:\s*(?:ext\.?|int\.?|x)\s*\d+)?)', re.I)
+OBFUSCATED_EMAIL_RE = re.compile(
+    r'(?<![\w.-])([A-Z0-9._%+-]+)\s*(?:\[at\]|\(at\))\s*'
+    r'([A-Z0-9.-]+)\s*(?:\[dot\]|\(dot\)|\.)\s*([A-Z]{2,63})(?![\w.-])', re.I)
+CONTACT_NUMBER_LABEL_RE = re.compile(
+    r'\b(telefaks|telefax|facsimile|faks|fax|telefon|tel|phone|mobil(?:ni)?)\b', re.I)
 
 
 def phone_value(raw):
@@ -30,6 +35,36 @@ def phone_value(raw):
         digits = digits[2:]
     number = ('+' if international else '') + digits
     return number + (';ext=' + re.sub(r'\D', '', parts[1]) if len(parts) == 2 else '')
+
+
+def local_contact_label(node):
+    """Text label immediately preceding a linked contact within its line."""
+    parts = []
+    current = node
+    while current is not None:
+        for sibling in current.previous_siblings:
+            if getattr(sibling, 'name', None) == 'br':
+                return ' '.join(reversed(parts))[-240:]
+            value = sibling.get_text(' ', strip=True) if hasattr(sibling, 'get_text') else str(sibling)
+            if value.strip():
+                parts.append(value.strip())
+        parent = getattr(current, 'parent', None)
+        if getattr(parent, 'name', None) not in ('span', 'strong', 'b', 'em', 'i'):
+            break
+        current = parent
+    return ' '.join(reversed(parts))[-240:]
+
+
+def obfuscated_emails(value):
+    return {f'{m.group(1)}@{m.group(2)}.{m.group(3)}'.lower()
+            for m in OBFUSCATED_EMAIL_RE.finditer(value or '')}
+
+
+def is_fax_label(value):
+    """True only when the nearest bounded number label identifies a fax."""
+    labels = CONTACT_NUMBER_LABEL_RE.findall(value or '')
+    return bool(labels and labels[-1].lower() in
+                ('telefaks', 'telefax', 'facsimile', 'faks', 'fax'))
 
 
 class EvidenceWriter:
@@ -176,18 +211,21 @@ class EvidenceWriter:
         for a in soup.find_all('a', href=True):
             publication, block = contact_context(a, self.company, soup)
             publication += ' ' + a['href']
+            local_label = local_contact_label(a)
             displayed = extract_emails(a.get_text(' ', strip=True))
             for email in sorted(mailto_emails(a['href'])):
                 self.observe(evidence_id, 'EMAIL_CANDIDATE', a['href'], email, method='mailto', locator='a[href=' + a['href'] + ']',
                     source_url=response.url, publication=publication, block=block, title=title,
-                    visible_email=next(iter(displayed)) if len(displayed) == 1 else '', source_kind='FETCHED_PAGE')
+                    visible_email=next(iter(displayed)) if len(displayed) == 1 else '',
+                    local_label=local_label, source_kind='FETCHED_PAGE')
             if a['href'].lower().startswith('tel:'):
                 normalized = phone_value(a['href'])
-                if normalized:
+                if normalized and not is_fax_label(local_label + ' ' + a.get_text(' ', strip=True)):
                     shown = phone_value(a.get_text(' ', strip=True))
                     self.phone(evidence_id, a['href'], normalized, 'a[href=' + a['href'] + ']', publication,
                         method='tel', source_url=response.url, block=block, title=title,
-                        display_conflict=bool(shown and shown != normalized), source_kind='FETCHED_PAGE')
+                        display_conflict=bool(shown and shown != normalized),
+                        local_label=local_label, source_kind='FETCHED_PAGE')
         for index, node in enumerate(soup.find_all(string=True)):
             if node.find_parent('a') and node.find_parent('a').get('href', '').lower().startswith(('mailto:', 'tel:')):
                 continue
@@ -196,12 +234,20 @@ class EvidenceWriter:
             for email in sorted(extract_emails(str(node))):
                 self.observe(evidence_id, 'EMAIL_CANDIDATE', email, email, locator=f'text_node:{index}',
                              publication=publication, **common)
+            for email in sorted(obfuscated_emails(str(node))):
+                self.observe(evidence_id, 'EMAIL_CANDIDATE', str(node), email,
+                             method='visible_obfuscated_text', locator=f'text_node:{index}',
+                             publication=publication, **common)
             phone_text = str(node)
+            local_label = local_contact_label(node)
             if any(w in (publication + ' ' + ' '.join(block.get('headings', []))).lower() for w in ('pokličite', 'telefon', 'phone', 'call us')) and re.fullmatch(r'[+\d ()/.-]+', phone_text.strip()):
+                phone_text = 'Tel: ' + phone_text
+            elif (block.get('single_entity_page') and
+                  re.fullmatch(r'\s*(?:\+|00)386[\d ()/.-]{5,}\d\s*', phone_text)):
                 phone_text = 'Tel: ' + phone_text
             for match in PHONE_RE.finditer(phone_text):
                 raw = match.group(1)
                 normalized = phone_value(raw)
-                if normalized:
+                if normalized and not is_fax_label(local_label + ' ' + phone_text[:match.start()]):
                     self.phone(evidence_id, raw, normalized, f'text_node:{index}', publication, **common)
         return evidence_id

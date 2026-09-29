@@ -117,6 +117,30 @@ class P0ContactTests(unittest.TestCase):
         self.assertEqual(self.selected(contacts, 'EMAIL')['normalized_value'], 'office@primer.si')
         self.assertEqual(contacts['primer.returns@gmail.com']['attribution_status'], 'ATTRIBUTED')
 
+    def test_visible_and_mailto_first_party_general_emails_are_extracted(self):
+        _, contacts = self.extract('''<p>info@primer.si</p>
+            <p><a href="mailto:office@primer.si">office@primer.si</a></p>''')
+        self.assertEqual(contacts['info@primer.si']['attribution_status'], 'ATTRIBUTED')
+        self.assertEqual(contacts['office@primer.si']['attribution_status'], 'ATTRIBUTED')
+
+    def test_safe_visible_obfuscation_is_extracted_but_hidden_examples_are_not(self):
+        writer, contacts = self.extract('''<p>Kontakt: info (at) primer (dot) si</p>
+            <!-- hidden@example.com --><span hidden>template@example.org</span>
+            <script>const example = "script@example.com";</script>''')
+        self.assertIn('info@primer.si', contacts)
+        self.assertTrue(any(o['extraction_method'] == 'visible_obfuscated_text'
+                            for o in writer.observations
+                            if o['normalized_value'] == 'info@primer.si'))
+        self.assertFalse(any('example.' in c for c in contacts))
+
+    def test_dpo_only_is_retained_but_has_no_default(self):
+        _, contacts = self.extract('''<section><h2>Varstvo osebnih podatkov</h2>
+            <p>PRIMER d.o.o. DPO: <a href="mailto:dpo@primer.si">dpo@primer.si</a></p>
+            </section>''')
+        self.assertEqual(contacts['dpo@primer.si']['attribution_status'], 'ATTRIBUTED')
+        self.assertEqual(json.loads(contacts['dpo@primer.si']['roles_json']), ['PRIVACY'])
+        self.assertIsNone(self.selected(contacts, 'EMAIL'))
+
     def test_explicit_general_context_beats_prefix_and_domain(self):
         _, contacts = self.extract('''<section><h2>PRIMER d.o.o.</h2>
             <p>General company contact: <a href="mailto:team@legacy.eu">team@legacy.eu</a></p>
@@ -161,6 +185,47 @@ class P0ContactTests(unittest.TestCase):
             <h3>Centrala</h3><p>PRIMER d.o.o. <a href="tel:+38612345678">Call</a></p>
             <h3>Servis</h3><p>PRIMER d.o.o. <a href="tel:+38640222333">Call</a></p></section>''')
         self.assertEqual(self.selected(contacts, 'PHONE')['normalized_value'], '+38612345678')
+
+    def test_each_tel_link_uses_its_own_local_label(self):
+        _, contacts = self.extract('''<section><h2>PRIMER d.o.o.</h2><p>
+            Centrala: <a href="tel:+38612345678">+386 1 234 56 78</a><br>
+            Električarji: <a href="tel:+38640222333">+386 40 222 333</a></p></section>''')
+        self.assertEqual(self.selected(contacts, 'PHONE')['normalized_value'], '+38612345678')
+        central = json.loads(contacts['+38612345678']['role_basis_json'])
+        department = json.loads(contacts['+38640222333']['role_basis_json'])
+        self.assertLess(central['default_rank'], department['default_rank'])
+
+    def test_visible_first_party_international_phone_is_extracted(self):
+        _, contacts = self.extract('<section><h2>Kontakt PRIMER d.o.o.</h2><p>+386 1 234 56 78</p></section>')
+        self.assertIn('+38612345678', contacts)
+
+    def test_fax_is_rejected_while_labelled_telephone_is_default(self):
+        writer, contacts = self.extract('''<section><h2>Kontakt PRIMER d.o.o.</h2><p>
+            Telefon: +386 1 89 83 507<br>Fax: +386 1 89 80 002</p></section>''')
+        self.assertIn('+38618983507', contacts)
+        self.assertNotIn('+38618980002', contacts)
+        self.assertFalse(any(o['observation_type'] == 'PHONE_CANDIDATE'
+                             and o['normalized_value'] == '+38618980002'
+                             for o in writer.observations))
+        self.assertEqual(self.selected(contacts, 'PHONE')['normalized_value'], '+38618983507')
+
+    def test_fax_only_has_no_phone_default(self):
+        writer, contacts = self.extract('''<section><h2>Kontakt PRIMER d.o.o.</h2><p>
+            Faks: <span>+386 1 89 80 002</span></p></section>''')
+        self.assertFalse(any(o['observation_type'] == 'PHONE_CANDIDATE'
+                             for o in writer.observations))
+        self.assertIsNone(self.selected(contacts, 'PHONE'))
+
+    def test_separate_tel_and_fax_labels_do_not_contaminate_telephone(self):
+        writer, contacts = self.extract('''<section><h2>Kontakt PRIMER d.o.o.</h2><p>
+            Telefon: <a href="tel:+38618983507">+386 1 89 83 507</a><br>
+            Telefaks: <a href="tel:+38618980002">+386 1 89 80 002</a></p></section>''')
+        self.assertIn('+38618983507', contacts)
+        self.assertNotIn('+38618980002', contacts)
+        self.assertFalse(any(o['observation_type'] == 'PHONE_CANDIDATE'
+                             and o['normalized_value'] == '+38618980002'
+                             for o in writer.observations))
+        self.assertEqual(self.selected(contacts, 'PHONE')['normalized_value'], '+38618983507')
 
     def test_foreign_office_is_preserved_but_subsidiary_is_not_attributed(self):
         _, contacts = self.extract('''<section><h2>PRIMER d.o.o. Foreign office</h2>
