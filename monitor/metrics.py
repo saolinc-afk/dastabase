@@ -27,6 +27,9 @@ COUNTS_SQL = '''SELECT w.status, COUNT(*) FROM companies_lite c
     JOIN website_discovery w ON w.id=(SELECT id FROM website_discovery
       WHERE company_id=c.id ORDER BY id DESC LIMIT 1) GROUP BY w.status'''
 EMAILS_SQL = 'SELECT * FROM email_discovery'
+DISCOVERY_V2_COMPANY_STATUSES = ('COMPLETED', 'PARTIAL', 'FAILED', 'INELIGIBLE',
+                                 'RUNNING', 'PENDING')
+DISCOVERY_V2_WEBSITE_STATUSES = ('VERIFIED', 'HIGH', 'MEDIUM', 'REVIEW')
 
 
 def obj(raw, kind):
@@ -110,6 +113,136 @@ def database_metrics(path, attribution_cache=None):
     result.update(emails=accepted_count, email_companies=company_count)
     if malformed:
         result['email_note'] = 'Malformed provenance excluded; counts may be incomplete.'
+    return result
+
+
+def _discovery_v2_empty(note=None):
+    return dict(available=False, note=note, database=None, run_id=None, run_status=None,
+                selected=None, processed=None, pending=None, percent=None,
+                company_statuses={s: None for s in DISCOVERY_V2_COMPANY_STATUSES},
+                website_statuses={s: None for s in DISCOVERY_V2_WEBSITE_STATUSES},
+                usable_websites=None, default_email_companies=None,
+                default_phone_companies=None, serper_evidence_companies=None,
+                last_activity=None)
+
+
+def _discovery_v2_runs(path):
+    """Read run headers from one result DB without creating, migrating or waiting on it."""
+    conn = None
+    try:
+        conn = sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro', uri=True,
+                               isolation_level=None, timeout=0.1)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA query_only=ON')
+        deadline = time.monotonic()+0.5
+        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+        return [dict(row) for row in conn.execute('''SELECT run_id, status, created_at,
+            started_at, finished_at FROM discovery_runs''')]
+    except (sqlite3.Error, OSError):
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _timestamp_key(*values):
+    valid = []
+    for value in values:
+        try:
+            valid.append(datetime.fromisoformat(value).timestamp())
+        except (TypeError, ValueError):
+            pass
+    return max(valid, default=float('-inf'))
+
+
+def discovery_v2_metrics(root):
+    """Summarize the active/latest isolated Discovery v2 run, strictly read-only.
+
+    A RUNNING/PENDING run is preferred. Otherwise the run with the newest persisted
+    run timestamp wins; path and run ID make ties deterministic. Result rows are not
+    used to infer manifest progress because failed/ineligible companies may lack one.
+    """
+    root = Path(root).expanduser()
+    try:
+        paths = sorted(p for p in root.rglob('results.sqlite3') if p.is_file())
+    except OSError:
+        paths = []
+    candidates = []
+    for path in paths:
+        for run in _discovery_v2_runs(path):
+            active = run.get('status') in ('RUNNING', 'PENDING')
+            activity = _timestamp_key(run.get('finished_at'), run.get('started_at'),
+                                      run.get('created_at'))
+            candidates.append((active, activity, str(path), str(run.get('run_id') or ''),
+                               path, run))
+    if not candidates:
+        return _discovery_v2_empty('No readable Discovery v2 run found.')
+    _, _, _, _, path, run = max(candidates)
+    result = _discovery_v2_empty()
+    result.update(database=str(path.relative_to(root)), run_id=run['run_id'],
+                  run_status=run.get('status'))
+    conn = None
+    notes = []
+    try:
+        conn = sqlite3.connect(path.resolve().as_uri()+'?mode=ro', uri=True,
+                               isolation_level=None, timeout=0.1)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA query_only=ON')
+        deadline = time.monotonic()+1.5
+        conn.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
+        company_counts = dict(conn.execute('''SELECT status, COUNT(*)
+            FROM discovery_run_companies WHERE run_id=? GROUP BY status''',
+            (run['run_id'],)).fetchall())
+        selected = sum(company_counts.values())
+        processed = sum(company_counts.get(s, 0)
+                        for s in ('COMPLETED', 'PARTIAL', 'FAILED', 'INELIGIBLE'))
+        statuses = {s: company_counts.get(s, 0) for s in DISCOVERY_V2_COMPANY_STATUSES}
+        result.update(available=True, selected=selected, processed=processed,
+                      pending=max(0, selected-processed),
+                      percent=round(100*processed/selected, 1) if selected else 0,
+                      company_statuses=statuses)
+        try:
+            website_counts = dict(conn.execute('''SELECT website_status, COUNT(*)
+                FROM discovery_company_results WHERE run_id=? GROUP BY website_status''',
+                (run['run_id'],)).fetchall())
+            result['website_statuses'] = {
+                s: website_counts.get(s, 0) for s in DISCOVERY_V2_WEBSITE_STATUSES}
+            result['usable_websites'] = sum(website_counts.get(s, 0)
+                                             for s in ('VERIFIED', 'HIGH', 'MEDIUM'))
+            contacts = conn.execute('''SELECT
+                COUNT(CASE WHEN default_email_contact_id IS NOT NULL THEN 1 END),
+                COUNT(CASE WHEN default_phone_contact_id IS NOT NULL THEN 1 END),
+                MAX(completed_at) FROM discovery_company_results WHERE run_id=?''',
+                (run['run_id'],)).fetchone()
+            result.update(default_email_companies=contacts[0],
+                          default_phone_companies=contacts[1])
+            result_timestamp = contacts[2]
+        except sqlite3.Error:
+            notes.append('Website/contact metrics unavailable with this schema.')
+            result_timestamp = None
+        try:
+            result['serper_evidence_companies'] = conn.execute('''SELECT COUNT(DISTINCT company_id)
+                FROM discovery_evidence WHERE run_id=? AND lower(provider)='serper' ''',
+                (run['run_id'],)).fetchone()[0]
+        except sqlite3.Error:
+            notes.append('Serper evidence coverage unavailable with this schema.')
+        activity_values = [run.get('finished_at'), run.get('started_at'),
+                           run.get('created_at'), result_timestamp]
+        for sql in ('''SELECT MAX(finished_at) FROM discovery_attempts WHERE run_id=?''',
+                    '''SELECT MAX(observed_at) FROM discovery_evidence WHERE run_id=?'''):
+            try:
+                activity_values.append(conn.execute(sql, (run['run_id'],)).fetchone()[0])
+            except sqlite3.Error:
+                pass
+        valid = [(value, _timestamp_key(value)) for value in activity_values
+                 if _timestamp_key(value) != float('-inf')]
+        result['last_activity'] = max(valid, key=lambda item: item[1])[0] if valid else None
+    except (sqlite3.Error, OSError):
+        return _discovery_v2_empty('Discovery v2 database unavailable or busy.')
+    finally:
+        if conn is not None:
+            conn.close()
+    result['note'] = ' '.join(notes) or None
     return result
 
 

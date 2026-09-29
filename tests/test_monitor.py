@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from monitor.app import create_app
 from monitor.metrics import (ROOT, active_jobs, database_metrics, log_progress,
-                             parse_report, recent_jobs, runner_args, safe_file, service_metrics)
+                             discovery_v2_metrics, parse_report, recent_jobs, runner_args,
+                             safe_file, service_metrics)
 
 
 class MonitorTests(unittest.TestCase):
@@ -141,7 +142,8 @@ class MonitorTests(unittest.TestCase):
 
     def test_routes_cache_and_no_mutations(self):
         self.fixture()
-        app = create_app({'TESTING': True, 'DB_PATH': self.db, 'LOGS_PATH': self.logs})
+        app = create_app({'TESTING': True, 'DB_PATH': self.db, 'LOGS_PATH': self.logs,
+                          'DISCOVERY_V2_PATH': self.root/'no-discovery-v2'})
         with patch('monitor.app.service_metrics', return_value=[]), patch('monitor.app.active_jobs', return_value={'available': False, 'jobs': []}):
             client = app.test_client()
             self.assertEqual(client.get('/').status_code, 200)
@@ -152,6 +154,68 @@ class MonitorTests(unittest.TestCase):
             self.assertIn("script-src 'self'", response.headers['Content-Security-Policy'])
             self.assertEqual(client.post('/api/status').status_code, 405)
             self.assertEqual(client.get('/api/status?db=/etc/passwd').json['database']['total'], 3)
+
+    def discovery_v2_fixture(self, directory, run_id='run-1', status='RUNNING',
+                             started='2026-01-02T10:00:00+00:00'):
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory/'results.sqlite3'
+        conn = sqlite3.connect(path)
+        conn.executescript('''CREATE TABLE discovery_runs(run_id TEXT, status TEXT,
+            created_at TEXT, started_at TEXT, finished_at TEXT);
+        CREATE TABLE discovery_run_companies(run_id TEXT, company_id INTEGER, status TEXT);
+        CREATE TABLE discovery_company_results(run_id TEXT, company_id INTEGER,
+            website_status TEXT, default_email_contact_id TEXT,
+            default_phone_contact_id TEXT, completed_at TEXT);
+        CREATE TABLE discovery_evidence(run_id TEXT, company_id INTEGER, provider TEXT,
+            observed_at TEXT);
+        CREATE TABLE discovery_attempts(run_id TEXT, finished_at TEXT);''')
+        conn.execute('INSERT INTO discovery_runs VALUES (?,?,?,?,?)',
+                     (run_id, status, started, started, None))
+        conn.executemany('INSERT INTO discovery_run_companies VALUES (?,?,?)', [
+            (run_id, 1, 'COMPLETED'), (run_id, 2, 'PARTIAL'),
+            (run_id, 3, 'FAILED'), (run_id, 4, 'INELIGIBLE'),
+            (run_id, 5, 'RUNNING'), (run_id, 6, 'PENDING')])
+        conn.executemany('INSERT INTO discovery_company_results VALUES (?,?,?,?,?,?)', [
+            (run_id, 1, 'VERIFIED', 'email-1', 'phone-1', '2026-01-02T10:02:00+00:00'),
+            (run_id, 2, 'HIGH', None, 'phone-2', '2026-01-02T10:03:00+00:00')])
+        conn.executemany('INSERT INTO discovery_evidence VALUES (?,?,?,?)', [
+            (run_id, 1, 'serper', '2026-01-02T10:04:00+00:00'),
+            (run_id, 1, 'serper', '2026-01-02T10:05:00+00:00'),
+            (run_id, 2, 'fixture', '2026-01-02T10:06:00+00:00')])
+        conn.commit(); conn.close()
+        return path
+
+    def test_discovery_v2_manifest_progress_results_and_read_only(self):
+        root = self.root/'discovery-v2'
+        path = self.discovery_v2_fixture(root/'batch')
+        before = path.read_bytes()
+        result = discovery_v2_metrics(root)
+        self.assertTrue(result['available'])
+        self.assertEqual((result['processed'], result['selected'], result['pending'], result['percent']),
+                         (4, 6, 2, 66.7))
+        self.assertEqual(result['company_statuses'], {'COMPLETED': 1, 'PARTIAL': 1,
+            'FAILED': 1, 'INELIGIBLE': 1, 'RUNNING': 1, 'PENDING': 1})
+        self.assertEqual(result['website_statuses'], {'VERIFIED': 1, 'HIGH': 1,
+            'MEDIUM': 0, 'REVIEW': 0})
+        self.assertEqual((result['usable_websites'], result['default_email_companies'],
+                          result['default_phone_companies'], result['serper_evidence_companies']),
+                         (2, 1, 2, 1))
+        self.assertEqual(result['last_activity'], '2026-01-02T10:06:00+00:00')
+        self.assertEqual(before, path.read_bytes())
+
+    def test_discovery_v2_prefers_active_then_latest_and_fails_gracefully(self):
+        root = self.root/'discovery-v2'
+        self.discovery_v2_fixture(root/'new-complete', 'complete', 'COMPLETED',
+                                  '2026-02-01T00:00:00+00:00')
+        self.discovery_v2_fixture(root/'older-active', 'active', 'RUNNING',
+                                  '2026-01-01T00:00:00+00:00')
+        self.assertEqual(discovery_v2_metrics(root)['run_id'], 'active')
+        empty = discovery_v2_metrics(self.root/'missing')
+        self.assertFalse(empty['available'])
+        broken = root/'broken'; broken.mkdir(); sqlite3.connect(broken/'results.sqlite3').close()
+        self.assertEqual(discovery_v2_metrics(root)['run_id'], 'active')
+        with patch('monitor.metrics.sqlite3.connect', side_effect=sqlite3.OperationalError('locked')):
+            self.assertFalse(discovery_v2_metrics(root)['available'])
 
 
 class LiveMonitorTests(unittest.TestCase):
@@ -283,7 +347,8 @@ class LiveMonitorTests(unittest.TestCase):
             self.assertEqual(cache.get(collect), 1)
             clock[0] += 0.5
             self.assertEqual(cache.get(collect), 2)
-        app = create_app({'TESTING': True, 'DB_PATH': self.db, 'LOGS_PATH': self.logs})
+        app = create_app({'TESTING': True, 'DB_PATH': self.db, 'LOGS_PATH': self.logs,
+                          'DISCOVERY_V2_PATH': self.root/'no-discovery-v2'})
         with patch('monitor.state.database_metrics') as db, patch('monitor.app.recent_jobs') as reports, patch('monitor.app.service_metrics') as services, patch('monitor.app.active_jobs', return_value={'available': True, 'jobs': []}) as processes:
             client = app.test_client()
             self.assertEqual(client.get('/api/live').status_code, 200)
@@ -309,7 +374,9 @@ class LiveMonitorTests(unittest.TestCase):
 
     def test_service_checks_not_repeated_with_status_refresh(self):
         self.fixture()
-        app = create_app({'TESTING': True, 'DB_PATH': self.db, 'LOGS_PATH': self.logs, 'CACHE_SECONDS': 0})
+        app = create_app({'TESTING': True, 'DB_PATH': self.db, 'LOGS_PATH': self.logs,
+                          'DISCOVERY_V2_PATH': self.root/'no-discovery-v2',
+                          'CACHE_SECONDS': 0})
         with patch('monitor.app.service_metrics', return_value=[]) as services, patch('monitor.app.active_jobs', return_value={'available': True, 'jobs': []}):
             client = app.test_client()
             for _ in range(3):

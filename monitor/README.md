@@ -27,6 +27,7 @@ Configuration is through server-side environment variables, never request inputs
 | `MONITOR_PORT` | `8765` |
 | `MONITOR_DB` | repository `database/dastabase_lite.db` |
 | `MONITOR_LOGS` | repository `logs/` |
+| `MONITOR_DISCOVERY_V2` | `~/dastabase-runs/discovery-v2/` |
 
 For later private access, set `MONITOR_HOST` to Duke's specific Tailscale/private
 interface address. There is no authentication; keep access on trusted
@@ -64,6 +65,27 @@ queue object without changing the meaning of observed workload.
 
 Snapshots are observations, not an atomic transaction across DB, processes and
 files. Database `sampled_at` identifies its actual last collection time.
+
+### Discovery v2 enrichment
+
+The separate **DISCOVERY V2 / ENRICHMENT** card scans read-only
+`results.sqlite3` files below the configured Discovery v2 directory. A `RUNNING`
+or `PENDING` run is preferred; otherwise the run with the newest persisted
+`finished_at`, `started_at`, or `created_at` is shown. Path and run ID provide
+deterministic tie-breaking.
+
+Progress comes from `discovery_run_companies`: `COMPLETED`, `PARTIAL`, `FAILED`,
+and `INELIGIBLE` are handled; `RUNNING` and `PENDING` remain pending/unprocessed.
+Website and default-contact totals come directly from
+`discovery_company_results`. “Companies with Serper evidence” is a distinct
+company count from persisted evidence provider rows, not an API query count.
+Last activity is the newest reliable persisted run/result/attempt/evidence
+timestamp available.
+
+Connections use SQLite URI `mode=ro`, `PRAGMA query_only=ON`, short busy
+timeouts, progress deadlines, and immediate close. Missing directories, locked
+files, and incomplete schemas return an unavailable or partial card without
+creating or migrating a database.
 
 ## Caching and resource budget
 

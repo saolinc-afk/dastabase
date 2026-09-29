@@ -7,10 +7,11 @@
 <main>
 <section><h2>01 / DATABASE</h2><div id="database"></div><progress id="progress" max="100" value="0" aria-label="Processing coverage"></progress><p class="muted">Processed = a discovery result exists; it does not imply successful enrichment.</p></section>
 <section><h2>02 / ENRICHMENT OUTPUT</h2><div id="results"></div><p class="muted">Latest result per company · current outreach attribution rules.</p></section>
-<section><h2>03 / ACTIVE JOBS</h2><div id="active"></div></section>
-<section><h2>04 / WORKLOAD / NEXT</h2><div id="workload"></div><p class="muted">Observed workload, not a persistent job queue. Estimate assumes the active batches finish; retries and overlapping selections are accounted for.</p></section>
-<section class="wide"><h2>05 / LIVE ACTIVITY</h2><div id="activity"></div><p id="activity-note" class="muted"></p></section>
-<section><h2>06 / DUKE SERVER</h2><div id="server"></div></section>
-<section><h2>07 / SERVICES</h2><div id="services"></div><p class="muted">Observed container/unit state, not an application health probe.</p></section>
-<section class="wide"><h2>08 / RECENT BATCHES</h2><div id="recent" class="scroll"></div></section>
+<section class="wide"><h2>03 / DISCOVERY V2 / ENRICHMENT</h2><div id="discovery-v2"></div><p class="muted">Prefers an active run; otherwise shows the run with the latest persisted run timestamp. Serper is evidence coverage, not an API-call count.</p></section>
+<section><h2>04 / ACTIVE JOBS</h2><div id="active"></div></section>
+<section><h2>05 / WORKLOAD / NEXT</h2><div id="workload"></div><p class="muted">Observed workload, not a persistent job queue. Estimate assumes the active batches finish; retries and overlapping selections are accounted for.</p></section>
+<section class="wide"><h2>06 / LIVE ACTIVITY</h2><div id="activity"></div><p id="activity-note" class="muted"></p></section>
+<section><h2>07 / DUKE SERVER</h2><div id="server"></div></section>
+<section><h2>08 / SERVICES</h2><div id="services"></div><p class="muted">Observed container/unit state, not an application health probe.</p></section>
+<section class="wide"><h2>09 / RECENT BATCHES</h2><div id="recent" class="scroll"></div></section>
 </main><footer>System 1s · operations 2.5s · services 30s · read-only SQLite</footer></body></html>

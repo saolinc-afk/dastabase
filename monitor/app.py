@@ -4,7 +4,8 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template
 from engine_identity import ENGINE_IDENTITY
-from monitor.metrics import ROOT, ServerMetrics, active_jobs, recent_jobs, service_metrics
+from monitor.metrics import (ROOT, ServerMetrics, active_jobs, discovery_v2_metrics,
+                             recent_jobs, service_metrics)
 from monitor.state import (DatabaseCache, ReportCache, SnapshotCache, operation_details,
                            public_jobs, stamp)
 
@@ -14,6 +15,8 @@ def create_app(config=None):
     app.json.sort_keys = False
     app.config.update(DB_PATH=Path(os.environ.get('MONITOR_DB', ROOT/'database/dastabase_lite.db')),
                       LOGS_PATH=Path(os.environ.get('MONITOR_LOGS', ROOT/'logs')),
+                      DISCOVERY_V2_PATH=Path(os.environ.get(
+                          'MONITOR_DISCOVERY_V2', Path.home()/'dastabase-runs/discovery-v2')),
                       CACHE_SECONDS=2, LIVE_CACHE_SECONDS=0.8, SERVICE_CACHE_SECONDS=30)
     if config:
         app.config.update(config)
@@ -55,7 +58,9 @@ def create_app(config=None):
             workload, activity = operation_details(db, active, recent, app.config['DB_PATH'])
             active, recent = public_jobs(active, recent)
             return dict(timestamp=stamp(), database=db, active=active, workload=workload,
-                        activity=activity, recent=recent, services=services.get(service_metrics))
+                        activity=activity, recent=recent,
+                        discovery_v2=discovery_v2_metrics(app.config['DISCOVERY_V2_PATH']),
+                        services=services.get(service_metrics))
         return jsonify(status_cache.get(collect))
 
     return app

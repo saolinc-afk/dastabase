@@ -32,6 +32,24 @@ function renderStatus(data){
     row(box,'Companies with usable emails',number(d.email_companies));row(box,'Usable email addresses',number(d.emails));
     if(d.email_note)box.append(node('p',d.email_note,'warn'));
   });
+  const v=data.discovery_v2 || {available:false,note:'Discovery v2 status unavailable.'};
+  changed('discovery-v2',v,box=>{
+    if(!v.available){box.append(node('p',v.note || 'No Discovery v2 run found.','muted'));return;}
+    row(box,'Run status',v.run_status,tone(v.run_status));
+    row(box,'Progress',`${number(v.processed)} / ${number(v.selected)} · ${v.percent == null ? 'N/A' : v.percent+'%'}`);
+    bar(box,v.percent,'Discovery v2 enrichment progress');
+    const companyLabels={COMPLETED:'Completed',PARTIAL:'Partial',FAILED:'Failed',INELIGIBLE:'Ineligible',RUNNING:'Running',PENDING:'Pending'};
+    for(const status of ['COMPLETED','PARTIAL','FAILED','INELIGIBLE','RUNNING','PENDING'])row(box,companyLabels[status],number(v.company_statuses?.[status]),tone(status));
+    row(box,'Pending / unprocessed',number(v.pending));
+    for(const status of ['VERIFIED','HIGH','MEDIUM','REVIEW'])row(box,resultLabel(status)+' websites',number(v.website_statuses?.[status]),tone(status));
+    row(box,'Usable websites',number(v.usable_websites),'good');
+    row(box,'Companies with default email',number(v.default_email_companies));
+    row(box,'Companies with default phone',number(v.default_phone_companies));
+    row(box,'Companies with Serper evidence',number(v.serper_evidence_companies));
+    row(box,'Last activity',localTime(v.last_activity));
+    row(box,'Run',v.run_id);row(box,'Results DB',v.database);
+    if(v.note)box.append(node('p',v.note,'warn'));
+  });
   changed('active',data.active,box=>{
     runtimes=new Map();
     if(!data.active.jobs.length)box.append(node('p',data.active.available ? 'No active worker observed.' : data.active.note,'muted'));

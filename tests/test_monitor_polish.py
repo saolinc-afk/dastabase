@@ -14,6 +14,14 @@ def status_fixture():
     return dict(timestamp='2026-09-26T12:00:00Z',
         database=dict(total=100, processed=42, remaining=58, percent=42,
                       statuses={'VERIFIED': 40, 'ERROR': 2}, emails=10, email_companies=8),
+        discovery_v2=dict(available=True, note=None, database='batch/results.sqlite3',
+            run_id='run-1', run_status='RUNNING', selected=100, processed=42,
+            pending=58, percent=42, company_statuses={'COMPLETED':40,'PARTIAL':2,
+            'FAILED':0,'INELIGIBLE':0,'RUNNING':1,'PENDING':57},
+            website_statuses={'VERIFIED':5,'HIGH':16,'MEDIUM':6,'REVIEW':15},
+            usable_websites=27, default_email_companies=25,
+            default_phone_companies=16, serper_evidence_companies=41,
+            last_activity='2026-09-26T11:59:00Z'),
         active=dict(available=True, jobs=[dict(identity='1:100', pid=1,
             job_type='WEBSITE + EMAIL DISCOVERY', report='example/batch.json',
             selected=100, processed=42, remaining=58, percent=42, runtime_seconds=123,
@@ -173,6 +181,10 @@ class MonitorPolishBrowserTests(unittest.TestCase):
         self.assertNotIn('Current name', active)
         self.assertIn('Unresolved', self.page.locator('#results').inner_text())
         self.assertIn('UNRESOLVED', self.page.locator('#activity').inner_text())
+        discovery = self.page.locator('#discovery-v2').inner_text()
+        self.assertIn('42 / 100 · 42%', discovery)
+        self.assertIn('Companies with Serper evidence', discovery)
+        self.assertIn('27', discovery)
         self.assertIn('SPARROW 0.9.0', self.page.locator('header').inner_text())
         self.assertNotIn('ENGINE', self.page.locator('header').inner_text())
         self.assertTrue(self.page.locator('.dastabase-logo').evaluate('(img) => img.complete && img.naturalWidth > 0'))
