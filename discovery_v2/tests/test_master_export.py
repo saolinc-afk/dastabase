@@ -68,6 +68,7 @@ class MasterExportTests(unittest.TestCase):
             (1, 0, 'z@alfa.si', 'HIGH'),
             (2, 0, 'a@alfa.si', 'VERIFIED'),
             (3, 4, 'outside@example.si', 'HIGH'),
+            (4, 3, 'existing@delta.si', 'VERIFIED'),
         ])
         connection.commit()
         connection.close()
@@ -158,12 +159,16 @@ class MasterExportTests(unittest.TestCase):
         self.assertEqual(by_id[1]['best_phone'], '+38640222000')
         self.assertIsNone(phone_column)
         self.assertEqual(stats, {
-            'TOTAL_45XX': 4, 'OLD_EMAIL_COMPANIES': 1,
-            'NO_OLD_EMAIL_COMPANIES': 3, 'DISCOVERY_SELECTED': 3,
+            'TOTAL_45XX': 4, 'OLD_EMAIL_COMPANIES': 2,
+            'NO_OLD_EMAIL_COMPANIES': 2, 'DISCOVERY_SELECTED': 3,
             'DISCOVERY_RESULTS': 2, 'DISCOVERY_FAILED': 1,
             'NEW_DISCOVERY_EMAILS': 1, 'DISCOVERY_DEFAULT_PHONES': 2,
             'DISCOVERY_USABLE_WEBSITES': 1, 'VERIFIED': 0, 'HIGH': 1,
             'MEDIUM': 0, 'REVIEW': 1,
+            'DISCOVERY_SELECTED_WITH_CURRENT_OLD_EMAIL': 1,
+            'DISCOVERY_SELECTED_WITHOUT_CURRENT_OLD_EMAIL': 2,
+            'NOT_SELECTED_WITH_CURRENT_OLD_EMAIL': 1,
+            'NOT_SELECTED_WITHOUT_CURRENT_OLD_EMAIL': 0,
         })
         self.assertEqual(before, {path: self._digest(path) for path in before})
 
@@ -187,6 +192,25 @@ class MasterExportTests(unittest.TestCase):
         self.assertEqual(rows[0]['audit_note'], '')
         self.assertIn('TOTAL_45XX=4', stdout.getvalue())
         self.assertIn('NEW_DISCOVERY_EMAILS=1', stdout.getvalue())
+        self.assertIn(
+            'DISCOVERY_SELECTED_WITH_CURRENT_OLD_EMAIL=1', stdout.getvalue())
+
+    def test_historical_selection_is_independent_of_current_email_state(self):
+        rows, stats, _, _ = self._build()
+        alfa = next(row for row in rows if row['company_id'] == 0)
+
+        self.assertNotEqual(stats['NO_OLD_EMAIL_COMPANIES'], stats['DISCOVERY_SELECTED'])
+        self.assertEqual(alfa['sparrow_emails'], 'a@alfa.si | z@alfa.si')
+        self.assertEqual(alfa['discovery_v2_selected'], 'YES')
+        self.assertEqual(alfa['discovery_v2_batch'], 'PILOT20')
+        self.assertEqual(alfa['new_discovery_email'], 'NO')
+        self.assertEqual(stats['NEW_DISCOVERY_EMAILS'], 1)
+        self.assertEqual(sum(stats[key] for key in (
+            'DISCOVERY_SELECTED_WITH_CURRENT_OLD_EMAIL',
+            'DISCOVERY_SELECTED_WITHOUT_CURRENT_OLD_EMAIL',
+            'NOT_SELECTED_WITH_CURRENT_OLD_EMAIL',
+            'NOT_SELECTED_WITHOUT_CURRENT_OLD_EMAIL',
+        )), stats['TOTAL_45XX'])
 
     def test_all_usable_discovery_website_statuses_are_accepted(self):
         for status in ('VERIFIED', 'HIGH', 'MEDIUM'):

@@ -13,6 +13,12 @@ USABLE_DISCOVERY_WEBSITES = {'VERIFIED', 'HIGH', 'MEDIUM'}
 EXPECTED_TOTAL = 839
 EXPECTED_SELECTED = 579
 REVIEW_COLUMNS = ('email_ok','website_ok','phone_ok','default_choice_ok','wrong_entity','audit_note')
+DISCOVERY_EMAIL_PARTITION = (
+    'DISCOVERY_SELECTED_WITH_CURRENT_OLD_EMAIL',
+    'DISCOVERY_SELECTED_WITHOUT_CURRENT_OLD_EMAIL',
+    'NOT_SELECTED_WITH_CURRENT_OLD_EMAIL',
+    'NOT_SELECTED_WITHOUT_CURRENT_OLD_EMAIL',
+)
 BASE_HEADERS = (
     'company_id','company_name','tax_number','registration_number','address','municipality',
     'revenue_2025','employees_2025','sparrow_website','sparrow_website_status',
@@ -222,11 +228,21 @@ def build(source,pilot,batch100,big459,expected_total=EXPECTED_TOTAL,
     stats=statistics(rows)
     if stats['OLD_EMAIL_COMPANIES']+stats['NO_OLD_EMAIL_COMPANIES']!=expected_total:
         raise ValueError('Old-email partition does not equal TOTAL_45XX')
+    if sum(stats[key] for key in DISCOVERY_EMAIL_PARTITION)!=expected_total:
+        raise ValueError('Discovery-selection/current-email partition does not equal TOTAL_45XX')
     return rows,stats,phone_column,[source_path,*[path for path,_ in batches]]
 
 
 def statistics(rows):
     websites=Counter(row['discovery_website_status'] for row in rows if row['discovery_website_status'])
+    selected_with_email=sum(
+        row['discovery_v2_selected']=='YES' and bool(row['sparrow_emails']) for row in rows)
+    selected_without_email=sum(
+        row['discovery_v2_selected']=='YES' and not bool(row['sparrow_emails']) for row in rows)
+    not_selected_with_email=sum(
+        row['discovery_v2_selected']=='NO' and bool(row['sparrow_emails']) for row in rows)
+    not_selected_without_email=sum(
+        row['discovery_v2_selected']=='NO' and not bool(row['sparrow_emails']) for row in rows)
     return {
         'TOTAL_45XX':len(rows),
         'OLD_EMAIL_COMPANIES':sum(bool(row['sparrow_emails']) for row in rows),
@@ -238,6 +254,10 @@ def statistics(rows):
         'DISCOVERY_DEFAULT_PHONES':sum(bool(row['discovery_default_phone']) for row in rows),
         'DISCOVERY_USABLE_WEBSITES':sum(row['discovery_website_status'] in USABLE_DISCOVERY_WEBSITES and bool(row['discovery_website']) for row in rows),
         **{status:websites[status] for status in ('VERIFIED','HIGH','MEDIUM','REVIEW')},
+        'DISCOVERY_SELECTED_WITH_CURRENT_OLD_EMAIL':selected_with_email,
+        'DISCOVERY_SELECTED_WITHOUT_CURRENT_OLD_EMAIL':selected_without_email,
+        'NOT_SELECTED_WITH_CURRENT_OLD_EMAIL':not_selected_with_email,
+        'NOT_SELECTED_WITHOUT_CURRENT_OLD_EMAIL':not_selected_without_email,
     }
 
 
