@@ -182,7 +182,7 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(lineage['source_run_id'], self.source_run)
         self.assertEqual(lineage['replay_mode'], 'OFFLINE_REPLAY')
         self.assertTrue(lineage['network_disabled'])
-        self.assertEqual(lineage['engine_version'], 'discovery-v2-phase-a-3')
+        self.assertEqual(lineage['engine_version'], 'discovery-v2-phase-a-4')
         self.assertTrue(destination.exists())
 
     def test_source_and_destination_must_differ_and_destination_is_new(self):
@@ -219,6 +219,31 @@ class ReplayTests(unittest.TestCase):
         with patch.object(replay_module, 'evaluate_website', side_effect=observed):
             _, result = self.replay_to()
         self.assertGreaterEqual(len(calls), result['companies'])
+
+    def test_replay_primary_selection_prefers_direct_site_over_verified_group_scope(self):
+        group = 'https://group.example/alfa/'
+        direct = 'https://alfa.si/'
+        group_html = '''<title>ALFA group</title><section>Website operated by ALFA d.o.o.
+            Glavna ulica 12, 1000 Ljubljana is a member of group</section>'''
+        source, source_run = self.raw_html_source(
+            {3: [(group, group_html), (direct, HTML)]}, [3])
+        before = source.read_bytes()
+
+        destination = self.root / 'primary-selection-replay.db'
+        result = replay(source, source_run, destination)
+        store = Store(destination)
+        try:
+            selected = store.current_results(result['run_id'])[0]
+            candidates = json.loads(selected['website_assessment_json'])['candidates']
+            group_candidate = next(candidate for candidate in candidates
+                                   if candidate['url'] == group)
+            self.assertEqual(group_candidate['status'], 'VERIFIED')
+            self.assertEqual(group_candidate['assessment']['relationship'],
+                             'SUBSIDIARY_ON_GROUP_DOMAIN')
+            self.assertEqual(selected['official_website'], direct)
+        finally:
+            store.close()
+        self.assertEqual(source.read_bytes(), before)
 
     def test_raw_legacy_html_reconstructs_current_bounded_p1a_evidence(self):
         source, source_run = self.raw_legacy_source()

@@ -141,8 +141,8 @@ class PhaseATests(unittest.TestCase):
         return [dict(r) for r in self.store.conn.execute(f'SELECT * FROM {table}')]
 
     def test_four_queries_keep_legal_name_and_optional_location(self):
-        self.assertEqual([q for _, q in queries(COMPANY)], ['Podjetje ALFA d.o.o. kontakt', 'ALFA d.o.o. kontakt', 'Podjetje ALFA d.o.o. bizi.si'])
-        self.assertEqual(queries(COMPANY, True)[0][1], 'Podjetje ALFA d.o.o. Ljubljana kontakt')
+        self.assertEqual([q for _, q in queries(COMPANY)], ['Podjetje "ALFA d.o.o." kontakt', 'ALFA d.o.o. kontakt', 'Podjetje ALFA d.o.o. bizi.si'])
+        self.assertEqual(queries(COMPANY, True)[0][1], 'Podjetje "ALFA d.o.o." kontakt')
         self.assertEqual(domain_query('https://www.alfa.si/a'), ('DOMAIN_CONTACT', 'alfa.si kontakt'))
 
     def test_serper_maps_organic_results_and_preserves_safe_payload(self):
@@ -194,7 +194,7 @@ class PhaseATests(unittest.TestCase):
         self.execute(search=provider)
 
         self.assertEqual(len(session.calls), 1)
-        self.assertEqual(session.calls[0][1]['json']['q'], 'Podjetje ALFA d.o.o. kontakt')
+        self.assertEqual(session.calls[0][1]['json']['q'], 'Podjetje "ALFA d.o.o." kontakt')
         diagnostics = json.loads(self.rows('discovery_attempts')[0]['diagnostics_json'])
         self.assertEqual([q['status'] for q in diagnostics['queries']],
                          ['COMPLETED', 'SKIPPED', 'SKIPPED', 'SKIPPED'])
@@ -295,7 +295,7 @@ class PhaseATests(unittest.TestCase):
     def test_complete_provenance_defaults_and_first_class_search(self):
         run_id, result, provider, fetchers = self.execute()
         self.assertEqual(result['status'], 'COMPLETED')
-        self.assertEqual(len(provider.calls), 4)
+        self.assertEqual(len(provider.calls), 1)
         self.assertTrue(fetchers[0].closed)
         self.assertFalse(any('bizi.si' in u for u in fetchers[0].calls))
         current = self.store.current_results(run_id)[0]
@@ -305,7 +305,7 @@ class PhaseATests(unittest.TestCase):
         self.assertEqual(contacts[current['default_phone_contact_id']]['normalized_value'], '+38612345678')
         email = contacts[current['default_email_contact_id']]
         refs = json.loads(email['supporting_observation_ids_json'])
-        self.assertGreaterEqual(len(refs), 5)
+        self.assertGreaterEqual(len(refs), 2)
         observations = {o['observation_id']: o for o in self.rows('discovery_observations')}
         evidence = {e['evidence_id']: e for e in self.rows('discovery_evidence')}
         self.assertEqual(evidence[observations[email['primary_observation_id']]['evidence_id']]['source_kind'], 'FETCHED_PAGE')
@@ -337,7 +337,87 @@ class PhaseATests(unittest.TestCase):
     def test_search_not_skipped_when_guess_verifies(self):
         _, result, provider, _ = self.execute(search=FakeSearch([]))
         self.assertEqual(result['status'], 'COMPLETED')
-        self.assertEqual(len(provider.calls), 4)
+        self.assertEqual(len(provider.calls), 3)
+
+    def test_one_search_response_tries_next_candidate_and_prefers_direct_si_site(self):
+        foreign = 'https://alfa-international.eu/'
+        direct = 'https://alfa.si/'
+        search = FakeSearch([
+            {'url': foreign, 'title': 'ALFA international', 'body': 'ALFA d.o.o. contact'},
+            {'url': direct, 'title': 'ALFA d.o.o.', 'body': IDENTITY},
+        ])
+        pages = {
+            foreign: response('<title>ALFA</title><section><h2>ALFA d.o.o.</h2>Contact</section>', foreign),
+            direct: response(HTML, direct),
+        }
+        run_id = self.create(config=Config(max_search_queries_per_company=1))
+        run_id, _, provider, fetchers = self.execute(run_id, search=search, pages=pages)
+
+        self.assertEqual(provider.calls, ['Podjetje "ALFA d.o.o." kontakt'])
+        self.assertIn(foreign, fetchers[0].calls)
+        self.assertIn(direct, fetchers[0].calls)
+        self.assertLess(fetchers[0].calls.index(foreign), fetchers[0].calls.index(direct))
+        self.assertEqual(self.store.current_results(run_id)[0]['official_website'], direct)
+        self.assertFalse(any(row['source_kind'] == 'GENERATED_CANDIDATE'
+                             for row in self.rows('discovery_evidence')))
+
+    def test_direct_company_site_beats_directory_and_verified_group_scope(self):
+        directory = 'https://directory.invalid/alfa'
+        group = 'https://group.example/alfa/'
+        direct = 'https://alfa.si/'
+        search = FakeSearch([
+            {'url': directory, 'title': 'Company directory: ALFA d.o.o.', 'body': IDENTITY},
+            {'url': group, 'title': 'ALFA group company', 'body': IDENTITY},
+            {'url': direct, 'title': 'ALFA d.o.o.', 'body': IDENTITY},
+        ])
+        group_html = '''<title>ALFA group</title><section>Website operated by ALFA d.o.o.
+            Glavna ulica 12, 1000 Ljubljana is a member of group</section>'''
+        pages = {group: response(group_html, group), direct: response(HTML, direct)}
+        run_id = self.create(config=Config(max_search_queries_per_company=1))
+        run_id, _, _, fetchers = self.execute(run_id, search=search, pages=pages)
+
+        self.assertFalse(any(url == directory for url in fetchers[0].calls))
+        self.assertIn(group, fetchers[0].calls)
+        self.assertIn(direct, fetchers[0].calls)
+        diagnostics = json.loads(self.rows('discovery_attempts')[0]['diagnostics_json'])
+        group_candidate = next(candidate for candidate in diagnostics['website_candidates']
+                               if candidate['url'] == group)
+        self.assertEqual(group_candidate['status'], 'VERIFIED')
+        self.assertEqual(group_candidate['assessment']['relationship'],
+                         'SUBSIDIARY_ON_GROUP_DOMAIN')
+        self.assertEqual(self.store.current_results(run_id)[0]['official_website'], direct)
+
+    def test_strong_verified_com_beats_weak_si_candidate(self):
+        weak = 'https://unrelated.si/'
+        strong = 'https://alfa-company.com/'
+        search = FakeSearch([
+            {'url': weak, 'title': 'ALFA', 'body': 'ALFA d.o.o. contact'},
+            {'url': strong, 'title': 'ALFA d.o.o.', 'body': IDENTITY},
+        ])
+        pages = {
+            weak: response('<title>ALFA</title><section><h2>ALFA d.o.o.</h2>Contact</section>', weak),
+            strong: response(HTML, strong),
+        }
+        run_id = self.create(config=Config(max_search_queries_per_company=1))
+        run_id, _, _, _ = self.execute(run_id, search=search, pages=pages)
+
+        self.assertEqual(self.store.current_results(run_id)[0]['official_website'], strong)
+
+    def test_failed_search_uses_generated_domains_only_as_fallback(self):
+        guessed = 'https://alfa.si/'
+        run_id = self.create(config=Config(max_search_queries_per_company=1))
+        run_id, _, provider, fetchers = self.execute(
+            run_id, search=FakeSearch(error=TimeoutError('offline')),
+            pages={guessed: response(HTML)})
+
+        self.assertEqual(provider.calls, ['Podjetje "ALFA d.o.o." kontakt'])
+        self.assertEqual(fetchers[0].calls[0], guessed)
+        self.assertEqual(self.store.current_results(run_id)[0]['official_website'],
+                         'https://alfa.si/')
+        diagnostics = json.loads(self.rows('discovery_attempts')[0]['diagnostics_json'])
+        self.assertEqual(diagnostics['queries'][0]['status'], 'FAILED')
+        self.assertTrue(any(row['source_kind'] == 'GENERATED_CANDIDATE'
+                            for row in self.rows('discovery_evidence')))
 
     def test_empty_search_has_diagnostics_and_domain_skip(self):
         self.execute(search=FakeSearch([]), pages={})
@@ -349,7 +429,7 @@ class PhaseATests(unittest.TestCase):
         first, _, _, _ = self.execute()
         second, _, provider, fetchers = self.execute()
         self.assertNotEqual(first, second)
-        self.assertEqual(len(provider.calls), 4)
+        self.assertEqual(len(provider.calls), 1)
         self.assertGreater(fetchers[0].requests, 0)
         self.assertEqual(len(self.rows('discovery_company_results')), 2)
         self.assertFalse(any('stale.si' in encode(o) for o in self.rows('discovery_observations')))

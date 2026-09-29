@@ -6,7 +6,7 @@ from pathlib import Path
 from discovery.domain_generator import normalize_domain, normalize_url
 from discovery.ownership import in_scope
 from discovery_v2 import ENGINE_VERSION, RULE_VERSION
-from discovery_v2.candidates import brand_match, eligible, rank
+from discovery_v2.candidates import brand_match, eligible, primary_rank, rank
 from discovery_v2.contacts import resolve_contacts, select_default
 from discovery_v2.evidence import EvidenceWriter
 from discovery_v2.interfaces import evaluate_website
@@ -133,23 +133,15 @@ def replay_company(store, run_id, company, source_conn, source_path, source_run_
                                      source_attempt)
     fetcher = RecordedOnlyFetcher(writer, pages)
     def path_priority(observation):
-        path = normalize_url(observation['normalized_value']).split('?', 1)[0].rstrip('/').lower()
-        specific = any('/' + marker in path for marker in
-                       ('kontakt', 'contact', 'o-nas', 'about', 'legal', 'impress', 'podjetj'))
-        return (0 if specific else 1, rank(company, observation))
+        source = writer.evidence_rows.get(observation['evidence_id'], {})
+        result_rank = source.get('result_rank')
+        return (observation['extraction_method'] == 'domain_guess',
+                not observation.get('value', {}).get('identity_match', False),
+                result_rank if isinstance(result_rank, int) and result_rank > 0 else 10_000,
+                rank(company, observation))
 
     candidates = sorted((o for o in writer.observations
                          if o['observation_type'] == 'WEBSITE_CANDIDATE'), key=path_priority)
-    reserved, reserved_hosts = [], set()
-    for observation in candidates:
-        host = normalize_domain(observation['normalized_value'])
-        if (observation['extraction_method'] in ('email_domain', 'domain_guess')
-                and brand_match(company, observation['normalized_value'])
-                and host not in reserved_hosts):
-            reserved.append(observation); reserved_hosts.add(host)
-            if len(reserved) == min(2, config.max_candidates):
-                break
-    candidates = reserved + [o for o in candidates if o not in reserved]
     diagnostics = {'mode': 'OFFLINE_REPLAY', 'network_disabled': True,
                    'source_attempt_id': source_attempt, 'source_evidence_map': source_map,
                    'website_candidates': [], 'missing_urls': []}
@@ -190,12 +182,15 @@ def replay_company(store, run_id, company, source_conn, source_path, source_run_
             'observation_id': observation['observation_id'], 'status': assessment['status'],
             'assessment': assessment})
         if usable(assessment):
-            priority = {'VERIFIED': 0, 'HIGH': 1, 'MEDIUM': 2}
-            if selected is None or priority[assessment['status']] < priority[selected[1]['status']]:
+            candidate_priority = primary_rank(
+                company, observation, assessment,
+                writer.evidence_rows.get(observation['evidence_id']))
+            if (selected is None or candidate_priority < primary_rank(
+                    company, selected[0], selected[1],
+                    writer.evidence_rows.get(selected[0]['evidence_id']))):
                 selected = (observation, assessment, assessment['verified_scope'])
             if assessment['status'] == 'VERIFIED':
                 terminal_hosts.add(host)
-                break
     diagnostics['missing_urls'] = sorted(set(fetcher.missing_urls))
     owner = selected[1]['ownership'] if selected else None
     contacts = resolve_contacts(company, writer.observations, owner, fetcher.responses)

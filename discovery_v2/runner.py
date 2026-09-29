@@ -8,7 +8,7 @@ from discovery.domain_generator import generate_candidates, normalize_url
 from discovery.domain_policy import blocks_official
 from discovery.ownership import in_scope
 from discovery.website_verifier import internal_identity_links
-from discovery_v2.candidates import eligible, rank, brand_match
+from discovery_v2.candidates import brand_match, eligible, primary_rank, rank
 from discovery.domain_generator import normalize_domain
 from discovery_v2.contacts import resolve_contacts, select_default
 from discovery_v2.evidence import EvidenceWriter
@@ -62,25 +62,17 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
     terminal_hosts = set()
 
     def path_priority(observation):
-        path = normalize_url(observation['normalized_value']).split('?', 1)[0].rstrip('/').lower()
-        specific = any('/' + marker in path for marker in
-                       ('kontakt', 'contact', 'o-nas', 'about', 'legal', 'impress', 'podjetj'))
-        return (0 if specific else 1, rank(company, observation))
+        source = writer.evidence_rows.get(observation['evidence_id'], {})
+        result_rank = source.get('result_rank')
+        return (observation['extraction_method'] == 'domain_guess',
+                not observation.get('value', {}).get('identity_match', False),
+                result_rank if isinstance(result_rank, int) and result_rank > 0 else 10_000,
+                rank(company, observation))
 
     def evaluate_candidates(limit):
         nonlocal selected
         ordered = sorted((o for o in writer.observations if o['observation_type'] == 'WEBSITE_CANDIDATE'), key=path_priority)
-        reserved = []
-        hosts = set()
         for observation in ordered:
-            host = normalize_domain(observation['normalized_value'])
-            if (observation['extraction_method'] in ('email_domain', 'domain_guess')
-                    and brand_match(company, observation['normalized_value']) and host not in hosts):
-                reserved.append(observation)
-                hosts.add(host)
-                if len(reserved) == min(2, limit):
-                    break
-        for observation in reserved + [o for o in ordered if o not in reserved]:
             if observation['observation_type'] != 'WEBSITE_CANDIDATE':
                 continue
             url = normalize_url(observation['normalized_value'])
@@ -96,7 +88,7 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
             if observation['extraction_method'] != 'domain_guess' and not brand_match(company, url) and not observation.get('value', {}).get('identity_match'):
                 continue
             used = sum(c['status'] != 'INELIGIBLE' for c in diagnostics['website_candidates'])
-            if (selected and selected[1]['status'] == 'VERIFIED') or used >= limit:
+            if used >= limit:
                 continue
             evaluated.add(url)
             assessment = evaluator(company, url, fetcher)
@@ -110,60 +102,68 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
             scope = assessment.get('verified_scope') or assessment.get('ownership', {}).get('scope')
             if (usable(assessment) and assessment.get('ownership', {}).get('status') == assessment.get('status')
                     and scope and normalize_url(scope) and not blocks_official(scope)):
-                priority = {'VERIFIED': 0, 'HIGH': 1, 'MEDIUM': 2}
-                if selected is None or priority[assessment['status']] < priority[selected[1]['status']]:
+                candidate_priority = primary_rank(
+                    company, observation, assessment,
+                    writer.evidence_rows.get(observation['evidence_id']))
+                if (selected is None or candidate_priority < primary_rank(
+                        company, selected[0], selected[1],
+                        writer.evidence_rows.get(selected[0]['evidence_id']))):
                     selected = (observation, assessment, scope)
             checkpoint()
 
     completed = False
     try:
-        if getattr(provider, 'staged', False):
-            # Serper credits are consumed progressively. A verified first-stage
-            # result is sufficient; unresolved companies retain the later query
-            # types as explicit escalation stages.
-            search(planned[0])
-            for url in generate_candidates(company['company_name']):
-                writer.generated(url)
-            evaluate_candidates(max(1, config.max_candidates - 2))
-            for query in planned[1:]:
-                if (config.max_search_queries_per_company is not None
-                        and counts['search_calls'] >= config.max_search_queries_per_company):
-                    entry = next(q for q in diagnostics['queries'] if q['query_type'] == query[0])
-                    entry.update(status='SKIPPED', reason='Search query budget exhausted')
-                elif selected:
-                    entry = next(q for q in diagnostics['queries'] if q['query_type'] == query[0])
-                    entry.update(status='SKIPPED', reason='Verified official website from earlier search stage')
-                else:
-                    search(query)
-                    evaluate_candidates(max(1, config.max_candidates - 2))
-        else:
-            # Preserve the existing DDGS query schedule and evaluation order.
-            for query in planned:
+        # Search is always the first acquisition stage. Several candidates from
+        # its first response are verified before another query is spent.
+        search_budget = max(1, config.max_candidates - 2)
+        search(planned[0])
+        evaluate_candidates(min(3, search_budget))
+        for query in planned[1:]:
+            entry = next(q for q in diagnostics['queries'] if q['query_type'] == query[0])
+            if (config.max_search_queries_per_company is not None
+                    and counts['search_calls'] >= config.max_search_queries_per_company):
+                entry.update(status='SKIPPED', reason='Search query budget exhausted')
+            elif selected:
+                entry.update(status='SKIPPED', reason='Usable primary website from earlier search stage')
+            else:
                 search(query)
-            for url in generate_candidates(company['company_name']):
-                writer.generated(url)
-            evaluate_candidates(max(1, config.max_candidates - 2))
+                evaluate_candidates(search_budget)
         # A likely domain may still be unverified. Never seed this from a publisher.
         likely = selected[2] if selected else next((c['url'] for c in diagnostics['website_candidates']
                     if c['status'] == 'REVIEW' and brand_match(company, c['url'])
                     and c.get('assessment', {}).get('relationship') != 'THIRD_PARTY'
                     and any(set(p.get('signals', [])) & {'company_name_exact', 'organization_name_exact', 'tax_exact', 'registration_exact'}
                             for p in c.get('assessment', {}).get('evidence', []))), None)
-        staged_budget_exhausted = (getattr(provider, 'staged', False)
-            and config.max_search_queries_per_company is not None
+        staged_budget_exhausted = (
+            config.max_search_queries_per_company is not None
             and counts['search_calls'] >= config.max_search_queries_per_company)
         if staged_budget_exhausted:
             diagnostics['queries'][-1].update(status='SKIPPED', reason='Search query budget exhausted')
-        elif likely and not (getattr(provider, 'staged', False) and selected):
+        elif likely and not selected:
             search(domain_query(likely))
-        elif likely:
-            diagnostics['queries'][-1].update(status='SKIPPED', reason='Verified official website; no additional Serper query required')
+            evaluate_candidates(search_budget)
+        elif selected:
+            diagnostics['queries'][-1].update(status='SKIPPED', reason='Usable primary website; no additional search required')
         else:
             diagnostics['queries'][-1].update(status='SKIPPED', reason='No likely eligible official domain')
-        evaluate_candidates(config.max_candidates)
-        if (selected and diagnostics['queries'][-1]['status'] == 'SKIPPED'
-                and not getattr(provider, 'staged', False)):
-            search(domain_query(selected[2]))
+        # Guesses are hypotheses of last resort after permitted search evidence.
+        if not selected:
+            for url in generate_candidates(company['company_name']):
+                writer.generated(url)
+            evaluate_candidates(config.max_candidates)
+        if not selected and diagnostics['queries'][-1]['status'] == 'SKIPPED':
+            guessed_likely = next((c['url'] for c in diagnostics['website_candidates']
+                if c['status'] == 'REVIEW' and brand_match(company, c['url'])
+                and c.get('assessment', {}).get('relationship') != 'THIRD_PARTY'
+                and any(set(page.get('signals', [])) & {
+                    'company_name_exact', 'organization_name_exact', 'tax_exact',
+                    'registration_exact'}
+                    for page in c.get('assessment', {}).get('evidence', []))), None)
+            budget_available = (config.max_search_queries_per_company is None or
+                                counts['search_calls'] < config.max_search_queries_per_company)
+            if guessed_likely and budget_available:
+                search(domain_query(guessed_likely))
+                evaluate_candidates(config.max_candidates)
         owner = selected[1]['ownership'] if selected else None
         contact_error_start = len(fetcher.errors)
         if selected:

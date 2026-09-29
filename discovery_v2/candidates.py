@@ -28,8 +28,26 @@ def eligible(company, url, title='', body=''):
 def rank(company, observation):
     url = observation['normalized_value']
     value = observation.get('value', {})
-    return (not brand_match(company, url),
-            observation['extraction_method'] == 'domain_guess',
-            not any(w in urlsplit(url).path.lower() for w in ('kontakt', 'contact')),
+    return (observation['extraction_method'] == 'domain_guess',
             not value.get('identity_match', False),
-            {'si': 0, 'com': 1, 'eu': 2}.get(normalize_domain(url).split('.')[-1], 3), len(url))
+            not brand_match(company, url),
+            not any(w in urlsplit(url).path.lower() for w in ('kontakt', 'contact')),
+            not normalize_domain(url).endswith('.si'), len(url))
+
+
+def primary_rank(company, observation, assessment, evidence_row=None):
+    """Prefer the best direct entity site after candidates verify independently."""
+    relationship = assessment.get('relationship') or 'AMBIGUOUS'
+    direct = relationship in ('STANDALONE', 'BRAND_OF_ENTITY')
+    result_rank = (evidence_row or {}).get('result_rank')
+    scope = assessment.get('verified_scope') or observation.get('normalized_value', '')
+    return (
+        not direct,
+        {'VERIFIED': 0, 'HIGH': 1, 'MEDIUM': 2}.get(assessment.get('status'), 3),
+        observation.get('extraction_method') == 'domain_guess',
+        not observation.get('value', {}).get('identity_match', False),
+        result_rank if isinstance(result_rank, int) and result_rank > 0 else 10_000,
+        not brand_match(company, scope),
+        not normalize_domain(scope).endswith('.si'),
+        len(scope),
+    )

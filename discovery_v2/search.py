@@ -39,7 +39,7 @@ def successful(results):
 def queries(company, use_municipality=False):
     name = company['company_name'].strip()
     location = ' ' + company['municipality'].strip() if use_municipality and company.get('municipality') else ''
-    return [(LEGAL_COMPANY_CONTACT, f'Podjetje {name}{location} kontakt'),
+    return [(LEGAL_COMPANY_CONTACT, f'Podjetje "{name}" kontakt'),
             (LEGAL_NAME_CONTACT, f'{name}{location} kontakt'),
             (LEGAL_COMPANY_DATABASE, f'Podjetje {name}{location} bizi.si')]
 

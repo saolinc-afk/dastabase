@@ -98,18 +98,18 @@ Each attempt records these search types:
 
 | Query type | Query |
 | --- | --- |
-| `LEGAL_COMPANY_CONTACT` | `Podjetje <legal company name> kontakt` |
+| `LEGAL_COMPANY_CONTACT` | `Podjetje "<legal company name>" kontakt` |
 | `LEGAL_NAME_CONTACT` | `<legal company name> kontakt` |
 | `LEGAL_COMPANY_DATABASE` | `Podjetje <legal company name> bizi.si` |
 | `DOMAIN_CONTACT` | `<likely official domain> kontakt` |
 
-Serper executes them as escalation stages. It starts with
-`LEGAL_COMPANY_CONTACT`; once that evidence verifies an official website, later
-searches are skipped with explicit reasons. Otherwise it proceeds conservatively
-through the remaining name queries and, when useful, `DOMAIN_CONTACT`. DDGS keeps
-the original schedule of all three name queries before candidate evaluation. The
-domain query runs once a likely eligible domain exists; otherwise its explicit skip
-reason is recorded. `--use-municipality` adds municipality to name queries.
+Every provider starts with `LEGAL_COMPANY_CONTACT`. Several plausible candidates
+from that single response are verified before another query is spent. Once those
+candidates produce a usable primary website, later searches are skipped with an
+explicit reason. Otherwise Discovery proceeds through the remaining name queries
+and, when useful, `DOMAIN_CONTACT`. Generated legal-name domains are added only
+after permitted search candidates fail verification. `--use-municipality` adds
+municipality to name queries.
 Default budgets: six retained results/query, eight website candidates,
 36 HTTP requests and eight contact crawl pages per company. Candidate verification
 uses the existing stateless verifier plus narrowly corroborated v2 brand/subdomain
