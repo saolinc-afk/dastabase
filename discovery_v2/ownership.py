@@ -664,6 +664,9 @@ def _validate_conf06(company, candidate_url, decision, writer, fetcher):
 def validate_assessment(company, candidate_url, assessment, writer, fetcher):
     """Re-derive authorization from recorded evidence, including at persistence."""
     decision = assessment.get('p1a') or {}
+    if decision.get('authorization_basis') == 'SEARCH_EVIDENCE_RESOLVER_V2':
+        from discovery_v2.search_resolver import validate_resolution_assessment
+        return validate_resolution_assessment(company, candidate_url, assessment, writer)
     status = decision.get('status')
     rule = decision.get('rule_id')
     confidence_rule = decision.get('confidence_rule_id')

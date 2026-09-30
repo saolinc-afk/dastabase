@@ -45,13 +45,17 @@ REGISTRY.update(_entries({
     'informiran.si', 'firmas.si', 'moja-dejavnost.si', 'mojastoritev.si',
     'cylex.si', 'cybo.com', 'topograph.co', 'moje-podjetje.net',
     'findglocal.com', 'starofservice.si', 'mapcarta.com', 'mapquest.com', 'mojmojster.net',
-    'yelp.com', 'najdi.si', 'acompio.si',
+    'yelp.com', 'najdi.si', 'acompio.si', 'preveri-podjetje.si',
+    'bilance.si', 'stop-neplacniki.si', 'javnipodatki.si',
+    'odpiralnicasi.com', 'imenik-podjetij.si', 'info-slovenija.si',
+    'prodajinkupi.si',
 }, DIRECTORY, BLOCK_AS_OFFICIAL))
 REGISTRY.update(_entries({
-    'ajpes.si', 'bizi.si', 'companywall.si', 'companywall.com', 'pirs.si', 'gvin.com',
+    'ajpes.si', 'bizi.si', 'companywall.si', 'companywall.eu', 'companywall.com', 'pirs.si', 'gvin.com',
     'dnb.com', 'dnb.si', 'bloomberg.com', 'zoominfo.com', 'crunchbase.com',
     'kompass.com', 'europages.com', 'europages.si', 'ebonitete.si',
     'infobel.com', 'infobel.si', 'optius.com', 'panjiva.com',
+    'information.coface.com', 'e-creditreform.si',
 }, COMPANY_DATABASE, BLOCK_AS_OFFICIAL))
 REGISTRY.update(_entries({
     'mascus.com', 'mascus.co.uk', 'mascus.si', 'mascus.at', 'mascus.com.au',
@@ -66,13 +70,17 @@ REGISTRY.update(_entries({
     'machinerytrader.com', 'doberavto.si', 'onlinecomponents.com',
 }, MARKETPLACE, BLOCK_AS_OFFICIAL))
 REGISTRY.update(_entries({'techpilot.com'}, DEALER_PORTAL, BLOCK_AS_OFFICIAL))
+REGISTRY.update(_entries({'mojedelo.com'}, JOB_PORTAL, BLOCK_AS_OFFICIAL))
+REGISTRY.update(_entries({'primerjam.si', 'servisko.si', 'kupujlokalno.si'},
+                         MARKETPLACE, BLOCK_AS_OFFICIAL))
 REGISTRY.update(_entries({'trivago.com'}, BOOKING_AGGREGATOR, BLOCK_AS_OFFICIAL))
 REGISTRY.update(_entries({'bergfex.com', 'evendo.com'}, TOURISM_PROFILE, BLOCK_AS_OFFICIAL))
 REGISTRY.update(_entries({
     'facebook.com', 'instagram.com', 'linkedin.com', 'twitter.com', 'x.com',
     'tiktok.com', 'youtube.com',
 }, SOCIAL_PLATFORM, BLOCK_AS_OFFICIAL))
-REGISTRY.update(_entries({'svet24.si', '1001ideja.si'}, MEDIA_NEWS, BLOCK_AS_OFFICIAL))
+REGISTRY.update(_entries({'svet24.si', '1001ideja.si', 'mladina.si', 'dk.um.si'},
+                         MEDIA_NEWS, BLOCK_AS_OFFICIAL))
 REGISTRY.update(_entries({
     'google.com', 'google.si', 'wikipedia.org', 'business.site',
     'konzum.hr', 'mojaobcina.si', 'urejam.si', 'avruparuyasi.com.tr',

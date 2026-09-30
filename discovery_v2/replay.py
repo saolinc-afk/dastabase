@@ -13,6 +13,8 @@ from discovery_v2.evidence import EvidenceWriter
 from discovery_v2.interfaces import evaluate_website
 from discovery_v2.models import Config
 from discovery_v2.ownership import validate_assessment, usable
+from discovery_v2.search_resolver import (RESOLVED, assessment_from_resolution,
+                                           resolve_search_evidence)
 from discovery_v2.store import (APPLICATION_ID, SCHEMA_VERSION, Store, encode,
                                 now, readonly, snapshot)
 
@@ -134,9 +136,12 @@ def replay_company(store, run_id, company, source_conn, source_path, source_run_
                                      source_attempt)
     fetcher = RecordedOnlyFetcher(writer, pages)
     candidates = fused_candidates(company, writer.observations, writer.evidence_rows)
+    resolution = resolve_search_evidence(company, writer.observations,
+                                         writer.evidence_rows)
     diagnostics = {'mode': 'OFFLINE_REPLAY', 'network_disabled': True,
                    'source_attempt_id': source_attempt, 'source_evidence_map': source_map,
-                   'website_candidates': [], 'missing_urls': []}
+                   'website_candidates': [], 'missing_urls': [],
+                   'search_evidence_resolution': resolution}
     selected = None
     terminal_hosts = set()
     evaluated_urls = set()
@@ -162,7 +167,13 @@ def replay_company(store, run_id, company, source_conn, source_path, source_run_
             before = len(fetcher.missing_urls)
             assessment = evaluate_website(company, url, fetcher)
             missing = fetcher.missing_urls[before:]
-            if missing:
+            recorded_host = any(normalize_domain(recorded_url) == host
+                                for recorded_url in pages)
+            if (not usable(assessment) and missing and not recorded_host
+                    and resolution['status'] == RESOLVED
+                    and host == resolution['candidate_domain']):
+                assessment = assessment_from_resolution(resolution)
+            elif missing:
                 assessment = _review_after_missing(assessment, missing)
             else:
                 # An unavailable offline hypothesis must not consume the host slot

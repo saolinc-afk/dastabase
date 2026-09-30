@@ -18,6 +18,8 @@ from discovery_v2.ownership import validate_assessment, usable
 from discovery_v2.models import Config, EXECUTION_MODE, JOB_TYPE
 from discovery_v2.search import (DOMAIN_CONTACT, default_provider, domain_query, queries,
                                  successful)
+from discovery_v2.search_resolver import (RESOLVED, assessment_from_resolution,
+                                           resolve_search_evidence)
 from discovery_v2.store import Store, encode, now, read_manifest
 
 
@@ -140,6 +142,28 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
             diagnostics['queries'][-1].update(status='SKIPPED', reason='Usable primary website; no additional search required')
         else:
             diagnostics['queries'][-1].update(status='SKIPPED', reason='No likely eligible official domain')
+        # Resolve only after the permitted search stages have accumulated their
+        # evidence. A provisional one-result resolution must not suppress later
+        # independent or conflicting search evidence.
+        resolution = resolve_search_evidence(company, writer.observations,
+                                             writer.evidence_rows)
+        diagnostics['search_evidence_resolution'] = resolution
+        if not selected and resolution['status'] == RESOLVED:
+            observation = next((o for o in writer.observations
+                if o['observation_id'] == resolution['observation_id']), None)
+            if observation is not None:
+                assessment = assessment_from_resolution(resolution)
+                url = normalize_url(observation['normalized_value'])
+                if not validate_assessment(company, url, assessment, writer, fetcher):
+                    raise ValueError('Invalid search evidence resolution')
+                entry = next((c for c in diagnostics['website_candidates']
+                              if c.get('observation_id') == observation['observation_id']), None)
+                if entry is None:
+                    entry = {'url': url, 'observation_id': observation['observation_id']}
+                    diagnostics['website_candidates'].append(entry)
+                entry.update(status='HIGH', assessment=assessment,
+                             search_evidence_resolution=resolution)
+                selected = (observation, assessment, assessment['verified_scope'])
         # Guesses are hypotheses of last resort after permitted search evidence.
         if not selected:
             for url in generate_candidates(company['company_name']):
