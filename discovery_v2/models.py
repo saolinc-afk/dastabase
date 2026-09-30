@@ -8,7 +8,7 @@ EXECUTION_MODE = "FRESH_DISCOVERY"
 
 @dataclass(frozen=True)
 class Config:
-    results_per_query: int = 6
+    results_per_query: int = 10
     max_candidates: int = 8
     max_http_requests: int = 36
     max_contact_pages: int = 8

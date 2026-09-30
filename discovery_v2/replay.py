@@ -6,7 +6,8 @@ from pathlib import Path
 from discovery.domain_generator import normalize_domain, normalize_url
 from discovery.ownership import in_scope
 from discovery_v2 import ENGINE_VERSION, RULE_VERSION
-from discovery_v2.candidates import brand_match, eligible, primary_rank, rank
+from discovery_v2.candidates import (brand_match, eligible, fused_candidates,
+                                     primary_rank)
 from discovery_v2.contacts import resolve_contacts, select_default
 from discovery_v2.evidence import EvidenceWriter
 from discovery_v2.interfaces import evaluate_website
@@ -132,17 +133,7 @@ def replay_company(store, run_id, company, source_conn, source_path, source_run_
     pages, source_map = _reconstruct(writer, source_conn, source_path, source_run_id,
                                      source_attempt)
     fetcher = RecordedOnlyFetcher(writer, pages)
-    def path_priority(observation):
-        source = writer.evidence_rows.get(observation['evidence_id'], {})
-        result_rank = source.get('result_rank')
-        return (observation['extraction_method'] == 'domain_guess',
-                not observation.get('value', {}).get('identity_match', False),
-                observation['extraction_method'] not in ('snippet_url', 'email_domain'),
-                result_rank if isinstance(result_rank, int) and result_rank > 0 else 10_000,
-                rank(company, observation))
-
-    candidates = sorted((o for o in writer.observations
-                         if o['observation_type'] == 'WEBSITE_CANDIDATE'), key=path_priority)
+    candidates = fused_candidates(company, writer.observations, writer.evidence_rows)
     diagnostics = {'mode': 'OFFLINE_REPLAY', 'network_disabled': True,
                    'source_attempt_id': source_attempt, 'source_evidence_map': source_map,
                    'website_candidates': [], 'missing_urls': []}
@@ -150,48 +141,50 @@ def replay_company(store, run_id, company, source_conn, source_path, source_run_
     terminal_hosts = set()
     evaluated_urls = set()
     evaluated_count = 0
-    for observation in candidates:
-        url = normalize_url(observation['normalized_value'])
-        host = normalize_domain(url)
-        if not url or url in evaluated_urls or host in terminal_hosts:
-            continue
-        evaluated_urls.add(url)
-        if not eligible(company, url, observation.get('value', {}).get('title', ''),
-                        observation.get('value', {}).get('body', '')):
+    for bundle in candidates:
+        for observation in bundle['observations']:
+            url = normalize_url(observation['normalized_value'])
+            host = normalize_domain(url)
+            if not url or url in evaluated_urls or host in terminal_hosts:
+                continue
+            evaluated_urls.add(url)
+            if not eligible(company, url, observation.get('value', {}).get('title', ''),
+                            observation.get('value', {}).get('body', '')):
+                diagnostics['website_candidates'].append({'url': url,
+                    'observation_id': observation['observation_id'], 'status': 'INELIGIBLE'})
+                continue
+            if (observation['extraction_method'] != 'domain_guess'
+                    and not brand_match(company, url)
+                    and not observation.get('value', {}).get('identity_match')):
+                continue
+            if evaluated_count >= config.max_candidates:
+                continue
+            before = len(fetcher.missing_urls)
+            assessment = evaluate_website(company, url, fetcher)
+            missing = fetcher.missing_urls[before:]
+            if missing:
+                assessment = _review_after_missing(assessment, missing)
+            else:
+                # An unavailable offline hypothesis must not consume the host slot
+                # or budget before a recorded path candidate on that host is seen.
+                evaluated_count += 1
+            if usable(assessment) and not validate_assessment(
+                    company, url, assessment, writer, fetcher):
+                raise ValueError('Invalid P1A ownership authorization during replay')
             diagnostics['website_candidates'].append({'url': url,
-                'observation_id': observation['observation_id'], 'status': 'INELIGIBLE'})
-            continue
-        if (observation['extraction_method'] != 'domain_guess'
-                and not brand_match(company, url)
-                and not observation.get('value', {}).get('identity_match')):
-            continue
-        if evaluated_count >= config.max_candidates:
-            continue
-        before = len(fetcher.missing_urls)
-        assessment = evaluate_website(company, url, fetcher)
-        missing = fetcher.missing_urls[before:]
-        if missing:
-            assessment = _review_after_missing(assessment, missing)
-        else:
-            # An unavailable offline hypothesis must not consume the host slot
-            # or budget before a recorded path candidate on that host is seen.
-            evaluated_count += 1
-        if usable(assessment) and not validate_assessment(
-                company, url, assessment, writer, fetcher):
-            raise ValueError('Invalid P1A ownership authorization during replay')
-        diagnostics['website_candidates'].append({'url': url,
-            'observation_id': observation['observation_id'], 'status': assessment['status'],
-            'assessment': assessment})
-        if usable(assessment):
-            candidate_priority = primary_rank(
-                company, observation, assessment,
-                writer.evidence_rows.get(observation['evidence_id']))
-            if (selected is None or candidate_priority < primary_rank(
-                    company, selected[0], selected[1],
-                    writer.evidence_rows.get(selected[0]['evidence_id']))):
-                selected = (observation, assessment, assessment['verified_scope'])
-            if assessment['status'] == 'VERIFIED':
-                terminal_hosts.add(host)
+                'observation_id': observation['observation_id'],
+                'domain_evidence': bundle['evidence'], 'status': assessment['status'],
+                'assessment': assessment})
+            if usable(assessment):
+                candidate_priority = primary_rank(
+                    company, observation, assessment,
+                    writer.evidence_rows.get(observation['evidence_id']))
+                if (selected is None or candidate_priority < primary_rank(
+                        company, selected[0], selected[1],
+                        writer.evidence_rows.get(selected[0]['evidence_id']))):
+                    selected = (observation, assessment, assessment['verified_scope'])
+                if assessment['status'] == 'VERIFIED':
+                    terminal_hosts.add(host)
     diagnostics['missing_urls'] = sorted(set(fetcher.missing_urls))
     owner = selected[1]['ownership'] if selected else None
     contacts = resolve_contacts(company, writer.observations, owner, fetcher.responses)

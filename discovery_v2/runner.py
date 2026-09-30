@@ -8,7 +8,8 @@ from discovery.domain_generator import generate_candidates, normalize_url
 from discovery.domain_policy import blocks_official
 from discovery.ownership import in_scope
 from discovery.website_verifier import internal_identity_links
-from discovery_v2.candidates import brand_match, eligible, primary_rank, rank
+from discovery_v2.candidates import (brand_match, eligible, fused_candidates,
+                                     primary_rank)
 from discovery.domain_generator import normalize_domain
 from discovery_v2.contacts import resolve_contacts, select_default
 from discovery_v2.evidence import EvidenceWriter
@@ -61,56 +62,48 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
     evaluated = set()
     terminal_hosts = set()
 
-    def path_priority(observation):
-        source = writer.evidence_rows.get(observation['evidence_id'], {})
-        result_rank = source.get('result_rank')
-        return (observation['extraction_method'] == 'domain_guess',
-                not observation.get('value', {}).get('identity_match', False),
-                observation['extraction_method'] not in ('snippet_url', 'email_domain'),
-                result_rank if isinstance(result_rank, int) and result_rank > 0 else 10_000,
-                rank(company, observation))
-
     def evaluate_candidates(limit):
         nonlocal selected
-        ordered = sorted((o for o in writer.observations if o['observation_type'] == 'WEBSITE_CANDIDATE'), key=path_priority)
-        for observation in ordered:
-            if observation['observation_type'] != 'WEBSITE_CANDIDATE':
-                continue
-            url = normalize_url(observation['normalized_value'])
-            if not url or url in evaluated:
-                continue
-            if not eligible(company, url, observation.get('value', {}).get('title', ''), observation.get('value', {}).get('body', '')):
+        bundles = fused_candidates(company, writer.observations, writer.evidence_rows)
+        for bundle in bundles:
+            for observation in bundle['observations']:
+                url = normalize_url(observation['normalized_value'])
+                if not url or url in evaluated:
+                    continue
+                if not eligible(company, url, observation.get('value', {}).get('title', ''), observation.get('value', {}).get('body', '')):
+                    evaluated.add(url)
+                    diagnostics['website_candidates'].append({'url': url, 'observation_id': observation['observation_id'],
+                        'status': 'INELIGIBLE', 'reason': 'Third-party/disallowed official website'})
+                    continue
+                if normalize_domain(url) in terminal_hosts:
+                    continue
+                if observation['extraction_method'] != 'domain_guess' and not brand_match(company, url) and not observation.get('value', {}).get('identity_match'):
+                    continue
+                used = sum(c['status'] != 'INELIGIBLE' for c in diagnostics['website_candidates'])
+                if used >= limit:
+                    continue
                 evaluated.add(url)
-                diagnostics['website_candidates'].append({'url': url, 'observation_id': observation['observation_id'],
-                    'status': 'INELIGIBLE', 'reason': 'Third-party/disallowed official website'})
-                continue
-            if normalize_domain(url) in terminal_hosts:
-                continue
-            if observation['extraction_method'] != 'domain_guess' and not brand_match(company, url) and not observation.get('value', {}).get('identity_match'):
-                continue
-            used = sum(c['status'] != 'INELIGIBLE' for c in diagnostics['website_candidates'])
-            if used >= limit:
-                continue
-            evaluated.add(url)
-            assessment = evaluator(company, url, fetcher)
-            if usable(assessment) and not validate_assessment(company, url, assessment, writer, fetcher):
-                raise ValueError('Invalid P1A ownership authorization')
-            entry = {'url': url, 'observation_id': observation['observation_id'], 'status': assessment['status'], 'assessment': assessment}
-            diagnostics['website_candidates'].append(entry)
-            if assessment['status'] == 'VERIFIED':
-                terminal_hosts.add(normalize_domain(url))
-            # Defence in depth: an adapter's Boolean cannot authorize a publisher URL.
-            scope = assessment.get('verified_scope') or assessment.get('ownership', {}).get('scope')
-            if (usable(assessment) and assessment.get('ownership', {}).get('status') == assessment.get('status')
-                    and scope and normalize_url(scope) and not blocks_official(scope)):
-                candidate_priority = primary_rank(
-                    company, observation, assessment,
-                    writer.evidence_rows.get(observation['evidence_id']))
-                if (selected is None or candidate_priority < primary_rank(
-                        company, selected[0], selected[1],
-                        writer.evidence_rows.get(selected[0]['evidence_id']))):
-                    selected = (observation, assessment, scope)
-            checkpoint()
+                assessment = evaluator(company, url, fetcher)
+                if usable(assessment) and not validate_assessment(company, url, assessment, writer, fetcher):
+                    raise ValueError('Invalid P1A ownership authorization')
+                entry = {'url': url, 'observation_id': observation['observation_id'],
+                         'domain_evidence': bundle['evidence'],
+                         'status': assessment['status'], 'assessment': assessment}
+                diagnostics['website_candidates'].append(entry)
+                if assessment['status'] == 'VERIFIED':
+                    terminal_hosts.add(normalize_domain(url))
+                # Defence in depth: an adapter's Boolean cannot authorize a publisher URL.
+                scope = assessment.get('verified_scope') or assessment.get('ownership', {}).get('scope')
+                if (usable(assessment) and assessment.get('ownership', {}).get('status') == assessment.get('status')
+                        and scope and normalize_url(scope) and not blocks_official(scope)):
+                    candidate_priority = primary_rank(
+                        company, observation, assessment,
+                        writer.evidence_rows.get(observation['evidence_id']))
+                    if (selected is None or candidate_priority < primary_rank(
+                            company, selected[0], selected[1],
+                            writer.evidence_rows.get(selected[0]['evidence_id']))):
+                        selected = (observation, assessment, scope)
+                checkpoint()
 
     completed = False
     try:

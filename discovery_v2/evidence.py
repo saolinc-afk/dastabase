@@ -21,9 +21,14 @@ OBFUSCATED_EMAIL_RE = re.compile(
 CONTACT_NUMBER_LABEL_RE = re.compile(
     r'\b(telefaks|telefax|facsimile|faks|fax|telefon|tel|phone|mobil(?:ni)?)\b', re.I)
 PUBLIC_EMAIL_DOMAINS = frozenset({
-    'gmail.com', 'hotmail.com', 'outlook.com', 'live.com', 'yahoo.com',
+    'gmail.com', 'googlemail.com', 'hotmail.com', 'outlook.com', 'live.com', 'yahoo.com',
     'icloud.com', 'me.com', 'siol.net', 't-2.net', 'amis.net', 'aol.com',
 })
+
+
+def public_email_domain(domain):
+    domain = (domain or '').lower().strip('.')
+    return domain in PUBLIC_EMAIL_DOMAINS or domain.startswith('yahoo.')
 
 
 def phone_value(raw):
@@ -163,12 +168,12 @@ class EvidenceWriter:
                              locator='result_url' if direct else 'title/snippet',
                              title=title, body=body,
                              identity_match=entity_specific(self.company, text),
-                             candidate_origin='DIRECT_SEARCH_RESULT' if direct else 'SNIPPET_URL',
+                             candidate_origin='DIRECT_SEARCH_DOMAIN' if direct else 'SNIPPET_URL',
                              source_result_url=url, source_result_rank=rank)
         for email in sorted(extract_emails(text)):
             email_domain = email.rsplit('@', 1)[1].lower()
             if (entity_specific(self.company, text)
-                    and email_domain not in PUBLIC_EMAIL_DOMAINS
+                    and not public_email_domain(email_domain)
                     and not blocks_official('https://' + email_domain + '/')):
                 self.observe(evidence_id, 'WEBSITE_CANDIDATE', email,
                              'https://' + email_domain + '/', method='email_domain',
