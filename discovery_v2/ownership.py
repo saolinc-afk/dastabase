@@ -556,11 +556,10 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
                     rows[item[0][0]].get('final_url', ''), item[0][1]))
                 eid, block_id = page_key
                 local = safe_blocks[page_key]
-                local_support = _exact(local, 'ADDRESS', 'TAX_NUMBER', 'REGISTRATION_NUMBER')
-                if local_support or onsite_email or search_support['third_party']:
-                    evidence = [alias] + local_support + search_support['witnesses']
-                    if email_support:
-                        evidence.append(email_support)
+                if search_support['third_party']:
+                    # Cite only the stable, mandatory CONF-06 predicate. Later
+                    # contact observations are useful but are not decisive.
+                    evidence = [alias] + search_support['witnesses']
                     url = rows[eid]['final_url']
                     confidence = dict(
                         confidence_rule_id='CONF-06_SUPPORTED_EXPANDED_LEGAL_NAME',
@@ -618,6 +617,50 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
             'source_publishers': sources}
 
 
+def _validate_conf06(company, candidate_url, decision, writer, fetcher):
+    """Revalidate recorded CONF-06 witnesses plus all-evidence contradictions."""
+    from types import SimpleNamespace
+
+    evidence_ids = set(decision.get('supporting_evidence_ids') or ())
+    observation_ids = set(decision.get('supporting_observation_ids') or ())
+    if (not evidence_ids or not observation_ids
+            or not evidence_ids <= set(writer.evidence_rows)):
+        return False
+    observations_by_id = {o.get('observation_id'): o for o in writer.observations}
+    if not observation_ids <= set(observations_by_id):
+        return False
+
+    # The original immutable witnesses must still independently derive the
+    # recorded CONF-06 decision. New positive observations cannot alter it.
+    witness_rows = {eid: writer.evidence_rows[eid] for eid in evidence_ids}
+    witness_observations = [observations_by_id[oid] for oid in observation_ids]
+    witness_writer = SimpleNamespace(evidence_rows=witness_rows,
+                                     observations=witness_observations)
+    witness_fetcher = SimpleNamespace(
+        responses={row.get('final_url'): True for row in witness_rows.values()
+                   if row.get('source_kind') == 'FETCHED_PAGE' and row.get('final_url')},
+        failures={})
+    original = evaluate(company, candidate_url, witness_writer, witness_fetcher)
+    keys = ('status', 'confidence_rule_id', 'confidence_reasons',
+            'verification_scope', 'relationship', 'supporting_evidence_ids',
+            'supporting_observation_ids', 'context')
+    if (original.get('confidence_rule_id') != 'CONF-06_SUPPORTED_EXPANDED_LEGAL_NAME'
+            or any(decision.get(key) != original.get(key) for key in keys)):
+        return False
+
+    # Evaluate every current observation as a contradiction gate. A stronger
+    # valid rule may win, but conflicts, unsafe publishers, or relationship
+    # changes still revoke the original authorization.
+    current = evaluate(company, candidate_url, writer, fetcher)
+    return bool(current.get('status') in ('HIGH', 'VERIFIED')
+                and current.get('usable')
+                and not current.get('blockers')
+                and not current.get('conflicts')
+                and current.get('relationship') == 'STANDALONE'
+                and normalize_domain(current.get('verification_scope') or '') ==
+                    normalize_domain(decision.get('verification_scope') or ''))
+
+
 def validate_assessment(company, candidate_url, assessment, writer, fetcher):
     """Re-derive authorization from recorded evidence, including at persistence."""
     decision = assessment.get('p1a') or {}
@@ -644,6 +687,8 @@ def validate_assessment(company, candidate_url, assessment, writer, fetcher):
             owner.get('relationship') != decision.get('relationship') or
             assessment.get('relationship') != decision.get('relationship')):
         return False
+    if confidence_rule == 'CONF-06_SUPPORTED_EXPANDED_LEGAL_NAME':
+        return _validate_conf06(company, candidate_url, decision, writer, fetcher)
     actual = evaluate(company, candidate_url, writer, fetcher)
     return actual.get('status') == status and all(decision.get(key) == actual.get(key) for key in (
         'status', 'rule_id', 'authorization_basis', 'confidence_rule_id', 'confidence_reasons',

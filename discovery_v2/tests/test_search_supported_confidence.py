@@ -5,10 +5,12 @@ import sqlite3
 from discovery.ownership import page_type
 from discovery_v2.candidates import eligible, fused_candidates
 from discovery_v2.models import Config
+from discovery_v2.interfaces import evaluate_website
+from discovery_v2.ownership import evaluate, validate_assessment
 from discovery_v2.runner import run
 from discovery_v2.tests import test_phase_a as phase_a
 from discovery_v2.tests.test_phase_a import response
-from discovery_v2.tests.test_phase_b_p1a_ownership import OwnershipHarness
+from discovery_v2.tests.test_phase_b_p1a_ownership import OwnershipHarness, RecordedFetcher
 
 
 ISKRA = dict(id=132, company_name='ISKRA AMS d.o.o.', tax_number='12345678',
@@ -98,6 +100,15 @@ class ExpandedLegalNameTests(unittest.TestCase):
                GPK_URL)
         return h
 
+    def assessment(self, h):
+        decision = h.decide(GPK_URL)
+        return {'verified': False, 'status': decision['status'],
+                'verified_scope': decision['verification_scope'],
+                'relationship': decision['relationship'], 'p1a': decision,
+                'ownership': {'status': decision['status'],
+                              'scope': decision['verification_scope'],
+                              'relationship': decision['relationship']}}
+
     def test_supported_expanded_name_is_alias_and_authorizes_high(self):
         h = self.supported_gpk()
         aliases = [o for o in h.writer.observations if o['observation_type'] == 'ALIAS']
@@ -108,6 +119,64 @@ class ExpandedLegalNameTests(unittest.TestCase):
         self.assertFalse(decision['verified'])
         self.assertEqual(decision['confidence_rule_id'],
                          'CONF-06_SUPPORTED_EXPANDED_LEGAL_NAME')
+
+    def test_conf06_revalidates_after_stronger_contact_evidence(self):
+        h = self.supported_gpk()
+        assessment = self.assessment(h)
+        fetcher = RecordedFetcher(h.responses, h.failures)
+        self.assertTrue(validate_assessment(GPK, GPK_URL, assessment, h.writer, fetcher))
+        h.page('<title>Kontakt</title><main><h2>GPK d.o.o.</h2>'
+               '<p>Kontakt <a href="mailto:info@gpk-gradbenistvo.si">'
+               'info@gpk-gradbenistvo.si</a></p></main>', GPK_URL + 'kontakt/')
+        current = evaluate(GPK, GPK_URL, h.writer, fetcher)
+        self.assertEqual(current['status'], 'HIGH')
+        self.assertNotEqual(current['confidence_rule_id'],
+                            'CONF-06_SUPPORTED_EXPANDED_LEGAL_NAME')
+        self.assertTrue(validate_assessment(GPK, GPK_URL, assessment, h.writer, fetcher))
+
+    def test_conf06_revalidates_after_duplicate_redirect_evidence(self):
+        h = self.supported_gpk()
+        assessment = self.assessment(h)
+        redirected = response('<title>GPK, gradbeništvo d.o.o.</title>'
+                              '<h1>GPK, gradbeništvo d.o.o.</h1>',
+                              'https://www.gpk-gradbenistvo.si/')
+        h.writer.page('http://gpk-gradbenistvo.si/', redirected)
+        h.responses[redirected.url] = redirected
+        self.assertTrue(validate_assessment(
+            GPK, GPK_URL, assessment, h.writer,
+            RecordedFetcher(h.responses, h.failures)))
+
+    def test_conf06_new_contradictions_fail_revalidation(self):
+        cases = (
+            '<section>GPK d.o.o.; VAT: 87654321</section>',
+            '<section>Website operated by BETA SISTEMI d.o.o.</section>',
+            '<section>GPK d.o.o.; member of group; subsidiary of BETA HOLDING d.o.o.</section>',
+        )
+        for html in cases:
+            with self.subTest(html=html):
+                h = self.supported_gpk()
+                assessment = self.assessment(h)
+                h.page(html, GPK_URL + 'kontakt/')
+                self.assertFalse(validate_assessment(
+                    GPK, GPK_URL, assessment, h.writer,
+                    RecordedFetcher(h.responses, h.failures)))
+
+    def test_non_conf06_validation_remains_strict(self):
+        company = {**GPK, 'company_name': 'GPK GRADNJE d.o.o.'}
+        h = OwnershipHarness(company)
+        url = GPK_URL + 'kontakt/'
+        h.page('<section>GPK GRADNJE d.o.o.; Britof 108A, 4000 Kranj</section>', url)
+        decision = h.decide(url)
+        assessment = {'verified': decision['verified'], 'status': decision['status'],
+            'verified_scope': decision['verification_scope'],
+            'relationship': decision['relationship'], 'p1a': decision,
+            'ownership': {'status': decision['status'], 'scope': decision['verification_scope'],
+                          'relationship': decision['relationship']}}
+        self.assertTrue(validate_assessment(company, url, assessment, h.writer,
+                                            RecordedFetcher(h.responses, h.failures)))
+        assessment['p1a'] = {**decision, 'supporting_observation_ids': []}
+        self.assertFalse(validate_assessment(company, url, assessment, h.writer,
+                                             RecordedFetcher(h.responses, h.failures)))
 
     def test_expanded_alias_alone_or_with_wrong_identifier_stays_review(self):
         for conflict in (False, True):
@@ -238,6 +307,45 @@ class RealRunnerPipelineTests(unittest.TestCase):
         self.assertEqual(outcome['failed'], 0)
         self.assertEqual(result['website_status'], 'HIGH')
         self.assertEqual(result['official_website'], GPK_URL)
+
+    def test_runner_persists_conf06_after_contact_crawl_strengthens_evidence(self):
+        self.set_company(GPK)
+        results = [
+            {'url': GPK_URL, 'title': 'GPK, gradbeništvo d.o.o.',
+             'body': 'GPK d.o.o. - gradbeništvo'},
+            {'url': 'https://bizi.si/gpk', 'title': 'GPK d.o.o.',
+             'body': 'GPK d.o.o., Britof 108A, 4000 Kranj; '
+                     'https://gpk-gradbenistvo.si/; info@gpk-gradbenistvo.si'},
+        ]
+        root = ('<html><title>GPK, gradbeništvo d.o.o.</title>'
+                '<main><h1>GPK, gradbeništvo d.o.o.</h1></main></html>')
+        contact_url = GPK_URL + 'kontakt/'
+        contact = ('<title>Kontakt</title><main><h2>GPK d.o.o.</h2>'
+                   '<p><a href="mailto:info@gpk-gradbenistvo.si">'
+                   'info@gpk-gradbenistvo.si</a></p></main>')
+        fetchers = []
+        def factory(_config):
+            fetcher = phase_a.FakeFetcher({
+                GPK_URL: response(root, GPK_URL),
+                contact_url: response(contact, contact_url),
+            })
+            fetchers.append(fetcher)
+            return fetcher
+        def evaluator(company, url, fetcher):
+            assessment = evaluate_website(company, url, fetcher)
+            self.assertEqual(assessment['p1a']['confidence_rule_id'],
+                             'CONF-06_SUPPORTED_EXPANDED_LEGAL_NAME')
+            assessment['contact_page'] = contact_url
+            return assessment
+
+        run_id = self.create(config=Config(max_search_queries_per_company=1))
+        outcome = run(self.store, run_id, provider=phase_a.FakeSearch(results),
+                      fetcher_factory=factory, evaluator=evaluator)
+        self.assertEqual(outcome['failed'], 0)
+        stored = self.store.current_results(run_id)[0]
+        self.assertEqual(stored['website_status'], 'HIGH')
+        self.assertEqual(stored['official_website'], GPK_URL)
+        self.assertIn(contact_url, fetchers[0].calls)
 
 
 if __name__ == '__main__':
