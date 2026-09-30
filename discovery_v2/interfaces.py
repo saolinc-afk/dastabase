@@ -83,6 +83,7 @@ class RecordingFetcher:
         elif len(self.errors) > before:
             # Keep diagnostics when a later contact crawl sees the cached failure.
             self.failures[url] = list(self.errors[before:])
+            self.writer.fetch_failure(url, self.failures[url])
         return response
 
     def close(self):

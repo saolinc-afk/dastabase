@@ -4,7 +4,7 @@ import re
 from urllib.parse import unquote, urlsplit
 
 from bs4 import BeautifulSoup
-from discovery.domain_generator import normalize_url
+from discovery.domain_generator import normalize_domain, normalize_url
 from discovery.domain_policy import blocks_official
 from discovery.email_discovery import extract_emails, mailto_emails
 from discovery_v2.context import contact_context, visible_soup, entity_specific
@@ -82,6 +82,7 @@ class EvidenceWriter:
         self.observations = []
         self.evidence_rows = {}
         self.pages = {}
+        self.failures = {}
 
     def evidence(self, kind, source_class, **fields):
         payload = fields.pop('payload', {})
@@ -198,6 +199,16 @@ class EvidenceWriter:
                                     payload={'strategy': 'legal_name_domain_guess', 'company_name': self.company['company_name']})
         return self.observe(evidence_id, 'WEBSITE_CANDIDATE', url, method='domain_guess', locator='requested_url')
 
+    def fetch_failure(self, url, errors):
+        """Persist a failed acquisition so authorization can be revalidated."""
+        key = normalize_domain(url)
+        if key in self.failures:
+            return self.failures[key]
+        evidence_id = self.evidence('FETCH_FAILURE', 'ACQUISITION_FAILURE', requested_url=url,
+                                    payload={'errors': list(errors)})
+        self.failures[key] = evidence_id
+        return evidence_id
+
     def page(self, requested_url, response):
         # The same final page can be reached through several candidates. Keep
         # each requested-to-final association: ownership evaluation uses it to
@@ -219,6 +230,17 @@ class EvidenceWriter:
             content_hash=content_hash, snippet_body=visible, payload={'html': response.text})
         self.pages[key] = evidence_id
         self.identity_identifiers(evidence_id, visible, 'visible_text')
+        # The document title is a bounded presentation claim. It can support a
+        # confidence decision, but never becomes operator evidence by itself.
+        for item in extract_claims(self.company, title):
+            if (item['kind'] != 'ALIAS' or
+                    item['value'].get('qualifiers', {}).get('alias_kind') !=
+                    'EXPANDED_LEGAL_NAME'):
+                continue
+            item['value']['qualifiers'].update(block_id='document_title',
+                source_url=response.url, context=title, block_tag='title')
+            self.observe(evidence_id, item['kind'], item['raw'], item['normalized'],
+                method='bounded_document_title', locator='title', **item['value'])
         # Preserve page-wide observations, but authorize only bounded contexts.
         block_tags = ['main', 'article', 'section', 'footer', 'address', 'p', 'li',
                       'div', 'h1', 'h2', 'h3']

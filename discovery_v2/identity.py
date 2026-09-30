@@ -102,7 +102,10 @@ def extract_claims(company, source_text):
         observed_names.append(forms['full'])
         target_words = target_names['distinctive'].split()
         observed_words = forms['distinctive'].split()
-        expanded = bool(target_words and len(''.join(target_words)) >= 4
+        # Three-character registered brands such as GPK are common. This is
+        # only an alias classification; ownership still requires independent
+        # evidence before an expanded presentation name can authorize a site.
+        expanded = bool(target_words and len(''.join(target_words)) >= 3
                         and all(word in observed_words for word in target_words)
                         and len(observed_words) > len(target_words))
         claims.append(claim('ALIAS', raw, forms['full'], 'UNVERIFIED', 'LOW',

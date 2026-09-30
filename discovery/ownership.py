@@ -81,6 +81,13 @@ def page_type(url, title='', visible='', signals=()):
               'poslovni imenik', 'seznam davcnih zavezancev', 'iskanje davcnih zavezancev',
               'profil kompanije', 'company listing', 'exhibitor', 'supplier report')
     if any(x in path for x in structural) or any(x in label for x in strong): return 'THIRD_PARTY'
+    member_path = any(x in path for x in ('/clani/', '/clan/'))
+    international_member_path = any(x in path for x in ('/members/', '/member/'))
+    association_context = any(x in body or x in label for x in (
+        'association', 'industry association', 'chamber', 'member directory',
+        'zdruzenje', 'zbornica', 'seznam clanov', 'clani zdruzenja'))
+    if member_path or (international_member_path and association_context):
+        return 'PROFILE'
     if any(x in body for x in ('business directory', 'company directory', 'poslovni imenik', 'baza podjetij')): return 'THIRD_PARTY'
     if any(x in label for x in ('company profile', 'seller profile', 'dealer profile', 'job portal', 'news article')): return 'PROFILE'
     if '/company/' in path or '/companies/' in path or '/dealers/' in path: return 'PROFILE'

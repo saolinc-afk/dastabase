@@ -23,10 +23,16 @@ def trusted_host(host):
     return any(host == item or host.endswith('.' + item) for item in TRUSTED_ENTITY_HOSTS)
 
 
-def fetch_state(fetcher, candidate_url):
+def fetch_state(fetcher, candidate_url, writer=None):
     domain = normalize_domain(candidate_url)
     errors = [error for url, values in fetcher.failures.items()
               if normalize_domain(url) == domain for error in values]
+    if writer is not None:
+        errors.extend(error for row in writer.evidence_rows.values()
+            if row.get('source_kind') == 'FETCH_FAILURE'
+            and normalize_domain(row.get('requested_url') or '') == domain
+            for error in row.get('evidence_payload', {}).get('errors', []))
+    errors = list(dict.fromkeys(errors))
     if any(normalize_domain(url) == domain for url in fetcher.responses):
         return {'status': 'FETCHED', 'errors': errors}
     label = 'NOT_FETCHED'
@@ -35,7 +41,8 @@ def fetch_state(fetcher, candidate_url):
         label = 'TLS_EXPIRED'
     elif 'hostname' in joined and ('mismatch' in joined or 'certificate' in joined):
         label = 'TLS_HOSTNAME_MISMATCH'
-    elif '403' in joined or 'access denied' in joined:
+    elif ('401' in joined or '403' in joined or 'access denied' in joined
+          or 'access challenge' in joined or 'unauthorized' in joined):
         label = 'HTTP_FORBIDDEN'
     elif 'eof' in joined:
         label = 'CONNECTION_EOF'
@@ -63,6 +70,8 @@ CONFIDENCE_RULES = {
     'CONF-02_LEGAL_CONTACT_CONVERGENCE': 'HIGH',
     'CONF-03_LEGAL_PAGE_DOMAIN_CONTACT': 'HIGH',
     'CONF-04_LEGAL_PAGE_COHERENCE': 'MEDIUM',
+    'CONF-05_SEARCH_SUPPORTED_DOMAIN': 'HIGH',
+    'CONF-06_SUPPORTED_EXPANDED_LEGAL_NAME': 'HIGH',
 }
 
 USABLE_STATUSES = ('VERIFIED', 'HIGH', 'MEDIUM')
@@ -138,6 +147,50 @@ def _explicit_link(row, candidate):
     return any(normalize_url(link.rstrip('.,;')) == normalize_url(candidate) for link in links)
 
 
+def _search_domain_support(company, domain, links, claims, rows):
+    """Summarize deterministic target-to-domain evidence without authorizing it."""
+    direct, third_party, evidence_types, publishers, witnesses = [], [], set(), set(), []
+    conflict = False
+    for link in links:
+        row = rows.get(link['evidence_id'], {})
+        if row.get('source_kind') != 'SEARCH_RESULT' or not link.get('value', {}).get('identity_match'):
+            continue
+        local = [o for o in claims if o['evidence_id'] == link['evidence_id']]
+        if any(o['observation_type'] in ('TAX_NUMBER', 'REGISTRATION_NUMBER')
+               and o['value'].get('verification_status') == 'CONFLICT' for o in local):
+            conflict = True
+        other_names = [o for o in local if o['observation_type'] == 'ALIAS'
+                       and o['value'].get('verification_status') == 'UNVERIFIED'
+                       and not _target_name_in_prose(company, o)]
+        if other_names:
+            conflict = True
+        publisher = publisher_id(row.get('result_host') or row.get('result_url'))
+        method = link.get('extraction_method')
+        is_direct = (method == 'search_url'
+                     and normalize_domain(row.get('result_host') or row.get('result_url')) == domain)
+        kind = ('DIRECT_SEARCH_DOMAIN' if is_direct else
+                'SNIPPET_URL' if method == 'snippet_url' else
+                'SNIPPET_EMAIL_DOMAIN' if method == 'email_domain' else None)
+        if not kind:
+            continue
+        publishers.add(publisher)
+        evidence_types.add(kind)
+        witnesses.append(link)
+        strong_identity = bool(_exact(local, 'LEGAL_NAME') and (
+            _exact(local, 'ADDRESS', 'TAX_NUMBER', 'REGISTRATION_NUMBER')
+            or (_exact(local, 'STREET') and _exact(local, 'POSTAL_CODE', 'MUNICIPALITY'))))
+        if is_direct:
+            direct.append(link)
+        elif publisher != domain and strong_identity:
+            third_party.append(link)
+            witnesses.extend(_exact(local, 'LEGAL_NAME', 'ADDRESS', 'TAX_NUMBER',
+                                    'REGISTRATION_NUMBER', 'STREET', 'POSTAL_CODE',
+                                    'MUNICIPALITY'))
+    return {'direct': direct, 'third_party': third_party,
+            'evidence_types': evidence_types, 'publishers': publishers,
+            'witnesses': witnesses, 'conflict': conflict}
+
+
 _INCIDENTAL_ENTITY_CONTEXT = (
     'website by', 'developed by', 'designed by', 'powered by', 'izdelava spletne',
     'privacy provider', 'cookie provider', 'software provider', 'ponudnik programske',
@@ -210,9 +263,15 @@ def _material_conflicting_entity(company, observation):
 
 def _attributed_identifier_conflicts(company, claims, blocks):
     """Return only conflicts structurally attributable to candidate identity."""
+    def target_presentation(local):
+        return any(o['observation_type'] == 'ALIAS'
+                   and o['value'].get('qualifiers', {}).get('alias_kind') ==
+                   'EXPANDED_LEGAL_NAME'
+                   and _target_name_in_prose(company, o) for o in local)
+
     page_target_identity = {}
     for (eid, _), local in blocks.items():
-        if _exact(local, 'LEGAL_NAME', 'SITE_OPERATOR'):
+        if _exact(local, 'LEGAL_NAME', 'SITE_OPERATOR') or target_presentation(local):
             page_target_identity[eid] = True
     conflicts = []
     for (eid, _), local in blocks.items():
@@ -227,7 +286,7 @@ def _attributed_identifier_conflicts(company, claims, blocks):
                        and not _target_name_in_prose(company, o)]
             if aliases and not any(_material_conflicting_entity(company, o) for o in aliases):
                 continue
-            if (_exact(local, 'LEGAL_NAME', 'SITE_OPERATOR')
+            if (_exact(local, 'LEGAL_NAME', 'SITE_OPERATOR') or target_presentation(local)
                     or any(_material_conflicting_entity(company, o) for o in aliases)
                     or page_target_identity.get(eid)):
                 conflicts.append(conflict)
@@ -295,6 +354,10 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
         if explicit and item['trusted'] and _exact(local, 'LEGAL_NAME') and _exact(local, 'TAX_NUMBER', 'REGISTRATION_NUMBER', 'ADDRESS'):
             corroboration.append((item, _exact(local, 'LEGAL_NAME', 'TAX_NUMBER', 'REGISTRATION_NUMBER', 'ADDRESS') +
                                   [o for o in links if o['evidence_id'] == eid and normalize_url(o['normalized_value']) == normalize_url(candidate_url)]))
+
+    search_support = _search_domain_support(company, domain, links, claims, rows)
+    if search_support['conflict']:
+        blockers.append('SEARCH_IDENTITY_CONFLICT')
 
     candidates = []
     group_seen = any(any(fold(word) in fold(row.get('snippet_body')) for word in GROUP_WORDS)
@@ -417,31 +480,31 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
         if foreign_context:
             blockers.append('FOREIGN_OR_RELATED_ENTITY_CONTEXT')
         blockers = sorted(set(blockers))
+        onsite_email = [o for o in claims
+            if o['observation_type'] == 'EMAIL_CANDIDATE'
+            and o.get('value', {}).get('source_kind') == 'FETCHED_PAGE'
+            and normalize_domain('https://' + o['normalized_value'].rsplit('@', 1)[-1]) == domain
+            and (in_scope(o.get('value', {}).get('source_url', ''), candidate_url)
+                 or normalize_domain(o.get('value', {}).get('source_url', '')) in redirect_domains)
+            and (o.get('value', {}).get('block', {}).get('target_entity') or
+                 (o.get('value', {}).get('block', {}).get('single_entity_page')
+                  and o.get('value', {}).get('block', {}).get('contact_section')))]
+        search_links = [o for o in links if rows[o['evidence_id']].get('source_kind') == 'SEARCH_RESULT'
+                        and o.get('value', {}).get('identity_match')
+                        and normalize_domain(o['normalized_value']) == domain]
+        email_support = min(onsite_email, key=lambda o: (
+            o['normalized_value'], o.get('value', {}).get('source_url', ''), o['source_locator'])) if onsite_email else None
+        search_link = min(search_links, key=lambda o: (
+            publisher_id(rows[o['evidence_id']].get('result_host')),
+            rows[o['evidence_id']].get('result_url', ''),
+            rows[o['evidence_id']].get('snippet_body', ''))) if search_links else None
+        domain_name = _domain_name_match(company, candidate_url)
         if bounded_legal and not blockers:
             legal_keys = {key for key, _ in bounded_legal}
             full_address = [(key, o) for key, local in safe_blocks.items()
                             for o in _exact(local, 'ADDRESS') if key in legal_keys]
             contact_legal = [(key, o) for key, o in bounded_legal
                              if classifications[key[0]] in ('CONTACT_PAGE', 'LEGAL_PAGE')]
-            onsite_email = [o for o in claims
-                if o['observation_type'] == 'EMAIL_CANDIDATE'
-                and o.get('value', {}).get('source_kind') == 'FETCHED_PAGE'
-                and normalize_domain('https://' + o['normalized_value'].rsplit('@', 1)[-1]) == domain
-                and in_scope(o.get('value', {}).get('source_url', ''), candidate_url)
-                and (o.get('value', {}).get('block', {}).get('target_entity') or
-                     (o.get('value', {}).get('block', {}).get('single_entity_page')
-                      and o.get('value', {}).get('block', {}).get('contact_section')))]
-            search_links = [o for o in links if rows[o['evidence_id']].get('source_kind') == 'SEARCH_RESULT'
-                            and o.get('value', {}).get('identity_match')
-                            and normalize_domain(o['normalized_value']) == domain]
-            email_support = min(onsite_email, key=lambda o: (
-                o['normalized_value'], o.get('value', {}).get('source_url', ''), o['source_locator'])) if onsite_email else None
-            search_support = min(search_links, key=lambda o: (
-                publisher_id(rows[o['evidence_id']].get('result_host')),
-                rows[o['evidence_id']].get('result_url', ''),
-                rows[o['evidence_id']].get('snippet_body', ''))) if search_links else None
-            domain_name = _domain_name_match(company, candidate_url)
-
             confidence_rule, reasons = None, []
             if full_address and (domain_name or onsite_email or search_links):
                 confidence_rule = 'CONF-01_LEGAL_ADDRESS_CONVERGENCE'
@@ -466,7 +529,7 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
                 evidence = [legal_observation]
                 evidence.extend(o for key, o in full_address if key == page_key)
                 if email_support: evidence.append(email_support)
-                if search_support: evidence.append(search_support)
+                if search_link: evidence.append(search_link)
                 if domain_name: reasons.append('LEGAL_NAME_DOMAIN_MATCH')
                 if onsite_email and 'FIRST_PARTY_DOMAIN_EMAIL' not in reasons: reasons.append('FIRST_PARTY_DOMAIN_EMAIL')
                 if search_links and 'ENTITY_SPECIFIC_SEARCH_DOMAIN_LINK' not in reasons: reasons.append('ENTITY_SPECIFIC_SEARCH_DOMAIN_LINK')
@@ -480,6 +543,66 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
                              'source_host': domain, 'page_classification': classifications[eid]},
                     status=status)
 
+        if not confidence and not blockers:
+            expanded = [(key, o) for key, local in safe_blocks.items() for o in local
+                        if o['observation_type'] == 'ALIAS'
+                        and o['value'].get('verification_status') == 'UNVERIFIED'
+                        and o['value'].get('qualifiers', {}).get('alias_kind') == 'EXPANDED_LEGAL_NAME'
+                        and _target_name_in_prose(company, o)]
+            if (expanded and search_support['direct'] and search_support['third_party']
+                    and len(search_support['publishers']) >= 2
+                    and len(search_support['evidence_types']) >= 2):
+                page_key, alias = min(expanded, key=lambda item: (
+                    rows[item[0][0]].get('final_url', ''), item[0][1]))
+                eid, block_id = page_key
+                local = safe_blocks[page_key]
+                local_support = _exact(local, 'ADDRESS', 'TAX_NUMBER', 'REGISTRATION_NUMBER')
+                if local_support or onsite_email or search_support['third_party']:
+                    evidence = [alias] + local_support + search_support['witnesses']
+                    if email_support:
+                        evidence.append(email_support)
+                    url = rows[eid]['final_url']
+                    confidence = dict(
+                        confidence_rule_id='CONF-06_SUPPORTED_EXPANDED_LEGAL_NAME',
+                        confidence_reasons=['EXPANDED_LEGAL_PRESENTATION_NAME',
+                            'DIRECT_ENTITY_SEARCH_DOMAIN', 'INDEPENDENT_DOMAIN_CORROBORATION'],
+                        verification_scope=scope_url(url), relationship='STANDALONE',
+                        supporting_observation_ids=sorted({o['observation_id'] for o in evidence}),
+                        supporting_evidence_ids=sorted({o['evidence_id'] for o in evidence}),
+                        context={'evidence_id': eid, 'block_id': block_id,
+                                 'source_url': url, 'source_host': normalize_domain(url),
+                                 'page_classification': classifications[eid]},
+                        status=CONFIDENCE_RULES['CONF-06_SUPPORTED_EXPANDED_LEGAL_NAME'])
+
+        state = fetch_state(fetcher, candidate_url, writer)
+        if (not confidence and not blockers and state['status'] == 'HTTP_FORBIDDEN'
+                and search_support['direct'] and search_support['third_party']
+                and len(search_support['publishers']) >= 2
+                and len(search_support['evidence_types']) >= 2
+                and domain_name and not blocks_official(candidate_url)
+                and page_type(candidate_url) not in ('THIRD_PARTY', 'PROFILE')):
+            evidence = search_support['witnesses']
+            failure_evidence_ids = sorted(eid for eid, row in rows.items()
+                if row.get('source_kind') == 'FETCH_FAILURE'
+                and normalize_domain(row.get('requested_url') or '') == domain)
+            direct = min(search_support['direct'], key=lambda o: (
+                rows[o['evidence_id']].get('result_rank') or 10_000,
+                rows[o['evidence_id']].get('result_url', '')))
+            confidence = dict(
+                confidence_rule_id='CONF-05_SEARCH_SUPPORTED_DOMAIN',
+                confidence_reasons=['DIRECT_ENTITY_SEARCH_DOMAIN',
+                    'INDEPENDENT_DOMAIN_CORROBORATION', 'MULTIPLE_DOMAIN_EVIDENCE_TYPES',
+                    'LEGAL_NAME_DOMAIN_MATCH', 'FETCH_BLOCKED_HTTP_FORBIDDEN'],
+                verification_scope=scope_url(candidate_url), relationship='STANDALONE',
+                supporting_observation_ids=sorted({o['observation_id'] for o in evidence}),
+                supporting_evidence_ids=sorted(
+                    {o['evidence_id'] for o in evidence} | set(failure_evidence_ids)),
+                context={'evidence_id': direct['evidence_id'], 'block_id': 'search_domain_bundle',
+                         'source_url': rows[direct['evidence_id']].get('result_url'),
+                         'source_host': domain, 'page_classification': 'SEARCH_EVIDENCE',
+                         'fetch_status': state['status']},
+                status=CONFIDENCE_RULES['CONF-05_SEARCH_SUPPORTED_DOMAIN'])
+
     status = 'VERIFIED' if selected else confidence.get('status', 'REVIEW')
     chosen = selected or confidence
     return {'verified': bool(selected), 'usable': status in USABLE_STATUSES, 'status': status,
@@ -491,7 +614,7 @@ def evaluate(company, candidate_url, writer, fetcher, legacy_result=None):
             'identity_evidence': [], 'operator_evidence': [], 'relationship_evidence': [],
             **chosen, 'site_operator_anchors': selected.get('operator_evidence', []),
             'conflicts': sorted(o['observation_id'] for o in conflicts), 'blockers': blockers,
-            'fetch_state': fetch_state(fetcher, candidate_url), 'page_classifications': classifications,
+            'fetch_state': fetch_state(fetcher, candidate_url, writer), 'page_classifications': classifications,
             'source_publishers': sources}
 
 
