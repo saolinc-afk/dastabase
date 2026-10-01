@@ -18,7 +18,11 @@ def status_fixture():
             run_id='run-1', run_status='RUNNING', selected=100, processed=42,
             pending=58, percent=42, company_statuses={'COMPLETED':40,'PARTIAL':2,
             'FAILED':0,'INELIGIBLE':0,'RUNNING':1,'PENDING':57},
+            success=42, success_denominator=42, success_percent=100,
             website_statuses={'VERIFIED':5,'HIGH':16,'MEDIUM':6,'REVIEW':15},
+            website_total=42, website_percentages={'VERIFIED':11.9,'HIGH':38.1,
+            'MEDIUM':14.3,'REVIEW':35.7}, current_company={'id':6353,'name':'FRBEŽAR d.o.o.'},
+            recent_activity=[],
             usable_websites=27, default_email_companies=25,
             default_phone_companies=16, serper_evidence_companies=41,
             last_activity='2026-09-26T11:59:00Z'),
@@ -185,6 +189,8 @@ class MonitorPolishBrowserTests(unittest.TestCase):
         self.assertIn('42 / 100 · 42%', discovery)
         self.assertIn('Companies with Serper evidence', discovery)
         self.assertIn('27', discovery)
+        self.assertIn('SUCCESS', discovery.upper())
+        self.assertEqual(self.page.locator('#discovery-v2 .segment').count(), 4)
         self.assertIn('SPARROW 0.9.0', self.page.locator('header').inner_text())
         self.assertNotIn('ENGINE', self.page.locator('header').inner_text())
         self.assertTrue(self.page.locator('.dastabase-logo').evaluate('(img) => img.complete && img.naturalWidth > 0'))

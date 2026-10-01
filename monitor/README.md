@@ -69,8 +69,8 @@ files. Database `sampled_at` identifies its actual last collection time.
 ### Discovery v2 enrichment
 
 The separate **DISCOVERY V2 / ENRICHMENT** card scans read-only
-`results.sqlite3` files below the configured Discovery v2 directory. A `RUNNING`
-or `PENDING` run is preferred; otherwise the run with the newest persisted
+`results.sqlite3` files below the configured Discovery v2 directory. A genuinely
+`RUNNING` run is preferred over every non-running run; otherwise the run with the newest persisted
 `finished_at`, `started_at`, or `created_at` is shown. Path and run ID provide
 deterministic tie-breaking.
 
@@ -81,6 +81,11 @@ Website and default-contact totals come directly from
 company count from persisted evidence provider rows, not an API query count.
 Last activity is the newest reliable persisted run/result/attempt/evidence
 timestamp available.
+
+Success is `(COMPLETED + PARTIAL) / (COMPLETED + PARTIAL + FAILED + INELIGIBLE)`;
+pending and running companies are excluded. Live Activity is taken only from
+persisted results for the selected Discovery v2 run. A persisted `RUNNING` state
+is displayed as such without claiming that an operating-system worker is alive.
 
 Connections use SQLite URI `mode=ro`, `PRAGMA query_only=ON`, short busy
 timeouts, progress deadlines, and immediate close. Missing directories, locked

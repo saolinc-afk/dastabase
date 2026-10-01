@@ -57,9 +57,37 @@ def create_app(config=None):
             recent = recent_jobs(logs, active, report_reader=reports.read)
             workload, activity = operation_details(db, active, recent, app.config['DB_PATH'])
             active, recent = public_jobs(active, recent)
+            discovery = discovery_v2_metrics(app.config['DISCOVERY_V2_PATH'])
+            if discovery['available']:
+                running = discovery['run_status'] == 'RUNNING'
+                if running:
+                    active = {'available': True, 'jobs': [{
+                        'identity': 'discovery-v2:' + discovery['run_id'],
+                        'job_type': 'DISCOVERY V2 ENRICHMENT',
+                        'namespace': discovery['database'], 'run_id': discovery['run_id'],
+                        'status': discovery['run_status'], 'processed': discovery['processed'],
+                        'selected': discovery['selected'], 'remaining': discovery['pending'],
+                        'percent': discovery['percent'],
+                        'current_company': discovery['current_company'],
+                        'last_activity': discovery['last_activity'],
+                        'worker_observed': False}],
+                        'note': 'Persisted RUNNING state; worker liveness is not independently proven.'}
+                statuses = discovery['company_statuses']
+                workload = {'kind': 'discovery_v2',
+                    'state': 'active' if running else 'idle',
+                    'active_batches': 1 if running else 0,
+                    'batch_remaining': discovery['pending'],
+                    'database_remaining': discovery['pending'],
+                    'running': statuses['RUNNING'], 'pending': statuses['PENDING'],
+                    'processed': discovery['processed'], 'selected': discovery['selected'],
+                    'remaining_after_batch': 0 if running else discovery['pending'],
+                    'estimate': False}
+                activity = {'source': 'discovery_v2',
+                    'entries': discovery['recent_activity'],
+                    'note': 'Selected Discovery v2 run only; ordered by persisted result completion time.'}
             return dict(timestamp=stamp(), database=db, active=active, workload=workload,
                         activity=activity, recent=recent,
-                        discovery_v2=discovery_v2_metrics(app.config['DISCOVERY_V2_PATH']),
+                        discovery_v2=discovery,
                         services=services.get(service_metrics))
         return jsonify(status_cache.get(collect))
 

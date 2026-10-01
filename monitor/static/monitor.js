@@ -5,7 +5,7 @@ const number = v => v === null || v === undefined ? 'N/A' : v.toLocaleString();
 const bytes = v => v == null ? 'N/A' : (v / 1073741824).toFixed(1) + ' GiB';
 const duration = v => v == null ? 'N/A' : [Math.floor(v/3600),Math.floor(v%3600/60),Math.floor(v%60)].map(x=>String(x).padStart(2,'0')).join(':');
 const percent = (used,total) => used == null || !total ? null : Math.min(100,Math.max(0,100*used/total));
-const tone = v => ['running','active','complete','VERIFIED'].includes(v) ? 'good' : ['ERROR','unhealthy','failed'].includes(v) ? 'error' : ['REVIEW','GROUP_REVIEW','interrupted','incomplete','circuit-breaker','stopped','starting'].includes(v) ? 'warn' : '';
+const tone = v => ['running','active','complete','RUNNING','COMPLETED','PARTIAL','VERIFIED','HIGH'].includes(v) ? 'good' : ['ERROR','FAILED','unhealthy','failed'].includes(v) ? 'error' : ['REVIEW','MEDIUM','INELIGIBLE','GROUP_REVIEW','interrupted','incomplete','circuit-breaker','stopped','starting'].includes(v) ? 'warn' : '';
 // Presentation only: API/report statuses and diagnostic text stay unchanged.
 const resultLabel = status => ({ERROR:'UNRESOLVED',GROUP_REVIEW:'GROUP REVIEW',NOT_FOUND:'NOT FOUND'}[status] || status);
 const companyLabel = company => company ? [company.id,company.name].filter(v=>v!=null && v!=='').join(' · ') || null : null;
@@ -13,6 +13,11 @@ const localTime = value => {if(!value)return 'N/A';const date=new Date(value);re
 function node(tag,value,cls=''){const n=document.createElement(tag);n.textContent=text(value);n.className=cls;return n;}
 function row(parent,label,value,cls=''){const r=node('div','','row'),n=node('span',value,'value '+cls);r.append(node('span',label),n);parent.append(r);return n;}
 function bar(parent,value,label){if(value==null)return;const n=document.createElement('progress');n.max=100;n.value=value;n.setAttribute('aria-label',label);parent.append(n);}
+function metric(parent,label,value,cls=''){const n=node('div','','metric');n.append(node('span',label,'metric-label'),node('strong',value,'metric-value '+cls));parent.append(n);}
+function metricGrid(parent,items){const grid=node('div','','metric-grid');for(const [label,value,cls] of items)metric(grid,label,value,cls||'');parent.append(grid);return grid;}
+function segmented(parent,statuses,percentages){const wrap=node('div','','distribution-wrap'),bar=node('div','','segmented-bar');bar.setAttribute('aria-label','Website status distribution');
+  for(const status of ['VERIFIED','HIGH','MEDIUM','REVIEW']){const part=node('span','',`segment segment-${status.toLowerCase()}`);part.style.width=(percentages?.[status]||0)+'%';part.title=`${status} ${number(statuses?.[status])} · ${percentages?.[status]||0}%`;bar.append(part);}wrap.append(bar);
+  const legend=node('div','','distribution-legend');for(const status of ['VERIFIED','HIGH','MEDIUM','REVIEW'])metric(legend,status,`${number(statuses?.[status])} · ${percentages?.[status]||0}%`,tone(status));wrap.append(legend);parent.append(wrap);}
 const previous = new Map();
 function changed(id,value,render){const key=JSON.stringify(value);if(previous.get(id)===key)return;previous.set(id,key);const target=el(id),scroll=[target.scrollLeft,target.scrollTop];target.replaceChildren();render(target);target.scrollLeft=scroll[0];target.scrollTop=scroll[1];}
 let runtimes = new Map();
@@ -38,14 +43,10 @@ function renderStatus(data){
     row(box,'Run status',v.run_status,tone(v.run_status));
     row(box,'Progress',`${number(v.processed)} / ${number(v.selected)} · ${v.percent == null ? 'N/A' : v.percent+'%'}`);
     bar(box,v.percent,'Discovery v2 enrichment progress');
-    const companyLabels={COMPLETED:'Completed',PARTIAL:'Partial',FAILED:'Failed',INELIGIBLE:'Ineligible',RUNNING:'Running',PENDING:'Pending'};
-    for(const status of ['COMPLETED','PARTIAL','FAILED','INELIGIBLE','RUNNING','PENDING'])row(box,companyLabels[status],number(v.company_statuses?.[status]),tone(status));
-    row(box,'Pending / unprocessed',number(v.pending));
-    for(const status of ['VERIFIED','HIGH','MEDIUM','REVIEW'])row(box,resultLabel(status)+' websites',number(v.website_statuses?.[status]),tone(status));
-    row(box,'Usable websites',number(v.usable_websites),'good');
-    row(box,'Companies with default email',number(v.default_email_companies));
-    row(box,'Companies with default phone',number(v.default_phone_companies));
-    row(box,'Companies with Serper evidence',number(v.serper_evidence_companies));
+    row(box,'Success',`${number(v.success)} / ${number(v.success_denominator)} · ${v.success_percent == null ? 'N/A' : v.success_percent+'%'}`,'good');
+    metricGrid(box,[['Completed',number(v.company_statuses?.COMPLETED),'good'],['Partial',number(v.company_statuses?.PARTIAL),'good'],['Failed',number(v.company_statuses?.FAILED),'error'],['Ineligible',number(v.company_statuses?.INELIGIBLE),'warn'],['Running',number(v.company_statuses?.RUNNING),'good'],['Pending',number(v.company_statuses?.PENDING),''],['Pending / unprocessed',number(v.pending),'']]);
+    segmented(box,v.website_statuses,v.website_percentages);
+    metricGrid(box,[['Usable websites',number(v.usable_websites),'good'],['Default email',number(v.default_email_companies),''],['Default phone',number(v.default_phone_companies),''],['Companies with Serper evidence',number(v.serper_evidence_companies),'']]);
     row(box,'Last activity',localTime(v.last_activity));
     row(box,'Run',v.run_id);row(box,'Results DB',v.database);
     if(v.note)box.append(node('p',v.note,'warn'));
@@ -56,17 +57,21 @@ function renderStatus(data){
     if(data.active.inaccessible_processes)box.append(node('p','Process visibility is partial.','warn'));
     for(const j of data.active.jobs){
       const job=node('div','','job');job.append(node('div','● '+j.job_type,'good job-title'));
-      row(job,'Batch',j.report);row(job,'Companies',`${number(j.processed)} / ${number(j.selected)}`);
+      if(j.namespace){row(job,'Namespace',j.namespace);row(job,'Run',j.run_id);row(job,'State',j.status,tone(j.status));}
+      else row(job,'Batch',j.report);
+      row(job,'Companies',`${number(j.processed)} / ${number(j.selected)}`);
       row(job,'Remaining',number(j.remaining));row(job,'Batch progress',j.percent == null ? 'N/A' : j.percent+'%');bar(job,j.percent,'Batch progress');
       row(job,'Current',companyLabel(j.current_company));
-      const last=j.last_completed;row(job,'Last',last ? [last.company_id,last.company_name,resultLabel(last.status)].filter(v=>v!=null).join(' · ') : null,last ? tone(last.status) : '');
-      row(job,'PID',j.pid);runtimes.set(j.identity,row(job,'Runtime',duration(j.runtime_seconds)));
-      row(job,'Circuit breaker',j.circuit_breaker == null ? 'N/A' : j.circuit_breaker ? 'TRIGGERED' : 'Not triggered',j.circuit_breaker ? 'warn' : '');box.append(job);
+      if(j.namespace){row(job,'Last activity',localTime(j.last_activity));job.append(node('p','Persisted RUNNING state · worker liveness not independently proven.','muted'));}
+      else {const last=j.last_completed;row(job,'Last',last ? [last.company_id,last.company_name,resultLabel(last.status)].filter(v=>v!=null).join(' · ') : null,last ? tone(last.status) : '');
+        row(job,'PID',j.pid);runtimes.set(j.identity,row(job,'Runtime',duration(j.runtime_seconds)));
+        row(job,'Circuit breaker',j.circuit_breaker == null ? 'N/A' : j.circuit_breaker ? 'TRIGGERED' : 'Not triggered',j.circuit_breaker ? 'warn' : '');}box.append(job);
     }
   });
   changed('workload',data.workload,box=>{
     const w=data.workload;
-    if(w.state==='idle'){box.append(node('p','No active batch','muted'));row(box,'Unprocessed companies',number(w.database_remaining));}
+    if(w.kind==='discovery_v2'){if(w.state==='idle')box.append(node('p','Selected Discovery v2 run is not active.','muted'));metricGrid(box,[['Pending / unprocessed',number(w.database_remaining),''],['Currently running',number(w.running),'good'],['Processed',`${number(w.processed)} / ${number(w.selected)}`,'']]);}
+    else if(w.state==='idle'){box.append(node('p','No active batch','muted'));row(box,'Unprocessed companies',number(w.database_remaining));}
     else{if(w.state==='unknown')box.append(node('p','Active batch visibility unavailable','warn'));
       row(box,w.active_batches>1 ? 'Active batches remaining' : 'Current batch remaining',number(w.batch_remaining));
       row(box,'Database remaining',number(w.database_remaining));row(box,'Remaining after batch (est.)',number(w.remaining_after_batch));
@@ -78,12 +83,14 @@ function renderStatus(data){
     for(const event of data.activity.entries){const line=node('div','','event');
       line.append(node('span',event.status==='VERIFIED' ? '✓' : event.status==='ERROR' ? '×' : '·',tone(event.status)),node('span',event.company_id,'event-id'),node('span',event.company_name || 'Name unavailable','event-name'));
       if(event.status)line.append(node('span',resultLabel(event.status),tone(event.status)));
+      if(event.website_status)line.append(node('span',resultLabel(event.website_status),tone(event.website_status)));
       if(event.domain)line.append(node('span',event.domain,'muted'));
-      if(event.usable_emails!=null)line.append(node('span',`${event.usable_emails} emails`,'muted'));
+      if(event.default_emails!=null)line.append(node('span',`${event.default_emails} default email`,'muted'));
+      else if(event.usable_emails!=null)line.append(node('span',`${event.usable_emails} emails`,'muted'));
       line.title=event.report;box.append(line);
     }
   });
-  el('activity-note').textContent=(data.activity.source==='active' ? 'Active runner · ' : 'Recent runner · ')+data.activity.note;
+  el('activity-note').textContent=(data.activity.source==='discovery_v2' ? 'Discovery v2 · ' : data.activity.source==='active' ? 'Active runner · ' : 'Recent runner · ')+data.activity.note;
   changed('recent',data.recent,box=>{
     const table=document.createElement('table'),head=document.createElement('tr');for(const h of ['REPORT','STATE','DONE / SELECTED','TIMESTAMP'])head.append(node('th',h));table.append(head);
     for(const j of data.recent.jobs){const tr=document.createElement('tr');tr.append(node('td',j.name),node('td',resultLabel(j.status),tone(j.status)),node('td',`${j.processed} / ${j.selected}`),node('td',localTime(j.timestamp)));table.append(tr);}box.append(table);

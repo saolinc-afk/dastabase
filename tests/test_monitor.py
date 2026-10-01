@@ -162,7 +162,8 @@ class MonitorTests(unittest.TestCase):
         conn = sqlite3.connect(path)
         conn.executescript('''CREATE TABLE discovery_runs(run_id TEXT, status TEXT,
             created_at TEXT, started_at TEXT, finished_at TEXT);
-        CREATE TABLE discovery_run_companies(run_id TEXT, company_id INTEGER, status TEXT);
+        CREATE TABLE discovery_run_companies(run_id TEXT, company_id INTEGER, status TEXT,
+            identity_snapshot_json TEXT);
         CREATE TABLE discovery_company_results(run_id TEXT, company_id INTEGER,
             website_status TEXT, default_email_contact_id TEXT,
             default_phone_contact_id TEXT, completed_at TEXT);
@@ -171,10 +172,13 @@ class MonitorTests(unittest.TestCase):
         CREATE TABLE discovery_attempts(run_id TEXT, finished_at TEXT);''')
         conn.execute('INSERT INTO discovery_runs VALUES (?,?,?,?,?)',
                      (run_id, status, started, started, None))
-        conn.executemany('INSERT INTO discovery_run_companies VALUES (?,?,?)', [
-            (run_id, 1, 'COMPLETED'), (run_id, 2, 'PARTIAL'),
-            (run_id, 3, 'FAILED'), (run_id, 4, 'INELIGIBLE'),
-            (run_id, 5, 'RUNNING'), (run_id, 6, 'PENDING')])
+        conn.executemany('INSERT INTO discovery_run_companies VALUES (?,?,?,?)', [
+            (run_id, 1, 'COMPLETED', '{"company_name":"V2 One"}'),
+            (run_id, 2, 'PARTIAL', '{"company_name":"V2 Two"}'),
+            (run_id, 3, 'FAILED', '{"company_name":"V2 Failed"}'),
+            (run_id, 4, 'INELIGIBLE', '{"company_name":"V2 Ineligible"}'),
+            (run_id, 5, 'RUNNING', '{"company_name":"V2 Current"}'),
+            (run_id, 6, 'PENDING', '{"company_name":"V2 Pending"}')])
         conn.executemany('INSERT INTO discovery_company_results VALUES (?,?,?,?,?,?)', [
             (run_id, 1, 'VERIFIED', 'email-1', 'phone-1', '2026-01-02T10:02:00+00:00'),
             (run_id, 2, 'HIGH', None, 'phone-2', '2026-01-02T10:03:00+00:00')])
@@ -193,10 +197,14 @@ class MonitorTests(unittest.TestCase):
         self.assertTrue(result['available'])
         self.assertEqual((result['processed'], result['selected'], result['pending'], result['percent']),
                          (4, 6, 2, 66.7))
+        self.assertEqual((result['success'], result['success_denominator'],
+                          result['success_percent']), (2, 4, 50.0))
         self.assertEqual(result['company_statuses'], {'COMPLETED': 1, 'PARTIAL': 1,
             'FAILED': 1, 'INELIGIBLE': 1, 'RUNNING': 1, 'PENDING': 1})
         self.assertEqual(result['website_statuses'], {'VERIFIED': 1, 'HIGH': 1,
             'MEDIUM': 0, 'REVIEW': 0})
+        self.assertEqual(result['website_percentages'], {'VERIFIED': 50.0, 'HIGH': 50.0,
+            'MEDIUM': 0.0, 'REVIEW': 0.0})
         self.assertEqual((result['usable_websites'], result['default_email_companies'],
                           result['default_phone_companies'], result['serper_evidence_companies']),
                          (2, 1, 2, 1))
@@ -209,6 +217,8 @@ class MonitorTests(unittest.TestCase):
                                   '2026-02-01T00:00:00+00:00')
         self.discovery_v2_fixture(root/'older-active', 'active', 'RUNNING',
                                   '2026-01-01T00:00:00+00:00')
+        self.discovery_v2_fixture(root/'newer-pending', 'pending', 'PENDING',
+                                  '2026-03-01T00:00:00+00:00')
         self.assertEqual(discovery_v2_metrics(root)['run_id'], 'active')
         empty = discovery_v2_metrics(self.root/'missing')
         self.assertFalse(empty['available'])
@@ -217,11 +227,30 @@ class MonitorTests(unittest.TestCase):
         with patch('monitor.metrics.sqlite3.connect', side_effect=sqlite3.OperationalError('locked')):
             self.assertFalse(discovery_v2_metrics(root)['available'])
 
+    def test_discovery_v2_latest_fallback_and_zero_safe_rates(self):
+        root = self.root/'discovery-v2'
+        path = self.discovery_v2_fixture(root/'older', 'older', 'COMPLETED',
+                                         '2026-01-01T00:00:00+00:00')
+        self.discovery_v2_fixture(root/'newer', 'newer', 'PENDING',
+                                  '2026-02-01T00:00:00+00:00')
+        self.assertEqual(discovery_v2_metrics(root)['run_id'], 'newer')
+        conn = sqlite3.connect(path)
+        conn.execute("DELETE FROM discovery_run_companies")
+        conn.execute("DELETE FROM discovery_company_results")
+        conn.commit(); conn.close()
+        only = self.root/'only-empty'; only.mkdir()
+        (only/'results.sqlite3').write_bytes(path.read_bytes())
+        result = discovery_v2_metrics(only)
+        self.assertEqual((result['success_percent'], result['website_total']), (0, 0))
+        self.assertEqual(result['website_percentages'], {'VERIFIED': 0, 'HIGH': 0,
+            'MEDIUM': 0, 'REVIEW': 0})
+
 
 class LiveMonitorTests(unittest.TestCase):
     setUp = MonitorTests.setUp
     tearDown = MonitorTests.tearDown
     fixture = MonitorTests.fixture
+    discovery_v2_fixture = MonitorTests.discovery_v2_fixture
 
     def test_batch_progress_and_activity_projection(self):
         report = {'selected_ids': [1, 2, 3], 'rule_version': 'phase2-ownership-1',
@@ -240,6 +269,31 @@ class LiveMonitorTests(unittest.TestCase):
         self.assertNotIn('domain', parse_report(report)['last_completed'])
         report['selected_ids'] = [1, 1]
         self.assertIsNone(parse_report(report))
+
+    def test_active_workload_and_activity_follow_selected_discovery_v2_run(self):
+        self.fixture()
+        root = self.root/'discovery-v2'
+        self.discovery_v2_fixture(root/'active', 'v2-active', 'RUNNING')
+        stale = {'available': True, 'jobs': [dict(identity='legacy', report='old.json',
+            processed=1, selected=1, remaining=0, percent=100,
+            activity=[{'company_id': 999, 'company_name': 'STALE SPARROW'}],
+            selected_ids=[999], completed_ids=[999])]}
+        app = create_app({'TESTING': True, 'DB_PATH': self.db, 'LOGS_PATH': self.logs,
+                          'DISCOVERY_V2_PATH': root, 'CACHE_SECONDS': 0})
+        with patch('monitor.app.active_jobs', return_value=stale), \
+                patch('monitor.app.recent_jobs', return_value={'jobs': [], 'skipped': 0}), \
+                patch('monitor.app.service_metrics', return_value=[]):
+            payload = app.test_client().get('/api/status').json
+        job = payload['active']['jobs'][0]
+        self.assertEqual((job['run_id'], job['status'], job['processed'], job['selected']),
+                         ('v2-active', 'RUNNING', 4, 6))
+        self.assertFalse(job['worker_observed'])
+        self.assertEqual(job['current_company'], {'id': 5, 'name': 'V2 Current'})
+        self.assertEqual((payload['workload']['pending'], payload['workload']['running'],
+                          payload['workload']['processed']), (1, 1, 4))
+        self.assertEqual(payload['activity']['source'], 'discovery_v2')
+        self.assertNotIn('STALE SPARROW', json.dumps(payload['activity']))
+        self.assertEqual(payload['activity']['entries'][0]['company_name'], 'V2 Two')
 
     def test_workload_retries_overlaps_and_no_worker(self):
         from monitor.state import workload

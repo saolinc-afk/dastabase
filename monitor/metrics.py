@@ -123,7 +123,10 @@ def _discovery_v2_empty(note=None):
                 website_statuses={s: None for s in DISCOVERY_V2_WEBSITE_STATUSES},
                 usable_websites=None, default_email_companies=None,
                 default_phone_companies=None, serper_evidence_companies=None,
-                last_activity=None)
+                last_activity=None, success=None, success_denominator=None,
+                success_percent=None, website_total=None, website_percentages={
+                    s: None for s in DISCOVERY_V2_WEBSITE_STATUSES},
+                current_company=None, recent_activity=[])
 
 
 def _discovery_v2_runs(path):
@@ -158,7 +161,7 @@ def _timestamp_key(*values):
 def discovery_v2_metrics(root):
     """Summarize the active/latest isolated Discovery v2 run, strictly read-only.
 
-    A RUNNING/PENDING run is preferred. Otherwise the run with the newest persisted
+    A genuinely RUNNING run is preferred. Otherwise the run with the newest persisted
     run timestamp wins; path and run ID make ties deterministic. Result rows are not
     used to infer manifest progress because failed/ineligible companies may lack one.
     """
@@ -170,7 +173,7 @@ def discovery_v2_metrics(root):
     candidates = []
     for path in paths:
         for run in _discovery_v2_runs(path):
-            active = run.get('status') in ('RUNNING', 'PENDING')
+            active = run.get('status') == 'RUNNING'
             activity = _timestamp_key(run.get('finished_at'), run.get('started_at'),
                                       run.get('created_at'))
             candidates.append((active, activity, str(path), str(run.get('run_id') or ''),
@@ -197,16 +200,40 @@ def discovery_v2_metrics(root):
         processed = sum(company_counts.get(s, 0)
                         for s in ('COMPLETED', 'PARTIAL', 'FAILED', 'INELIGIBLE'))
         statuses = {s: company_counts.get(s, 0) for s in DISCOVERY_V2_COMPANY_STATUSES}
+        success = statuses['COMPLETED'] + statuses['PARTIAL']
+        success_denominator = success + statuses['FAILED'] + statuses['INELIGIBLE']
         result.update(available=True, selected=selected, processed=processed,
                       pending=max(0, selected-processed),
                       percent=round(100*processed/selected, 1) if selected else 0,
-                      company_statuses=statuses)
+                      company_statuses=statuses, success=success,
+                      success_denominator=success_denominator,
+                      success_percent=(round(100*success/success_denominator, 1)
+                                       if success_denominator else 0))
+        run_company_columns = {row[1] for row in conn.execute(
+            'PRAGMA table_info(discovery_run_companies)')}
+        identity = ('identity_snapshot_json' if 'identity_snapshot_json' in run_company_columns
+                    else 'NULL')
+        order = ('manifest_position' if 'manifest_position' in run_company_columns
+                 else 'company_id')
+        running = conn.execute(f'''SELECT company_id,{identity}
+            FROM discovery_run_companies WHERE run_id=? AND status='RUNNING'
+            ORDER BY {order},company_id LIMIT 1''', (run['run_id'],)).fetchone()
+        if running:
+            snapshot = obj(running[1], dict)
+            result['current_company'] = {
+                'id': running[0], 'name': snapshot.get('company_name')}
         try:
             website_counts = dict(conn.execute('''SELECT website_status, COUNT(*)
                 FROM discovery_company_results WHERE run_id=? GROUP BY website_status''',
                 (run['run_id'],)).fetchall())
             result['website_statuses'] = {
                 s: website_counts.get(s, 0) for s in DISCOVERY_V2_WEBSITE_STATUSES}
+            website_total = sum(result['website_statuses'].values())
+            result['website_total'] = website_total
+            result['website_percentages'] = {
+                s: (round(100*result['website_statuses'][s]/website_total, 1)
+                    if website_total else 0)
+                for s in DISCOVERY_V2_WEBSITE_STATUSES}
             result['usable_websites'] = sum(website_counts.get(s, 0)
                                              for s in ('VERIFIED', 'HIGH', 'MEDIUM'))
             contacts = conn.execute('''SELECT
@@ -217,6 +244,28 @@ def discovery_v2_metrics(root):
             result.update(default_email_companies=contacts[0],
                           default_phone_companies=contacts[1])
             result_timestamp = contacts[2]
+            selected_join = (''' AND r.attempt_id=rc.selected_attempt_id'''
+                if {'selected_attempt_id'} <= run_company_columns and
+                {'attempt_id'} <= {row[1] for row in conn.execute(
+                    'PRAGMA table_info(discovery_company_results)')} else '')
+            recent_identity = ('rc.identity_snapshot_json'
+                               if 'identity_snapshot_json' in run_company_columns else 'NULL')
+            recent = conn.execute(f'''SELECT rc.company_id,rc.status,{recent_identity},
+                r.website_status,r.default_email_contact_id,r.completed_at
+                FROM discovery_run_companies rc
+                LEFT JOIN discovery_company_results r ON r.run_id=rc.run_id
+                    AND r.company_id=rc.company_id{selected_join}
+                WHERE rc.run_id=? AND rc.status IN ('COMPLETED','PARTIAL','FAILED','INELIGIBLE')
+                    AND r.completed_at IS NOT NULL
+                ORDER BY COALESCE(r.completed_at,'') DESC,rc.company_id DESC LIMIT 10''',
+                (run['run_id'],)).fetchall()
+            result['recent_activity'] = [{
+                'company_id': row[0],
+                'company_name': obj(row[2], dict).get('company_name'),
+                'status': row[1], 'website_status': row[3],
+                'default_emails': 1 if row[4] is not None else 0,
+                'completed_at': row[5]}
+                for row in recent]
         except sqlite3.Error:
             notes.append('Website/contact metrics unavailable with this schema.')
             result_timestamp = None
