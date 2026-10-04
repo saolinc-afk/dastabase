@@ -3,10 +3,14 @@ import argparse, csv, json, sqlite3
 from pathlib import Path
 from profile_v1 import APPLICATION_ID, SCHEMA_VERSION
 
-FIELDS=['company_id','company_name','profile_status','registered_activity','actual_primary_activity',
+REVIEW_FIELDS=['PRIMARY_ACTIVITY_CORRECT','PRODUCTS_SERVICES_CORRECT','AUDIENCE_CORRECT',
+ 'MANUFACTURER_CORRECT','INTERNATIONAL_CORRECT','DESCRIPTION_USEFUL_FOR_SALES',
+ 'UNSUPPORTED_CLAIMS','OVERALL_USEFUL','REVIEW_NOTES']
+FIELDS=['company_id','company_name','official_website','profile_status','registered_activity','actual_primary_activity',
         'industry_category','products','services','business_audience','customer_types',
         'manufacturer_signal','international_signal','business_description','overall_confidence',
-        'evidence_count','block_count','claim_count']
+        'supported_claim_count','rejected_claim_count','evidence_count','block_count',
+        'diagnostic_category']+REVIEW_FIELDS
 MAP={'ACTUAL_PRIMARY_ACTIVITY':'actual_primary_activity','INDUSTRY_CATEGORY':'industry_category',
      'PRODUCTS':'products','SERVICES':'services','BUSINESS_AUDIENCE':'business_audience',
      'CUSTOMER_TYPES':'customer_types','MANUFACTURER_SIGNAL':'manufacturer_signal',
@@ -26,11 +30,15 @@ def load(path,run_id):
                 citations=[dict(x) for x in conn.execute('SELECT * FROM profile_claim_evidence WHERE claim_id=?',(claim['claim_id'],))]
                 detail=dict(claim); detail['normalized_value']=json.loads(detail.pop('normalized_value_json')); detail['citations']=citations; claims.append(detail)
                 values[MAP[claim['claim_type']]].append(claim['display_value'])
+            rejected=len(json.loads(item['rejected_claim_ids_json']))
             row={'company_id':item['company_id'],'company_name':identity.get('company_name') or identity.get('name'),
+                 'official_website':item['accepted_website'] or '',
                  'profile_status':item['profile_status'],'registered_activity':json.dumps(json.loads(item['registered_activity_json']),ensure_ascii=False) if item['registered_activity_json'] else '',
                  'overall_confidence':item['overall_confidence'] or '','evidence_count':item['evidence_count'],
-                 'block_count':item['block_count'],'claim_count':item['claim_count']}
+                 'block_count':item['block_count'],'supported_claim_count':item['claim_count'],
+                 'rejected_claim_count':rejected,'diagnostic_category':item['diagnostic_category']}
             row.update({key:' | '.join(entries) for key,entries in values.items()})
+            row.update({key:'' for key in REVIEW_FIELDS})
             output.append({'summary':row,'claims':claims})
         return output
     finally: conn.close()

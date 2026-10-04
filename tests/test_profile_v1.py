@@ -5,8 +5,10 @@ import pytest
 
 from discovery_v2.store import APPLICATION_ID, SCHEMA_VERSION
 from profile_v1.contracts import CandidateClaim, Citation
+from profile_v1.blocks import extract_blocks
 from profile_v1.export import export
 from profile_v1.runner import create, replay, run
+from profile_v1.pilot import freeze, select
 from profile_v1.store import Store
 
 
@@ -63,6 +65,8 @@ def test_vertical_slice_import_validation_export_and_read_only(tmp_path):
     csv_path=tmp_path/'review.csv'; json_path=tmp_path/'review.json'; export(profile,run_id,csv_path,json_path)
     row=next(csv.DictReader(csv_path.open(encoding='utf-8-sig')))
     assert row['actual_primary_activity']=='Pump manufacturing' and row['registered_activity']=='"C28"'
+    assert row['official_website']=='https://pumpa.si' and row['supported_claim_count']=='4'
+    assert row['PRIMARY_ACTIVITY_CORRECT']=='' and row['REVIEW_NOTES']==''
     assert json.loads(json_path.read_text())[0]['claims'][0]['citations']
 
 
@@ -102,3 +106,22 @@ def test_wrong_run_company_and_source_mutation_are_rejected(tmp_path):
     profile=tmp_path/'profile.sqlite3'; rid=create(source,'dr',[7],profile)
     with source.open('ab') as handle: handle.write(b'changed')
     with pytest.raises(ValueError,match='hash mismatch'): run(profile,rid)
+
+
+def test_pilot_selection_is_deterministic_and_frozen(tmp_path):
+    source,_=discovery_db(tmp_path)
+    first=select(source,'dr',1); second=select(source,'dr',1)
+    assert first['companies']==second['companies'] and first['manifest_sha256']==second['manifest_sha256']
+    path=tmp_path/'pilot.json'; frozen=freeze(source,'dr',path,1)
+    assert json.loads(path.read_text())['manifest_sha256']==frozen['manifest_sha256']
+    with pytest.raises(ValueError,match='already exists'): freeze(source,'dr',path,1)
+
+
+def test_nested_noise_decomposition_does_not_crash_or_remove_valid_content():
+    html='''<html><body><div class="menu"><section><p>Discarded navigation</p></section></div>
+      <main><h1>Useful heading</h1><p>Useful company activity content.</p></main></body></html>'''
+    blocks=extract_blocks({'html':html})
+    texts=[block['text'] for block in blocks]
+    assert 'Useful heading' in texts
+    assert 'Useful company activity content.' in texts
+    assert 'Discarded navigation' not in texts

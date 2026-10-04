@@ -21,6 +21,9 @@ def extract_blocks(evidence):
     for node in soup(['script','style','noscript','template','svg','nav','footer','form','aside']):
         node.decompose()
     for node in list(soup.find_all(True)):
+        # Decomposing a noise parent recursively clears descendant attributes,
+        # while those descendants remain in this precomputed traversal list.
+        if node.attrs is None: continue
         marker = ' '.join(node.get('class', []))+' '+str(node.get('id') or '')
         if NOISE.search(marker): node.decompose()
     rows, seen = [], set()

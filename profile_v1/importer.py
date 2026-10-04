@@ -38,6 +38,8 @@ def discovery_manifest(path, run_id, company_ids):
             if identity.get('id') != company_id: raise ValueError('Discovery manifest identity mismatch')
             rows.append({'identity':identity,'registered_activity':identity.get('registered_activity'),
                          'discovery_attempt_id':row['selected_attempt_id'],'discovery_result_id':result['result_id']})
+            rows[-1]['accepted_website'] = (result['official_website']
+                                            if result['website_status'] in USABLE else None)
         descriptor={'database_path':str(resolved),'sha256':file_hash(resolved),'run_id':run_id,
                     'engine_version':run['engine_version'],'rule_version':run['rule_version']}
         return descriptor, rows

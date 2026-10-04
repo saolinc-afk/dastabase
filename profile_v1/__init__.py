@@ -2,5 +2,5 @@
 
 ENGINE_VERSION = 'profile-activity-0.1'
 RULE_VERSION = 'profile-claims-1'
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 APPLICATION_ID = 0x50524631

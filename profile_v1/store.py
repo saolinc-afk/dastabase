@@ -52,7 +52,8 @@ class Store:
                     registered_activity_json=(encode(item['registered_activity'])
                                               if item.get('registered_activity') else None),
                     discovery_attempt_id=item['discovery_attempt_id'],
-                    discovery_result_id=item['discovery_result_id'], status='PENDING'))
+                    discovery_result_id=item['discovery_result_id'],
+                    accepted_website=item.get('accepted_website'), status='PENDING'))
         return run_id
 
     def start_attempt(self, run_id, company_id):

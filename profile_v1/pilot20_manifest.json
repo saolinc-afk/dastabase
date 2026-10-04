@@ -1,0 +1,191 @@
+{
+  "pilot": "PROFILE_ACTIVITY_PILOT20",
+  "selection_policy": "PILOT20_DISCOVERY_EVIDENCE_V1",
+  "source_database": "audit_artifacts/batch100-real/results.sqlite3",
+  "source_sha256": "801e47f2fbc47f12cd197813b8371adeb9d9c4c40891b95be1f1b46d44ddcd8f",
+  "discovery_run_id": "33b0ec022ae44aa392c61c35aa757f8a",
+  "company_count": 20,
+  "companies": [
+    {
+      "company_id": 688,
+      "company_name": "PREVOZNIŠTVO KLAUT d.o.o.",
+      "manifest_position": 63,
+      "website_status": "HIGH",
+      "official_website": "https://klaut.si/",
+      "fetched_page_count": 2,
+      "persisted_content_bytes": 175228
+    },
+    {
+      "company_id": 669,
+      "company_name": "TEKSTINA d.o.o.",
+      "manifest_position": 60,
+      "website_status": "HIGH",
+      "official_website": "https://tekstina.com/privacy/",
+      "fetched_page_count": 1,
+      "persisted_content_bytes": 117848
+    },
+    {
+      "company_id": 1029,
+      "company_name": "PAMI d.o.o. Nova Gorica",
+      "manifest_position": 97,
+      "website_status": "VERIFIED",
+      "official_website": "https://pami-lascarpa.si/kontakt/",
+      "fetched_page_count": 2,
+      "persisted_content_bytes": 62639
+    },
+    {
+      "company_id": 678,
+      "company_name": "GORIŠKE OPEKARNE d.o.o.",
+      "manifest_position": 62,
+      "website_status": "MEDIUM",
+      "official_website": "https://www.goriske.si/o-podjetju/kje-smo/",
+      "fetched_page_count": 2,
+      "persisted_content_bytes": 71922
+    },
+    {
+      "company_id": 803,
+      "company_name": "PROJEKT d.d. NOVA GORICA",
+      "manifest_position": 79,
+      "website_status": "MEDIUM",
+      "official_website": "https://www.projekt.si/",
+      "fetched_page_count": 7,
+      "persisted_content_bytes": 100531
+    },
+    {
+      "company_id": 739,
+      "company_name": "BUSINESS SOLUTIONS d.o.o.",
+      "manifest_position": 68,
+      "website_status": "HIGH",
+      "official_website": "https://www.b-s.si/kontakt/",
+      "fetched_page_count": 1,
+      "persisted_content_bytes": 84362
+    },
+    {
+      "company_id": 587,
+      "company_name": "GOSTOL-GOPAN d.o.o. Nova Gorica",
+      "manifest_position": 52,
+      "website_status": "MEDIUM",
+      "official_website": "https://gostolgroup.eu/sl/contact/",
+      "fetched_page_count": 1,
+      "persisted_content_bytes": 18814
+    },
+    {
+      "company_id": 572,
+      "company_name": "PIPISTREL d.o.o.",
+      "manifest_position": 50,
+      "website_status": "HIGH",
+      "official_website": "https://www.pipistrel-aircraft.com/sl/contact/",
+      "fetched_page_count": 1,
+      "persisted_content_bytes": 165305
+    },
+    {
+      "company_id": 765,
+      "company_name": "VRC d.o.o.",
+      "manifest_position": 72,
+      "website_status": "VERIFIED",
+      "official_website": "https://www.vrcsprings.com/kontakt/",
+      "fetched_page_count": 1,
+      "persisted_content_bytes": 56698
+    },
+    {
+      "company_id": 55,
+      "company_name": "LOGOS.SI d.o.o.",
+      "manifest_position": 5,
+      "website_status": "VERIFIED",
+      "official_website": "https://www.logos.si/Home/Podjetje/",
+      "fetched_page_count": 2,
+      "persisted_content_bytes": 22950
+    },
+    {
+      "company_id": 910,
+      "company_name": "INOX CENTER d.o.o.",
+      "manifest_position": 90,
+      "website_status": "HIGH",
+      "official_website": "https://inoxcenter.si/kontakt/",
+      "fetched_page_count": 1,
+      "persisted_content_bytes": 315447
+    },
+    {
+      "company_id": 79,
+      "company_name": "LISI d.o.o.",
+      "manifest_position": 22,
+      "website_status": "VERIFIED",
+      "official_website": "http://www.fasaderstvo-fasade.si/kontakt/",
+      "fetched_page_count": 2,
+      "persisted_content_bytes": 86806
+    },
+    {
+      "company_id": 1006,
+      "company_name": "TRONIUS d.o.o.",
+      "manifest_position": 95,
+      "website_status": "HIGH",
+      "official_website": "https://troniusgaming.com/",
+      "fetched_page_count": 5,
+      "persisted_content_bytes": 327649
+    },
+    {
+      "company_id": 761,
+      "company_name": "SGP ZIDGRAD Idrija d.o.o.",
+      "manifest_position": 71,
+      "website_status": "HIGH",
+      "official_website": "https://www.sgpzidgrad.si/kontakt/",
+      "fetched_page_count": 1,
+      "persisted_content_bytes": 18081
+    },
+    {
+      "company_id": 905,
+      "company_name": "KOMUNALA Nova Gorica d.d.",
+      "manifest_position": 89,
+      "website_status": "VERIFIED",
+      "official_website": "https://www.komunala-ng.si/sl/podjetje/informacije-javnega-znacaja/",
+      "fetched_page_count": 1,
+      "persisted_content_bytes": 27255
+    },
+    {
+      "company_id": 945,
+      "company_name": "ROTO INOX d.o.o.",
+      "manifest_position": 91,
+      "website_status": "VERIFIED",
+      "official_website": "https://rotoinox.com/kontakt/",
+      "fetched_page_count": 1,
+      "persisted_content_bytes": 20303
+    },
+    {
+      "company_id": 86,
+      "company_name": "PLANTEA d.o.o.",
+      "manifest_position": 25,
+      "website_status": "HIGH",
+      "official_website": "https://www.gardenvillagebled.com/en/",
+      "fetched_page_count": 5,
+      "persisted_content_bytes": 1264835
+    },
+    {
+      "company_id": 780,
+      "company_name": "BORMIA d.o.o.",
+      "manifest_position": 75,
+      "website_status": "HIGH",
+      "official_website": "https://www.bormiamed.com/en/kontakt/",
+      "fetched_page_count": 1,
+      "persisted_content_bytes": 49271
+    },
+    {
+      "company_id": 766,
+      "company_name": "STEM d.o.o.",
+      "manifest_position": 73,
+      "website_status": "MEDIUM",
+      "official_website": "https://www.stem.si/kontakt/kontakt/",
+      "fetched_page_count": 2,
+      "persisted_content_bytes": 84469
+    },
+    {
+      "company_id": 715,
+      "company_name": "SGG TOLMIN d.o.o.",
+      "manifest_position": 65,
+      "website_status": "HIGH",
+      "official_website": "https://sgg-tolmin.si/",
+      "fetched_page_count": 4,
+      "persisted_content_bytes": 132424
+    }
+  ],
+  "manifest_sha256": "fb011d7fa129b8bc09a02c24bab4f9ae1242e3006e0280551f5499c99de5f00f"
+}

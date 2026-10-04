@@ -1,6 +1,11 @@
 """Deterministic citation, enum, scope and publication gates."""
+import re
 from profile_v1.contracts import CLAIM_TYPES, ENUMS
 from profile_v1.store import encode, uid
+from profile_v1.taxonomy import CATEGORIES, TAXONOMY_VERSION
+
+MANUFACTURING = re.compile(r'\b(manufactur|produc|fabricat|assembl|process|izdel|proizvaj|predel|sestavlj)',re.I)
+INTERNATIONAL = re.compile(r'\b(export|international|foreign|worldwide|global|markets? abroad|izvoz|mednarod|tuj(?:i|ina|ino|em))',re.I)
 
 
 def validate_and_store(store, context, candidates, interpreter_version):
@@ -16,6 +21,7 @@ def validate_and_store(store, context, candidates, interpreter_version):
         elif candidate.confidence not in ('HIGH','MEDIUM','LOW'): reason='INVALID_CONFIDENCE'
         elif not candidate.display_value.strip() or candidate.normalized_value is None: reason='VALUE_REQUIRED'
         elif candidate.claim_type in ENUMS and candidate.normalized_value not in ENUMS[candidate.claim_type]: reason='INVALID_ENUM'
+        elif candidate.claim_type=='INDUSTRY_CATEGORY' and candidate.normalized_value not in CATEGORIES: reason='INVALID_TAXONOMY'
         elif not candidate.citations: reason='EVIDENCE_REQUIRED'
         else:
             for citation in candidate.citations:
@@ -23,6 +29,9 @@ def validate_and_store(store, context, candidates, interpreter_version):
                 if block is None: reason='MISSING_BLOCK'; break
                 if block['source_class']!='FIRST_PARTY': reason='SOURCE_CLASS_NOT_PERMITTED'; break
                 if not citation.quote or citation.quote not in block['text']: reason='FABRICATED_QUOTE'; break
+        quotes=' '.join(c.quote for c in candidate.citations)
+        if not reason and candidate.claim_type=='MANUFACTURER_SIGNAL' and candidate.normalized_value=='YES' and not MANUFACTURING.search(quotes): reason='MANUFACTURER_EVIDENCE_REQUIRED'
+        if not reason and candidate.claim_type=='INTERNATIONAL_SIGNAL' and candidate.normalized_value=='YES' and not INTERNATIONAL.search(quotes): reason='INTERNATIONAL_EVIDENCE_REQUIRED'
         if not reason and candidate.claim_type=='BUSINESS_DESCRIPTION':
             cited={c.block_id for c in candidate.citations}
             if not cited & supported_blocks: reason='DESCRIPTION_REQUIRES_SUPPORTED_CLAIM'
@@ -36,7 +45,8 @@ def validate_and_store(store, context, candidates, interpreter_version):
         store.insert('profile_claims',{**context,'claim_id':claim_id,'claim_type':candidate.claim_type,
             'normalized_value_json':encode(candidate.normalized_value),'display_value':candidate.display_value,
             'confidence':candidate.confidence,'status':status,'ambiguity_note':candidate.ambiguity_note,
-            'rejection_reason':reason,'interpreter_version':interpreter_version})
+            'rejection_reason':reason,'interpreter_version':interpreter_version,
+            'taxonomy_version':TAXONOMY_VERSION})
         if not reason:
             for citation in candidate.citations:
                 store.insert('profile_claim_evidence',{'claim_id':claim_id,'block_id':citation.block_id,'quote':citation.quote})
