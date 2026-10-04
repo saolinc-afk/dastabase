@@ -14,9 +14,9 @@ from discovery_v2.contacts import role, select_default
 from discovery_v2.eligibility import company_eligibility, normalize_legal_name
 from discovery_v2.evidence import EvidenceWriter, phone_value
 from discovery_v2.models import Config
-from discovery_v2.runner import main, run
+from discovery_v2.runner import main, read_ids_file, run
 from discovery_v2.search import (DDGSearch, SUCCESS_WITH_RESULTS, SUCCESS_ZERO_RESULTS,
-                                 SerperAPIError, SerperSearch, default_provider,
+                                 ProviderCircuitOpen, SerperAPIError, SerperSearch, default_provider,
                                  domain_query, queries)
 from discovery_v2.store import Store, digest, encode, read_manifest, snapshot
 
@@ -92,6 +92,19 @@ class FakeSerperSession:
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
         return self.response
+
+
+class SequenceSerperSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        response = self.responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class PhaseATests(unittest.TestCase):
@@ -174,9 +187,10 @@ class PhaseATests(unittest.TestCase):
         zero = SerperSearch('test-key', session=FakeSerperSession({'organic': [], 'credits': 1})).search('nič', 6)
         self.assertEqual(zero.status, SUCCESS_ZERO_RESULTS)
         self.assertEqual(zero.results, ())
-        with self.assertRaises(requests.HTTPError):
-            SerperSearch('test-key', session=FakeSerperSession({'message': 'unavailable'}, 503)).search('test', 6)
-        with self.assertRaisesRegex(SerperAPIError, 'Serper API returned an error'):
+        with self.assertRaisesRegex(SerperAPIError, 'HTTP 503 after 3 attempts'):
+            SerperSearch('test-key', session=FakeSerperSession({'message': 'unavailable'}, 503),
+                         sleeper=lambda _: None).search('test', 6)
+        with self.assertRaisesRegex(ProviderCircuitOpen, 'error payload'):
             SerperSearch('test-key', session=FakeSerperSession({'message': 'quota exhausted'})).search('test', 6)
 
     def test_provider_selection_prefers_configured_serper_and_retains_ddgs(self):
@@ -208,11 +222,14 @@ class PhaseATests(unittest.TestCase):
 
     def test_serper_http_failure_is_recorded_failed_without_secret(self):
         secret = 'failure-secret'
-        provider = SerperSearch(secret, session=FakeSerperSession({'message': 'unavailable'}, 503))
+        provider = SerperSearch(secret, session=FakeSerperSession({'message': 'unavailable'}, 503),
+                                sleeper=lambda _: None)
         self.execute(search=provider, pages={})
         diagnostics = json.loads(self.rows('discovery_attempts')[0]['diagnostics_json'])
         self.assertEqual([q['search_outcome'] for q in diagnostics['queries'][:3]], ['FAILED'] * 3)
         self.assertTrue(all(q['status'] == 'FAILED' for q in diagnostics['queries'][:3]))
+        counts = json.loads(self.rows('discovery_attempts')[0]['request_counts_json'])
+        self.assertEqual((counts['search_calls'], counts['search_provider_requests']), (3, 9))
         self.assertNotIn(secret, encode(diagnostics) + encode(self.rows('discovery_evidence')))
 
     def test_serper_query_cap_stops_escalation_but_processes_first_evidence(self):
@@ -618,6 +635,90 @@ class PhaseATests(unittest.TestCase):
             self.assertEqual(config['max_search_queries_per_company'], 1)
         finally:
             created.close()
+
+    def test_ids_file_preserves_order_and_rejects_bad_manifests(self):
+        conn = sqlite3.connect(self.source)
+        conn.execute('INSERT INTO companies_lite VALUES (2,?,?,?,?,?)',
+                     ('BETA d.o.o.', None, None, None, None))
+        conn.commit()
+        conn.close()
+        ids_file = self.root / 'ids.txt'
+        ids_file.write_text('\n2\n\n1\n', encoding='utf-8')
+        target = self.root / 'ids-file-results.db'
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(['create', '--source', str(self.source), '--results', str(target),
+                '--namespace', 'x', '--ids-file', str(ids_file)]), 0)
+        created = Store(target)
+        try:
+            rows = created.conn.execute('SELECT company_id FROM discovery_run_companies ORDER BY manifest_position').fetchall()
+            self.assertEqual([row[0] for row in rows], [2, 1])
+        finally:
+            created.close()
+        for content, message in (('1\nabc\n', 'Malformed'), ('1\n01\n', 'Duplicate'), ('\n', 'no company')):
+            ids_file.write_text(content, encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, message):
+                read_ids_file(ids_file)
+
+    def test_cli_requires_exactly_one_manifest_source(self):
+        ids_file = self.root / 'ids.txt'
+        ids_file.write_text('1\n', encoding='utf-8')
+        for extra in ([], ['--ids', '1', '--ids-file', str(ids_file)]):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                main(['create', '--source', str(self.source), '--results', str(self.root/'unused.db'),
+                      '--namespace', 'x', *extra])
+            self.assertEqual(raised.exception.code, 2)
+
+    def test_serper_retries_transient_failures_with_bounded_backoff(self):
+        session = SequenceSerperSession([
+            json_response({}, 429), json_response({}, 503),
+            json_response({'organic': []}, 200)])
+        sleeps = []
+        provider = SerperSearch('secret', session=session, sleeper=sleeps.append,
+                                clock=lambda: 0.0)
+        result = provider.search('query', 10)
+        self.assertEqual(result.status, SUCCESS_ZERO_RESULTS)
+        self.assertEqual(provider.request_count, 3)
+        self.assertEqual(len(session.calls), 3)
+        self.assertIn(1.0, sleeps)
+        self.assertIn(2.0, sleeps)
+        self.assertNotIn('secret', repr(sleeps))
+
+    def test_serper_circuit_opens_after_sustained_transient_failures(self):
+        session = SequenceSerperSession([json_response({}, 429) for _ in range(15)])
+        provider = SerperSearch('secret', session=session, sleeper=lambda _: None,
+                                clock=lambda: 0.0)
+        for _ in range(4):
+            with self.assertRaises(SerperAPIError):
+                provider.search('query', 10)
+        with self.assertRaisesRegex(ProviderCircuitOpen, '5 consecutive') as raised:
+            provider.search('query', 10)
+        self.assertEqual(provider.request_count, 15)
+        self.assertNotIn('secret', str(raised.exception))
+
+    def test_serper_permanent_error_opens_circuit_without_retry(self):
+        session = SequenceSerperSession([json_response({}, 401)])
+        provider = SerperSearch('secret', session=session, sleeper=lambda _: None,
+                                clock=lambda: 0.0)
+        with self.assertRaisesRegex(ProviderCircuitOpen, 'permanent provider error'):
+            provider.search('query', 10)
+        self.assertEqual(provider.request_count, 1)
+
+    def test_open_circuit_interrupts_current_company_and_stops_run(self):
+        conn = sqlite3.connect(self.source)
+        conn.execute('INSERT INTO companies_lite VALUES (2,?,?,?,?,?)',
+                     ('BETA d.o.o.', None, None, None, None))
+        conn.commit()
+        conn.close()
+        run_id = self.create(ids=(1, 2))
+        with patch('discovery_v2.runner.discover', side_effect=ProviderCircuitOpen('safe failure')):
+            with self.assertRaises(ProviderCircuitOpen):
+                run(self.store, run_id, provider=FakeSearch())
+        attempts = self.rows('discovery_attempts')
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0]['status'], 'INTERRUPTED')
+        companies = self.store.conn.execute('SELECT company_id,status FROM discovery_run_companies ORDER BY manifest_position').fetchall()
+        self.assertEqual([tuple(row) for row in companies], [(1, 'PENDING'), (2, 'PENDING')])
+        self.assertEqual(self.store.conn.execute('SELECT status FROM discovery_runs WHERE run_id=?', (run_id,)).fetchone()[0], 'PARTIAL')
 
     def test_invalid_manifest_and_config(self):
         for ids in ([], [1, 1], [999], [-1]):

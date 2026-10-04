@@ -1,6 +1,7 @@
 """Serial, bounded DISCOVERY_CONTACTS execution with durable run-local resume."""
 import argparse
 import json
+from pathlib import Path
 import sqlite3
 
 from bs4 import BeautifulSoup
@@ -17,7 +18,7 @@ from discovery_v2.interfaces import RecordingFetcher, VERIFIER_VERSION, evaluate
 from discovery_v2.ownership import validate_assessment, usable
 from discovery_v2.models import Config, EXECUTION_MODE, JOB_TYPE
 from discovery_v2.search import (DOMAIN_CONTACT, default_provider, domain_query, queries,
-                                 successful)
+                                 ProviderCircuitOpen, successful)
 from discovery_v2.search_resolver import (RESOLVED, assessment_from_resolution,
                                            resolve_search_evidence)
 from discovery_v2.store import Store, encode, now, read_manifest
@@ -30,7 +31,7 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
     diagnostics = {'queries': [dict(query_type=kind, query_text=query, provider=provider.name, status='PENDING')
                                for kind, query in planned] + [dict(query_type=DOMAIN_CONTACT, status='PENDING')],
                    'website_candidates': [], 'verifier_version': VERIFIER_VERSION}
-    counts = {'search_calls': 0, 'http_requests': 0}
+    counts = {'search_calls': 0, 'search_provider_requests': 0, 'http_requests': 0}
 
     def checkpoint():
         counts['http_requests'] = fetcher.requests
@@ -42,6 +43,7 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
         entry = next(q for q in diagnostics['queries'] if q['query_type'] == query_type)
         entry.update(query_text=query_text, provider=provider.name, status='RUNNING')
         entry.pop('reason', None)
+        provider_count_before = getattr(provider, 'request_count', None)
         counts['search_calls'] += 1
         checkpoint()
         try:
@@ -56,9 +58,17 @@ def discover(store, context, company, config, provider, fetcher_factory, evaluat
                                      position if isinstance(position, int) and position > 0 else rank)
             entry.update(status='COMPLETED', search_outcome=outcome.status,
                          result_count=min(len(results), config.results_per_query))
+        except ProviderCircuitOpen as exc:
+            entry.update(status='FAILED', search_outcome='FAILED', error=f'{type(exc).__name__}: {exc}')
+            raise
         except Exception as exc:
             entry.update(status='FAILED', search_outcome='FAILED', error=f'{type(exc).__name__}: {exc}')
-        checkpoint()
+        finally:
+            provider_count_after = getattr(provider, 'request_count', None)
+            if (type(provider_count_before) is int and type(provider_count_after) is int
+                    and provider_count_after >= provider_count_before):
+                counts['search_provider_requests'] += provider_count_after - provider_count_before
+            checkpoint()
 
     selected = None
     evaluated = set()
@@ -268,12 +278,15 @@ def run(store, run_id, *, max_items=None, batch_size=100, provider=None,
                         with store.conn:
                             data = json.loads(store.conn.execute('SELECT diagnostics_json FROM discovery_attempts WHERE attempt_id=?', (attempt_id,)).fetchone()[0])
                             data['error'] = f'{type(exc).__name__}: {exc}'
-                            status = 'FAILED' if isinstance(exc, Exception) else 'INTERRUPTED'
+                            interrupted = isinstance(exc, ProviderCircuitOpen) or not isinstance(exc, Exception)
+                            status = 'INTERRUPTED' if interrupted else 'FAILED'
                             store.conn.execute('UPDATE discovery_attempts SET status=?,finished_at=?,diagnostics_json=? WHERE attempt_id=?',
                                                (status, now(), encode(data), attempt_id))
-                            store.conn.execute("UPDATE discovery_run_companies SET status='FAILED' WHERE run_id=? AND company_id=?", (run_id, row['company_id']))
-                        failures += 1
-                        if not isinstance(exc, Exception):
+                            company_status = 'PENDING' if interrupted else 'FAILED'
+                            store.conn.execute('UPDATE discovery_run_companies SET status=? WHERE run_id=? AND company_id=?',
+                                               (company_status, run_id, row['company_id']))
+                        failures += not interrupted
+                        if interrupted:
                             raise
                     processed += 1
         finally:
@@ -286,6 +299,26 @@ def run(store, run_id, *, max_items=None, batch_size=100, provider=None,
                 'status': 'PARTIAL' if remaining else 'COMPLETED'}
 
 
+def read_ids_file(path):
+    """Read a strict, ordered, one-ID-per-line manifest."""
+    ids = []
+    seen = set()
+    for line_number, raw in enumerate(Path(path).read_text(encoding='utf-8').splitlines(), 1):
+        value = raw.strip()
+        if not value:
+            continue
+        if not value.isascii() or not value.isdecimal():
+            raise ValueError(f'Malformed company ID at {path}:{line_number}')
+        company_id = int(value)
+        if company_id in seen:
+            raise ValueError(f'Duplicate company ID {company_id} at {path}:{line_number}')
+        seen.add(company_id)
+        ids.append(company_id)
+    if not ids:
+        raise ValueError('ID file contains no company IDs')
+    return ids
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
@@ -293,7 +326,9 @@ def main(argv=None):
     create.add_argument('--source', required=True)
     create.add_argument('--namespace', required=True)
     create.add_argument('--results', required=True)
-    create.add_argument('--ids', required=True, help='Comma-separated explicit source company IDs')
+    manifest = create.add_mutually_exclusive_group(required=True)
+    manifest.add_argument('--ids', help='Comma-separated explicit source company IDs')
+    manifest.add_argument('--ids-file', help='UTF-8 file with one source company ID per line')
     create.add_argument('--job-type', choices=[JOB_TYPE], default=JOB_TYPE)
     create.add_argument('--execution-mode', choices=[EXECUTION_MODE], default=EXECUTION_MODE)
     create.add_argument('--use-municipality', action='store_true')
@@ -312,7 +347,8 @@ def main(argv=None):
     store = None
     try:
         if args.command == 'create':
-            descriptor, companies = read_manifest(args.source, [int(i) for i in args.ids.split(',')], args.namespace)
+            ids = read_ids_file(args.ids_file) if args.ids_file else [int(i) for i in args.ids.split(',')]
+            descriptor, companies = read_manifest(args.source, ids, args.namespace)
             store = Store(args.results, source=args.source, create=True)
             config = Config(use_municipality=args.use_municipality,
                 max_search_queries_per_company=args.max_search_queries_per_company)
@@ -325,6 +361,8 @@ def main(argv=None):
             result = replay(args.source_results, args.source_run_id, args.results)
         print(encode(result))
         return 1 if result.get('failed') or result.get('partial') else 0
+    except ProviderCircuitOpen as exc:
+        parser.exit(1, f'error: {exc}\n')
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.exit(2, f'error: {exc}\n')
     finally:

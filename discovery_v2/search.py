@@ -1,6 +1,7 @@
 """Search providers and scheduled evidence acquisition."""
 from dataclasses import dataclass
 import os
+import time
 
 import requests
 
@@ -17,6 +18,14 @@ FAILED = 'FAILED'
 
 class SerperAPIError(RuntimeError):
     """A sanitized Serper response error safe for attempt diagnostics."""
+
+
+class ProviderCircuitOpen(RuntimeError):
+    """Stop a run after sustained transient or permanent provider failure."""
+
+
+class SerperTransientError(SerperAPIError):
+    """A bounded-retry Serper failure with no credentials in its message."""
 
 
 @dataclass(frozen=True)
@@ -69,26 +78,71 @@ class SerperSearch:
     name = 'serper'
     staged = True
     endpoint = 'https://google.serper.dev/search'
+    pacing_seconds = 0.5
+    retry_delays = (1.0, 2.0)
+    circuit_failure_threshold = 5
 
-    def __init__(self, api_key, session=None):
+    def __init__(self, api_key, session=None, *, sleeper=time.sleep, clock=time.monotonic):
         if not api_key:
             raise ValueError('SERPER_API_KEY is required for Serper')
         self._api_key = api_key
         self._session = session or requests.Session()
+        self._sleep = sleeper
+        self._clock = clock
+        self._last_request_at = None
+        self._consecutive_failures = 0
+        self.request_count = 0
+
+    def _pace(self):
+        if self._last_request_at is not None:
+            remaining = self.pacing_seconds - (self._clock() - self._last_request_at)
+            if remaining > 0:
+                self._sleep(remaining)
+        self._last_request_at = self._clock()
+
+    def _failed(self, message, *, permanent=False):
+        self._consecutive_failures += 1
+        if permanent or self._consecutive_failures >= self.circuit_failure_threshold:
+            reason = 'permanent provider error' if permanent else (
+                f'{self._consecutive_failures} consecutive exhausted transient queries')
+            raise ProviderCircuitOpen(f'Serper circuit breaker opened: {reason}; last error: {message}')
+        raise SerperTransientError(message)
 
     def search(self, query, max_results):
-        response = self._session.post(self.endpoint,
-            headers={'X-API-KEY': self._api_key, 'Content-Type': 'application/json'},
-            json={'q': query, 'gl': 'si', 'hl': 'sl', 'num': 10}, timeout=15)
-        response.raise_for_status()
-        payload = response.json()
+        response = None
+        for attempt in range(len(self.retry_delays) + 1):
+            self._pace()
+            self.request_count += 1
+            try:
+                response = self._session.post(self.endpoint,
+                    headers={'X-API-KEY': self._api_key, 'Content-Type': 'application/json'},
+                    json={'q': query, 'gl': 'si', 'hl': 'sl', 'num': 10}, timeout=15)
+            except requests.RequestException as exc:
+                if attempt < len(self.retry_delays):
+                    self._sleep(self.retry_delays[attempt])
+                    continue
+                return self._failed(f'transport failure after {attempt + 1} attempts ({type(exc).__name__})')
+            status = response.status_code
+            if status in (408, 425, 429) or 500 <= status <= 599:
+                if attempt < len(self.retry_delays):
+                    self._sleep(self.retry_delays[attempt])
+                    continue
+                return self._failed(f'HTTP {status} after {attempt + 1} attempts')
+            if status >= 400:
+                return self._failed(f'HTTP {status}', permanent=True)
+            break
+        try:
+            payload = response.json()
+        except (ValueError, requests.JSONDecodeError):
+            return self._failed('invalid JSON response')
         if not isinstance(payload, dict):
-            raise SerperAPIError('Invalid Serper response')
+            return self._failed('invalid response object')
         if 'error' in payload or ('message' in payload and 'organic' not in payload):
-            raise SerperAPIError('Serper API returned an error')
+            return self._failed('provider returned an error payload', permanent=True)
         organic = payload.get('organic') or []
         if not isinstance(organic, list):
-            raise ValueError('Invalid Serper response: organic must be a list')
+            return self._failed('invalid organic results payload')
+        self._consecutive_failures = 0
         results = []
         for sequence, item in enumerate(organic[:max_results], 1):
             if not isinstance(item, dict):

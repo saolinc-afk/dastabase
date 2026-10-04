@@ -74,10 +74,26 @@ For a credit-capped Serper validation, add the immutable run setting at creation
 
 The cap counts search API calls per company. It does not reduce website or contact
 page fetch budgets. Omit it to retain normal staged escalation.
-There is no implicit “all companies” selection; `--ids` is mandatory at creation.
-Several IDs use `--ids 1,2,3`. Larger manifests are processed serially in chunks
+There is no implicit “all companies” selection; an explicit manifest is mandatory.
+Several IDs can use `--ids 1,2,3`. Larger manifests are processed serially in chunks
 (`--batch-size 100`, maximum 200); a 500-company job does not require one transaction
 or one in-memory working set for all evidence.
+
+For production manifests, `--ids-file PATH` accepts one nonnegative company ID per
+UTF-8 line. Blank lines are ignored, file order becomes manifest order, and malformed
+or duplicate IDs fail before the result database is created. `--ids` and `--ids-file`
+are mutually exclusive and one is required. The existing frozen identity manifest
+and its hash remain the authoritative persisted run input; the external file is not
+needed to resume.
+
+Serper calls are paced at no more than two request attempts per second. HTTP 408,
+425, 429 and 5xx responses, plus request transport failures, receive at most two
+retries after 1 and 2 seconds. Five consecutive queries that exhaust those retries
+open a run-wide circuit breaker. Other HTTP errors and explicit provider error
+payloads open it immediately without retry. The current attempt becomes INTERRUPTED,
+its company returns to PENDING, the run becomes PARTIAL, and the worker exits; a
+later `resume` starts a new attempt. `request_counts_json.search_calls` counts logical
+queries and `search_provider_requests` counts actual Serper HTTP request attempts.
 
 Resume the same manifest, skipping only successfully committed companies:
 
