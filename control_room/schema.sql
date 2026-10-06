@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS control_jobs (
     job_id TEXT NOT NULL UNIQUE,
     display_name TEXT NOT NULL,
     input_kind TEXT NOT NULL CHECK(input_kind IN ('FAKE','UPLOAD','DASTABASE_SELECTION')),
-    module TEXT NOT NULL CHECK(module='DISCOVERY_CONTACTS'),
+    module TEXT NOT NULL CHECK(module IN ('DISCOVERY_CONTACTS','IMPORT_ENRICH')),
     status TEXT NOT NULL CHECK(status IN (
         'DRAFT','REVIEW_REQUIRED','QUEUED','STARTING','RUNNING',
         'EXPORTING','COMPLETED','PARTIAL','FAILED')),
@@ -22,12 +22,19 @@ CREATE TABLE IF NOT EXISTS control_jobs (
     phones_found INTEGER NOT NULL DEFAULT 0 CHECK(phones_found >= 0),
     error_code TEXT,
     error_message TEXT,
-    execution_adapter TEXT NOT NULL DEFAULT 'FAKE' CHECK(execution_adapter IN ('FAKE','DISCOVERY_V2')),
+    execution_adapter TEXT NOT NULL DEFAULT 'FAKE' CHECK(execution_adapter IN ('FAKE','DISCOVERY_V2','IMPORT_ENRICH')),
     discovery_run_id TEXT,
     completed_company_count INTEGER NOT NULL DEFAULT 0,
     partial_company_count INTEGER NOT NULL DEFAULT 0,
     failed_company_count INTEGER NOT NULL DEFAULT 0,
     ineligible_company_count INTEGER NOT NULL DEFAULT 0,
+    progress_stage TEXT,
+    import_total_rows INTEGER NOT NULL DEFAULT 0,
+    import_matched_count INTEGER NOT NULL DEFAULT 0,
+    import_ambiguous_count INTEGER NOT NULL DEFAULT 0,
+    import_unresolved_count INTEGER NOT NULL DEFAULT 0,
+    import_resolved_without_ai_count INTEGER NOT NULL DEFAULT 0,
+    import_matched_requires_enrichment_count INTEGER NOT NULL DEFAULT 0,
     CHECK(processed_company_count <= selected_company_count)
 );
 
@@ -103,6 +110,19 @@ CREATE TABLE IF NOT EXISTS job_items (
     match_status TEXT NOT NULL,
     match_method TEXT,
     selected INTEGER NOT NULL CHECK(selected IN (0,1)),
+    processing_status TEXT NOT NULL DEFAULT 'PENDING' CHECK(processing_status IN ('PENDING','COMPLETED')),
+    match_evidence_json TEXT NOT NULL DEFAULT '[]',
+    conflicts_json TEXT NOT NULL DEFAULT '[]',
+    route_hint TEXT,
+    reusable_enrichment INTEGER NOT NULL DEFAULT 0 CHECK(reusable_enrichment IN (0,1)),
+    ai_eligibility TEXT NOT NULL DEFAULT 'NOT_EVALUATED',
+    ai_status TEXT NOT NULL DEFAULT 'NOT_STARTED',
+    estimated_input_tokens INTEGER,
+    estimated_output_tokens INTEGER,
+    estimated_cost REAL,
+    actual_input_tokens INTEGER,
+    actual_output_tokens INTEGER,
+    actual_cost REAL,
     PRIMARY KEY(job_id,item_position),
     FOREIGN KEY(upload_id,upload_row_number) REFERENCES upload_rows(upload_id,row_number)
 );
@@ -128,6 +148,8 @@ ON job_events(job_id, sequence DESC);
 CREATE INDEX IF NOT EXISTS upload_rows_status ON upload_rows(upload_id,match_status,row_number);
 CREATE INDEX IF NOT EXISTS match_candidates_row ON match_candidates(upload_id,row_number,rank);
 CREATE INDEX IF NOT EXISTS job_items_job ON job_items(job_id,item_position);
+CREATE INDEX IF NOT EXISTS job_items_processing ON job_items(job_id,processing_status,item_position);
+CREATE INDEX IF NOT EXISTS job_items_company ON job_items(job_id,company_id,match_status);
 CREATE INDEX IF NOT EXISTS job_artifacts_job ON job_artifacts(job_id,artifact_type);
 
-PRAGMA user_version=3;
+PRAGMA user_version=4;

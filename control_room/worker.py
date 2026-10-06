@@ -40,8 +40,12 @@ class Worker:
         heartbeat = threading.Thread(target=self._heartbeat, args=(stop,), daemon=True)
         heartbeat.start()
         try:
+            started_code = {
+                'FAKE': 'FAKE_STARTED', 'DISCOVERY_V2': 'DISCOVERY_STARTED',
+                'IMPORT_ENRICH': 'IMPORT_ENRICH_STARTED',
+            }.get(job['execution_adapter'], 'ENRICHMENT_STARTED')
             job = self.repository.transition(job['job_id'], 'RUNNING', worker_id=self.worker_id,
-                event_code='FAKE_STARTED' if job['execution_adapter'] == 'FAKE' else 'DISCOVERY_STARTED',
+                event_code=started_code,
                 event_message=f'{job["execution_adapter"]} enrichment started')
             adapter = self.adapters.get(job['execution_adapter'])
             if adapter is None:
@@ -97,9 +101,14 @@ def main(argv=None):
     try:
         fake = FakeEnrichmentAdapter(args.fake_delay)
         from control_room.discovery_adapter import DiscoveryV2JobAdapter
+        from control_room.import_enrich_adapter import ImportEnrichAdapter
         discovery = DiscoveryV2JobAdapter(repository,args.storage_root,args.canonical,
                                            max_companies=args.real_discovery_max_companies)
-        Worker(repository,fake,adapters={'FAKE':fake,'DISCOVERY_V2':discovery}).run_forever(args.poll_interval)
+        result_paths = tuple(filter(None, os.environ.get(
+            'CONTROL_ROOM_IMPORT_DISCOVERY_RESULTS', '').split(os.pathsep)))
+        import_enrich = ImportEnrichAdapter(repository, args.canonical, result_paths)
+        Worker(repository,fake,adapters={'FAKE':fake,'DISCOVERY_V2':discovery,
+            'IMPORT_ENRICH':import_enrich}).run_forever(args.poll_interval)
     except KeyboardInterrupt:
         return 0
     return 0

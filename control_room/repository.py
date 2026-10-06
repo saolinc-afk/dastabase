@@ -19,11 +19,12 @@ class JobRepository:
     def initialize(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._migrate_job_limit()
+        self._migrate_import_enrich()
         conn = self._connect()
         try:
             conn.executescript(Path(__file__).with_name('schema.sql').read_text())
             self._migrate_adapter_columns(conn)
-            conn.execute('PRAGMA user_version=3')
+            conn.execute('PRAGMA user_version=4')
         finally:
             conn.close()
 
@@ -37,10 +38,95 @@ class JobRepository:
             'partial_company_count': 'INTEGER NOT NULL DEFAULT 0',
             'failed_company_count': 'INTEGER NOT NULL DEFAULT 0',
             'ineligible_company_count': 'INTEGER NOT NULL DEFAULT 0',
+            'progress_stage': 'TEXT',
+            'import_total_rows': 'INTEGER NOT NULL DEFAULT 0',
+            'import_matched_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_ambiguous_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_unresolved_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_resolved_without_ai_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_matched_requires_enrichment_count': 'INTEGER NOT NULL DEFAULT 0',
         }
         for name, definition in additions.items():
             if name not in columns:
                 conn.execute(f'ALTER TABLE control_jobs ADD COLUMN {name} {definition}')
+
+    def _migrate_import_enrich(self):
+        """Expand existing Control Room tables without replacing their queue."""
+        if not self.path.exists():
+            return
+        conn = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+        try:
+            job_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='control_jobs'"
+            ).fetchone()
+            if job_sql and ('IMPORT_ENRICH' not in (job_sql[0] or '') or
+                            'import_total_rows' not in {row[1] for row in
+                                conn.execute('PRAGMA table_info(control_jobs)')}):
+                conn.execute('PRAGMA foreign_keys=OFF')
+                conn.execute('BEGIN IMMEDIATE')
+                conn.execute('''CREATE TABLE control_jobs_import_v4 (
+                    job_number INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL,
+                    input_kind TEXT NOT NULL CHECK(input_kind IN ('FAKE','UPLOAD','DASTABASE_SELECTION')),
+                    module TEXT NOT NULL CHECK(module IN ('DISCOVERY_CONTACTS','IMPORT_ENRICH')),
+                    status TEXT NOT NULL CHECK(status IN ('DRAFT','REVIEW_REQUIRED','QUEUED','STARTING',
+                        'RUNNING','EXPORTING','COMPLETED','PARTIAL','FAILED')),
+                    created_at TEXT NOT NULL, queued_at TEXT, started_at TEXT, finished_at TEXT,
+                    worker_id TEXT, worker_heartbeat_at TEXT,
+                    selected_company_count INTEGER NOT NULL CHECK(selected_company_count BETWEEN 1 AND 5000),
+                    processed_company_count INTEGER NOT NULL DEFAULT 0 CHECK(processed_company_count >= 0),
+                    emails_found INTEGER NOT NULL DEFAULT 0 CHECK(emails_found >= 0),
+                    websites_found INTEGER NOT NULL DEFAULT 0 CHECK(websites_found >= 0),
+                    phones_found INTEGER NOT NULL DEFAULT 0 CHECK(phones_found >= 0),
+                    error_code TEXT, error_message TEXT,
+                    execution_adapter TEXT NOT NULL DEFAULT 'FAKE'
+                        CHECK(execution_adapter IN ('FAKE','DISCOVERY_V2','IMPORT_ENRICH')),
+                    discovery_run_id TEXT, completed_company_count INTEGER NOT NULL DEFAULT 0,
+                    partial_company_count INTEGER NOT NULL DEFAULT 0,
+                    failed_company_count INTEGER NOT NULL DEFAULT 0,
+                    ineligible_company_count INTEGER NOT NULL DEFAULT 0,
+                    progress_stage TEXT, import_total_rows INTEGER NOT NULL DEFAULT 0,
+                    import_matched_count INTEGER NOT NULL DEFAULT 0,
+                    import_ambiguous_count INTEGER NOT NULL DEFAULT 0,
+                    import_unresolved_count INTEGER NOT NULL DEFAULT 0,
+                    import_resolved_without_ai_count INTEGER NOT NULL DEFAULT 0,
+                    import_matched_requires_enrichment_count INTEGER NOT NULL DEFAULT 0,
+                    CHECK(processed_company_count <= selected_company_count))''')
+                source = [row[1] for row in conn.execute('PRAGMA table_info(control_jobs)')]
+                target = {row[1] for row in conn.execute('PRAGMA table_info(control_jobs_import_v4)')}
+                columns = ','.join(name for name in source if name in target)
+                conn.execute(f'INSERT INTO control_jobs_import_v4({columns}) '
+                             f'SELECT {columns} FROM control_jobs')
+                conn.execute('DROP TABLE control_jobs')
+                conn.execute('ALTER TABLE control_jobs_import_v4 RENAME TO control_jobs')
+                conn.commit()
+            item_sql = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='job_items'"
+            ).fetchone()
+            if item_sql:
+                columns = {row[1] for row in conn.execute('PRAGMA table_info(job_items)')}
+                additions = {
+                    'processing_status': "TEXT NOT NULL DEFAULT 'PENDING' CHECK(processing_status IN ('PENDING','COMPLETED'))",
+                    'match_evidence_json': "TEXT NOT NULL DEFAULT '[]'",
+                    'conflicts_json': "TEXT NOT NULL DEFAULT '[]'",
+                    'route_hint': 'TEXT',
+                    'reusable_enrichment': 'INTEGER NOT NULL DEFAULT 0 CHECK(reusable_enrichment IN (0,1))',
+                    'ai_eligibility': "TEXT NOT NULL DEFAULT 'NOT_EVALUATED'",
+                    'ai_status': "TEXT NOT NULL DEFAULT 'NOT_STARTED'",
+                    'estimated_input_tokens': 'INTEGER', 'estimated_output_tokens': 'INTEGER',
+                    'estimated_cost': 'REAL', 'actual_input_tokens': 'INTEGER',
+                    'actual_output_tokens': 'INTEGER', 'actual_cost': 'REAL',
+                }
+                for name, definition in additions.items():
+                    if name not in columns:
+                        conn.execute(f'ALTER TABLE job_items ADD COLUMN {name} {definition}')
+            conn.execute('PRAGMA user_version=4')
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _migrate_job_limit(self):
         """Expand the v1 job bound without discarding existing jobs/events."""
@@ -324,11 +410,177 @@ class JobRepository:
         finally:
             conn.close()
 
+    def create_import_enrich_job(self, upload_id, display_name, mapping):
+        """Snapshot every registration row into the existing durable job queue."""
+        name = str(display_name or '').strip()
+        if not 1 <= len(name) <= 120:
+            raise ValueError('Job name must be between 1 and 120 characters')
+        mapping = dict(mapping or {})
+        conn = self._connect()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            upload = conn.execute('SELECT * FROM uploads WHERE upload_id=?',
+                                  (upload_id,)).fetchone()
+            if not upload or upload['status'] not in ('MAPPING', 'REVIEW'):
+                raise ValueError('Upload is not available for Import & Enrich')
+            headers = json.loads(upload['headers_json'])
+            used = [value for value in mapping.values() if value is not None]
+            if (any(type(value) is not int or not 0 <= value < len(headers) for value in used)
+                    or len(used) != len(set(used))):
+                raise ValueError('Invalid or duplicate registration column mapping')
+            rows = conn.execute('SELECT * FROM upload_rows WHERE upload_id=? ORDER BY row_number',
+                                (upload_id,)).fetchall()
+            if not rows:
+                raise ValueError('Upload has no registration rows')
+            job_id = uuid.uuid4().hex
+            created = now()
+            conn.execute('''INSERT INTO control_jobs(job_id,display_name,input_kind,module,status,
+                created_at,queued_at,selected_company_count,execution_adapter,progress_stage,
+                import_total_rows) VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                (job_id, name, 'UPLOAD', 'IMPORT_ENRICH', 'QUEUED', created, created,
+                 len(rows), 'IMPORT_ENRICH', 'PARSING', len(rows)))
+            for position, row in enumerate(rows, 1):
+                conn.execute('''INSERT INTO job_items(job_id,item_position,upload_id,
+                    upload_row_number,company_id,match_status,match_method,selected,
+                    processing_status) VALUES (?,?,?,?,NULL,'PENDING',NULL,0,'PENDING')''',
+                    (job_id, position, upload_id, row['row_number']))
+            conn.execute("UPDATE uploads SET mapping_json=?,status='CONFIRMED' WHERE upload_id=?",
+                         (json.dumps(mapping, sort_keys=True, separators=(',', ':')), upload_id))
+            self._event(conn, job_id, 'IMPORT_ENRICH_QUEUED',
+                        'Import & Enrich matching queued', details={
+                            'upload_id': upload_id, 'total_rows': len(rows)})
+            conn.commit()
+            return self.get_job(job_id)
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def pending_import_items(self, job_id):
+        conn = self._connect()
+        try:
+            rows = []
+            query = '''SELECT i.*,u.headers_json,u.mapping_json,r.original_values_json
+                FROM job_items i JOIN uploads u ON u.upload_id=i.upload_id
+                JOIN upload_rows r ON r.upload_id=i.upload_id
+                  AND r.row_number=i.upload_row_number
+                WHERE i.job_id=? AND i.processing_status='PENDING'
+                ORDER BY i.item_position'''
+            for stored in conn.execute(query, (job_id,)):
+                item = dict(stored)
+                item['headers'] = json.loads(item.pop('headers_json'))
+                item['mapping'] = json.loads(item.pop('mapping_json'))
+                item['original_values'] = json.loads(item.pop('original_values_json'))
+                rows.append(item)
+            return rows
+        finally:
+            conn.close()
+
+    def set_import_stage(self, job_id, stage, worker_id):
+        allowed = {'PARSING', 'MATCHING', 'EXISTING_ENRICHMENT', 'DISCOVERY',
+                   'AI_PREFLIGHT', 'AI_ENRICHMENT', 'EXPORT'}
+        if stage not in allowed:
+            raise ValueError('Invalid Import & Enrich progress stage')
+        conn = self._connect()
+        try:
+            updated = conn.execute('''UPDATE control_jobs SET progress_stage=?,worker_id=?,
+                worker_heartbeat_at=? WHERE job_id=? AND module='IMPORT_ENRICH'
+                AND status='RUNNING' ''', (stage, worker_id, now(), job_id)).rowcount
+            if updated != 1:
+                raise ValueError('Import stage requires a running IMPORT_ENRICH job')
+        finally:
+            conn.close()
+
+    def complete_import_item(self, job_id, item_position, match, worker_id):
+        """Checkpoint one row and recompute the job summary in one transaction."""
+        evidence = [dict(item) for item in match.as_dict()['evidence']]
+        conn = self._connect()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            job = conn.execute('SELECT * FROM control_jobs WHERE job_id=?',
+                               (job_id,)).fetchone()
+            if not job or job['module'] != 'IMPORT_ENRICH' or job['status'] != 'RUNNING':
+                raise ValueError('Import match requires a running IMPORT_ENRICH job')
+            updated = conn.execute('''UPDATE job_items SET processing_status='COMPLETED',
+                company_id=?,match_status=?,match_method=?,selected=?,match_evidence_json=?,
+                conflicts_json=?,route_hint=?,reusable_enrichment=?,ai_eligibility=?
+                WHERE job_id=? AND item_position=? AND processing_status='PENDING' ''',
+                (match.company_id, match.outcome, match.match_method,
+                 int(match.outcome == 'MATCHED'),
+                 json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
+                 json.dumps(list(match.conflicts), ensure_ascii=False, separators=(',', ':')),
+                 match.route_hint, int(match.has_reusable_enrichment), match.ai_eligibility,
+                 job_id, item_position)).rowcount
+            if updated == 0:
+                # A replayed checkpoint is safe only when the item is already complete.
+                existing = conn.execute('''SELECT processing_status FROM job_items
+                    WHERE job_id=? AND item_position=?''', (job_id, item_position)).fetchone()
+                if not existing:
+                    raise ValueError('Unknown Import & Enrich job item')
+            summary = self._import_summary_conn(conn, job_id)
+            conn.execute('''UPDATE control_jobs SET processed_company_count=?,progress_stage='MATCHING',
+                import_matched_count=?,import_ambiguous_count=?,import_unresolved_count=?,
+                import_resolved_without_ai_count=?,import_matched_requires_enrichment_count=?,
+                worker_id=?,worker_heartbeat_at=? WHERE job_id=?''',
+                (summary['processed_rows'], summary['matched'], summary['ambiguous'],
+                 summary['unresolved'], summary['resolved_without_ai'],
+                 summary['matched_requires_enrichment'], worker_id, now(), job_id))
+            conn.commit()
+            return summary
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _import_summary_conn(conn, job_id):
+        counts = {row['match_status']: row['count'] for row in conn.execute('''
+            SELECT match_status,COUNT(*) count FROM job_items
+            WHERE job_id=? AND processing_status='COMPLETED' GROUP BY match_status''', (job_id,))}
+        routes = {row['route_hint']: row['count'] for row in conn.execute('''
+            SELECT route_hint,COUNT(*) count FROM job_items
+            WHERE job_id=? AND processing_status='COMPLETED' GROUP BY route_hint''', (job_id,))}
+        total = conn.execute('SELECT COUNT(*) FROM job_items WHERE job_id=?',
+                             (job_id,)).fetchone()[0]
+        processed = sum(counts.values())
+        return {'total_rows': total, 'processed_rows': processed,
+                'matched': counts.get('MATCHED', 0),
+                'ambiguous': counts.get('AMBIGUOUS', 0),
+                'unresolved': counts.get('UNRESOLVED', 0),
+                'resolved_without_ai': routes.get('RESOLVED_WITHOUT_AI', 0),
+                'matched_requires_enrichment': routes.get('MATCHED_REQUIRES_ENRICHMENT', 0)}
+
+    def import_summary(self, job_id):
+        conn = self._connect()
+        try:
+            return self._import_summary_conn(conn, job_id)
+        finally:
+            conn.close()
+
+    def import_enrichment_company_ids(self, job_id):
+        """Distinct future fan-out; registration job items remain undeduplicated."""
+        conn = self._connect()
+        try:
+            return [row[0] for row in conn.execute('''SELECT DISTINCT company_id FROM job_items
+                WHERE job_id=? AND processing_status='COMPLETED' AND match_status='MATCHED'
+                  AND company_id IS NOT NULL AND route_hint='MATCHED_REQUIRES_ENRICHMENT'
+                ORDER BY company_id''', (job_id,))]
+        finally:
+            conn.close()
+
     def job_items(self, job_id):
         conn = self._connect()
         try:
-            return [dict(row) for row in conn.execute(
-                'SELECT * FROM job_items WHERE job_id=? ORDER BY item_position',(job_id,))]
+            result = []
+            for row in conn.execute(
+                    'SELECT * FROM job_items WHERE job_id=? ORDER BY item_position',(job_id,)):
+                item = dict(row)
+                item['match_evidence'] = json.loads(item['match_evidence_json'])
+                item['conflicts'] = json.loads(item['conflicts_json'])
+                result.append(item)
+            return result
         finally:
             conn.close()
 
