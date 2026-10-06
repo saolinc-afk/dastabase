@@ -63,6 +63,8 @@ class EnrichmentIndex:
             'website': None, 'website_status': None, 'default_email': None,
             'default_phone': None, 'sources': [], 'provenance': []}
             for company in self.companies}
+        self.historical_domain_candidates = defaultdict(set)
+        self.historical_email_candidates = defaultdict(set)
         self._load_sparrow()
         self._load_discovery(precedence, run_ids or {})
         self._build_indexes()
@@ -100,6 +102,13 @@ class EnrichmentIndex:
             _require(_columns(conn, 'email_discovery'), SPARROW_EMAIL_REQUIRED,
                      f'{self.canonical_path}: email_discovery')
             accepted = {}
+            for row in conn.execute('''SELECT id,company_id,website,verified_scope
+                FROM website_discovery WHERE TRIM(COALESCE(website,''))<>''
+                   OR TRIM(COALESCE(verified_scope,''))<>'' '''):
+                if row['company_id'] in self.by_id:
+                    domain = _domain(row['verified_scope'] or row['website'])
+                    if domain:
+                        self.historical_domain_candidates[domain].add(row['company_id'])
             query = '''SELECT w.* FROM website_discovery w JOIN
                 (SELECT company_id,MAX(id) AS id FROM website_discovery GROUP BY company_id) latest
                 ON latest.id=w.id WHERE w.status='VERIFIED'
@@ -128,12 +137,42 @@ class EnrichmentIndex:
                         and _domain(email.rsplit('@', 1)[1]) == domain):
                     self.enrichment[row['company_id']].setdefault('accepted_emails', []).append({
                         'value': email, 'source': 'SPARROW', 'record_id': row['id']})
+                if email and row['company_id'] in self.by_id:
+                    email_domain = email.rsplit('@', 1)[1]
+                    if not public_email_domain(email_domain):
+                        self.historical_email_candidates[email_domain].add(row['company_id'])
         finally:
             conn.close()
 
     def _load_discovery(self, precedence, run_ids):
         if not self.discovery_results:
             return
+        # Non-selected/legacy observations remain candidate provenance only.
+        # They can narrow a later identity search but never authorize locally.
+        for path in self.discovery_results:
+            _, conn = _readonly(path)
+            try:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                if 'discovery_observations' not in tables:
+                    continue
+                columns = _columns(conn, 'discovery_observations')
+                if not {'company_id','observation_type','normalized_value'} <= columns:
+                    continue
+                for row in conn.execute('''SELECT company_id,observation_type,normalized_value
+                    FROM discovery_observations WHERE observation_type IN
+                    ('WEBSITE_CANDIDATE','EMAIL_CANDIDATE')'''):
+                    if row['company_id'] not in self.by_id:
+                        continue
+                    if row['observation_type'] == 'WEBSITE_CANDIDATE':
+                        domain = _domain(row['normalized_value'])
+                    else:
+                        email = normalize_email(row['normalized_value'])
+                        domain = email.rsplit('@', 1)[1] if email else ''
+                    if domain and not public_email_domain(domain):
+                        self.historical_domain_candidates[domain].add(row['company_id'])
+            finally:
+                conn.close()
         normalized_run_ids = {
             str(Path(path).expanduser().resolve()): value for path, value in run_ids.items()}
         candidates = []

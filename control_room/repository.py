@@ -24,7 +24,8 @@ class JobRepository:
         try:
             conn.executescript(Path(__file__).with_name('schema.sql').read_text())
             self._migrate_adapter_columns(conn)
-            conn.execute('PRAGMA user_version=5')
+            self._migrate_identity_columns(conn)
+            conn.execute('PRAGMA user_version=6')
         finally:
             conn.close()
 
@@ -51,10 +52,63 @@ class JobRepository:
             'import_discovery_processed_company_count': 'INTEGER NOT NULL DEFAULT 0',
             'import_discovery_usable_company_count': 'INTEGER NOT NULL DEFAULT 0',
             'import_discovery_missing_company_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_identity_unmatched_rows': 'INTEGER NOT NULL DEFAULT 0',
+            'import_identity_task_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_identity_local_resolved_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_identity_search_eligible_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_identity_search_ineligible_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_identity_planned_query_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_identity_actual_query_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_identity_actual_provider_request_count': 'INTEGER NOT NULL DEFAULT 0',
+            'identity_task_cap': 'INTEGER NOT NULL DEFAULT 1000',
+            'identity_query_cap': 'INTEGER NOT NULL DEFAULT 2000',
+            'identity_estimated_provider_requests': 'INTEGER NOT NULL DEFAULT 0',
+            'identity_max_provider_requests': 'INTEGER NOT NULL DEFAULT 0',
+            'identity_estimated_cost': 'REAL',
+            'identity_actual_cost': 'REAL',
+            'identity_approval_status': "TEXT NOT NULL DEFAULT 'NOT_CONFIGURED'",
         }
         for name, definition in additions.items():
             if name not in columns:
                 conn.execute(f'ALTER TABLE control_jobs ADD COLUMN {name} {definition}')
+
+    @staticmethod
+    def _migrate_identity_columns(conn):
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(job_items)')}
+        additions = {
+            'initial_match_status': 'TEXT', 'initial_match_method': 'TEXT',
+            'initial_match_evidence_json': "TEXT NOT NULL DEFAULT '[]'",
+            'initial_conflicts_json': "TEXT NOT NULL DEFAULT '[]'",
+            'identity_task_id': 'TEXT',
+            'identity_status': "TEXT NOT NULL DEFAULT 'NOT_EVALUATED'",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                conn.execute(f'ALTER TABLE job_items ADD COLUMN {name} {definition}')
+        # A v5 job may have checkpointed matcher rows before this migration.
+        # Preserve those values as the immutable initial decision on resume.
+        conn.execute('''UPDATE job_items SET
+            initial_match_status=COALESCE(initial_match_status,match_status),
+            initial_match_method=COALESCE(initial_match_method,match_method),
+            initial_match_evidence_json=CASE WHEN initial_match_evidence_json='[]'
+                THEN match_evidence_json ELSE initial_match_evidence_json END,
+            initial_conflicts_json=CASE WHEN initial_conflicts_json='[]'
+                THEN conflicts_json ELSE initial_conflicts_json END
+            WHERE processing_status='COMPLETED' ''')
+        task_columns = {row[1] for row in conn.execute(
+            'PRAGMA table_info(identity_resolution_tasks)')}
+        task_additions = {
+            'identity_resolution_status': "TEXT NOT NULL DEFAULT 'UNRESOLVED'",
+            'canonical_persistence_status': "TEXT NOT NULL DEFAULT 'NOT_APPLICABLE'",
+            'proposed_identity_json': 'TEXT',
+            'research_mode': "TEXT NOT NULL DEFAULT 'ON_DEMAND'",
+        }
+        for name, definition in task_additions.items():
+            if name not in task_columns:
+                conn.execute(f'ALTER TABLE identity_resolution_tasks ADD COLUMN {name} {definition}')
+        if 'enrichment_scope' in task_columns:
+            conn.execute("""UPDATE identity_resolution_tasks SET enrichment_scope='NOT_EVALUATED'
+                WHERE enrichment_scope='CANONICAL_UNKNOWN'""")
 
     def _migrate_import_enrich(self):
         """Expand existing Control Room tables without replacing their queue."""
@@ -493,7 +547,8 @@ class JobRepository:
             conn.close()
 
     def set_import_stage(self, job_id, stage, worker_id):
-        allowed = {'PARSING', 'MATCHING', 'EXISTING_ENRICHMENT', 'DISCOVERY',
+        allowed = {'PARSING', 'MATCHING', 'IDENTITY_LOCAL', 'IDENTITY_PREFLIGHT',
+                   'IDENTITY_SEARCH', 'EXISTING_ENRICHMENT', 'DISCOVERY',
                    'AI_PREFLIGHT', 'AI_ENRICHMENT', 'EXPORT'}
         if stage not in allowed:
             raise ValueError('Invalid Import & Enrich progress stage')
@@ -519,13 +574,18 @@ class JobRepository:
                 raise ValueError('Import match requires a running IMPORT_ENRICH job')
             updated = conn.execute('''UPDATE job_items SET processing_status='COMPLETED',
                 company_id=?,match_status=?,match_method=?,selected=?,match_evidence_json=?,
-                conflicts_json=?,route_hint=?,reusable_enrichment=?,ai_eligibility=?
+                conflicts_json=?,route_hint=?,reusable_enrichment=?,ai_eligibility=?,
+                initial_match_status=?,initial_match_method=?,initial_match_evidence_json=?,
+                initial_conflicts_json=?
                 WHERE job_id=? AND item_position=? AND processing_status='PENDING' ''',
                 (match.company_id, match.outcome, match.match_method,
                  int(match.outcome == 'MATCHED'),
                  json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
                  json.dumps(list(match.conflicts), ensure_ascii=False, separators=(',', ':')),
                  match.route_hint, int(match.has_reusable_enrichment), match.ai_eligibility,
+                 match.outcome, match.match_method,
+                 json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(',', ':')),
+                 json.dumps(list(match.conflicts), ensure_ascii=False, separators=(',', ':')),
                  job_id, item_position)).rowcount
             if updated == 0:
                 # A replayed checkpoint is safe only when the item is already complete.
@@ -571,6 +631,252 @@ class JobRepository:
         conn = self._connect()
         try:
             return self._import_summary_conn(conn, job_id)
+        finally:
+            conn.close()
+
+    def ensure_identity_task(self, job_id, item_position, spec):
+        """Create/link one deduplicated task without changing matcher evidence."""
+        conn = self._connect()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('''SELECT * FROM identity_resolution_tasks
+                WHERE job_id=? AND identity_fingerprint=?''',
+                (job_id, spec['fingerprint'])).fetchone()
+            if row is None:
+                task_id = uuid.uuid4().hex
+                created = now()
+                conn.execute('''INSERT INTO identity_resolution_tasks(
+                    task_id,job_id,identity_fingerprint,normalized_input_json,
+                    origin_status,origin_candidate_ids_json,origin_conflicts_json,status,
+                    resolver_version,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                    (task_id, job_id, spec['fingerprint'], json.dumps(spec['inputs'],
+                     ensure_ascii=False, sort_keys=True, separators=(',', ':')),
+                     spec['origin_status'], json.dumps(spec['candidate_ids']),
+                     json.dumps(spec['conflicts']), 'PENDING', spec['resolver_version'],
+                     created, created))
+            else:
+                task_id = row['task_id']
+            conn.execute('''INSERT OR IGNORE INTO identity_task_rows(
+                task_id,job_id,item_position) VALUES (?,?,?)''',
+                (task_id, job_id, item_position))
+            conn.execute('''UPDATE job_items SET identity_task_id=?,identity_status=
+                COALESCE((SELECT identity_resolution_status FROM identity_resolution_tasks
+                    WHERE task_id=?),'UNRESOLVED')
+                WHERE job_id=? AND item_position=?''',
+                (task_id, task_id, job_id, item_position))
+            conn.commit()
+            return task_id
+        except BaseException:
+            conn.rollback(); raise
+        finally:
+            conn.close()
+
+    def identity_registration_items(self, job_id):
+        conn = self._connect()
+        try:
+            result = []
+            for row in conn.execute('''SELECT i.*,u.headers_json,u.mapping_json,
+                r.original_values_json FROM job_items i
+                JOIN uploads u ON u.upload_id=i.upload_id
+                JOIN upload_rows r ON r.upload_id=i.upload_id
+                  AND r.row_number=i.upload_row_number
+                WHERE i.job_id=? AND i.processing_status='COMPLETED'
+                  AND i.initial_match_status IN ('AMBIGUOUS','UNRESOLVED')
+                ORDER BY i.item_position''', (job_id,)):
+                item = dict(row)
+                item['headers'] = json.loads(item.pop('headers_json'))
+                item['mapping'] = json.loads(item.pop('mapping_json'))
+                item['original_values'] = json.loads(item.pop('original_values_json'))
+                item['match_evidence'] = json.loads(item['initial_match_evidence_json'])
+                item['conflicts'] = json.loads(item['initial_conflicts_json'])
+                result.append(item)
+            return result
+        finally:
+            conn.close()
+
+    def identity_tasks(self, job_id):
+        conn = self._connect()
+        try:
+            rows = []
+            for row in conn.execute('''SELECT * FROM identity_resolution_tasks
+                WHERE job_id=? ORDER BY created_at,task_id''', (job_id,)):
+                item = dict(row)
+                for key in ('normalized_input_json','origin_candidate_ids_json',
+                            'origin_conflicts_json','decisive_evidence_json',
+                            'alternative_company_ids_json','conflicts_json'):
+                    item[key[:-5]] = json.loads(item[key])
+                item['proposed_identity'] = (json.loads(item['proposed_identity_json'])
+                    if item.get('proposed_identity_json') else None)
+                rows.append(item)
+            return rows
+        finally:
+            conn.close()
+
+    def apply_identity_decision(self, task_id, decision):
+        conn = self._connect()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            task = conn.execute('SELECT * FROM identity_resolution_tasks WHERE task_id=?',
+                                (task_id,)).fetchone()
+            if not task:
+                raise ValueError('Unknown identity task')
+            conn.execute('''UPDATE identity_resolution_tasks SET status=?,
+                canonical_company_id=?,resolution_rule=?,decisive_evidence_json=?,
+                alternative_company_ids_json=?,conflicts_json=?,identity_resolution_status=?,
+                canonical_persistence_status=?,proposed_identity_json=?,enrichment_scope=?,
+                research_mode=?,updated_at=?,error_message=NULL WHERE task_id=?''',
+                (decision.status, decision.canonical_company_id,
+                decision.resolution_rule, json.dumps(list(decision.decisive_evidence),
+                ensure_ascii=False, sort_keys=True, separators=(',', ':')),
+                json.dumps(list(decision.alternatives)), json.dumps(list(decision.conflicts)),
+                decision.identity_status, decision.persistence_status,
+                (json.dumps(decision.proposed_identity, ensure_ascii=False, sort_keys=True,
+                 separators=(',', ':')) if decision.proposed_identity else None),
+                decision.enrichment_scope, decision.research_mode, now(), task_id))
+            if decision.status in ('LOCAL_RESOLVED','SEARCH_RESOLVED'):
+                conn.execute('''UPDATE job_items SET company_id=?,match_status='MATCHED',
+                    match_method=?,selected=1,identity_status=?,route_hint='MATCHED_REQUIRES_ENRICHMENT'
+                    WHERE job_id=? AND item_position IN (SELECT item_position FROM
+                    identity_task_rows WHERE task_id=?)''',
+                    (decision.canonical_company_id, decision.resolution_rule,
+                     decision.identity_status, task['job_id'], task_id))
+            else:
+                conn.execute('''UPDATE job_items SET identity_status=? WHERE job_id=?
+                    AND item_position IN (SELECT item_position FROM identity_task_rows
+                    WHERE task_id=?)''', (decision.identity_status, task['job_id'], task_id))
+            conn.commit()
+        except BaseException:
+            conn.rollback(); raise
+        finally:
+            conn.close()
+
+    def plan_identity_queries(self, task_id, plans):
+        conn = self._connect()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            task = conn.execute('SELECT * FROM identity_resolution_tasks WHERE task_id=?',
+                                (task_id,)).fetchone()
+            if not task:
+                raise ValueError('Unknown identity task')
+            for sequence, plan in enumerate(plans, 1):
+                conn.execute('''INSERT OR IGNORE INTO identity_search_queries(
+                    query_id,task_id,sequence,provider,query_text,query_strategy,
+                    strategy_version,locale_json,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)''',
+                    (uuid.uuid4().hex, task_id, sequence, plan['provider'],
+                     plan['query_text'], plan['query_strategy'], plan['strategy_version'],
+                     json.dumps(plan['locale'], sort_keys=True, separators=(',', ':')),
+                     'PLANNED', now()))
+            status = 'SEARCH_PLANNED' if plans else 'NOT_ELIGIBLE'
+            conn.execute('UPDATE identity_resolution_tasks SET status=?,updated_at=? WHERE task_id=?',
+                         (status, now(), task_id))
+            conn.commit()
+        except BaseException:
+            conn.rollback(); raise
+        finally:
+            conn.close()
+
+    def identity_queries(self, task_id):
+        conn = self._connect()
+        try:
+            result = []
+            for row in conn.execute('''SELECT * FROM identity_search_queries
+                WHERE task_id=? ORDER BY sequence''', (task_id,)):
+                item = dict(row)
+                item['locale'] = json.loads(item.pop('locale_json'))
+                item['raw_result'] = (json.loads(item['raw_result_json'])
+                                      if item['raw_result_json'] else None)
+                result.append(item)
+            return result
+        finally:
+            conn.close()
+
+    def start_identity_query(self, query_id, provider):
+        """Durably mark a future provider call; Commit 5 never calls this itself."""
+        conn = self._connect()
+        try:
+            updated = conn.execute('''UPDATE identity_search_queries SET provider=?,
+                status='RUNNING',started_at=?,uncertain_billing=1 WHERE query_id=?
+                AND status IN ('PLANNED','INTERRUPTED')''',
+                (provider, now(), query_id)).rowcount
+            if updated != 1:
+                raise ValueError('Identity query is not available to start')
+        finally:
+            conn.close()
+
+    def fail_identity_query(self, query_id, message, provider_requests=0):
+        conn = self._connect()
+        try:
+            updated = conn.execute('''UPDATE identity_search_queries SET status='FAILED',
+                sanitized_error=?,provider_request_count=?,completed_at=? WHERE query_id=?
+                AND status='RUNNING' ''', (str(message)[:500], provider_requests,
+                                           now(), query_id)).rowcount
+            if updated != 1:
+                raise ValueError('Identity query is not running')
+        finally:
+            conn.close()
+
+    def recover_identity_queries(self, job_id):
+        conn = self._connect()
+        try:
+            conn.execute('''UPDATE identity_search_queries SET status='INTERRUPTED',
+                uncertain_billing=1,completed_at=? WHERE status='RUNNING' AND task_id IN
+                (SELECT task_id FROM identity_resolution_tasks WHERE job_id=?)''',
+                (now(), job_id))
+        finally:
+            conn.close()
+
+    def persist_identity_response(self, query_id, payload, *, provider='INJECTED',
+                                  logical_calls=0, provider_requests=0):
+        conn = self._connect()
+        try:
+            updated = conn.execute('''UPDATE identity_search_queries SET provider=?,
+                status='COMPLETED',raw_result_json=?,logical_call_count=?,
+                provider_request_count=?,completed_at=?,uncertain_billing=0
+                WHERE query_id=? AND status IN ('PLANNED','INTERRUPTED')''',
+                (provider, json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                 separators=(',', ':')), logical_calls, provider_requests, now(), query_id)).rowcount
+            if updated != 1:
+                raise ValueError('Identity query is not available for an injected response')
+        finally:
+            conn.close()
+
+    def update_identity_preflight(self, job_id, task_cap=1000, query_cap=2000,
+                                  max_attempts_per_query=3):
+        conn = self._connect()
+        try:
+            counts = conn.execute('''SELECT COUNT(*) tasks,
+                SUM(status='LOCAL_RESOLVED') local_resolved,
+                SUM(EXISTS(SELECT 1 FROM identity_search_queries q
+                    WHERE q.task_id=t.task_id)) search_eligible,
+                SUM(status IN ('NOT_ELIGIBLE','UNRESOLVED','CANONICAL_NOT_FOUND') AND
+                    NOT EXISTS(SELECT 1 FROM identity_search_queries q
+                    WHERE q.task_id=t.task_id)) ineligible
+                FROM identity_resolution_tasks t WHERE job_id=?''', (job_id,)).fetchone()
+            queries = conn.execute('''SELECT COUNT(*) FROM identity_search_queries WHERE task_id IN
+                (SELECT task_id FROM identity_resolution_tasks WHERE job_id=?)''', (job_id,)).fetchone()[0]
+            unmatched = conn.execute('''SELECT COUNT(*) FROM job_items WHERE job_id=? AND
+                initial_match_status IN ('AMBIGUOUS','UNRESOLVED')''', (job_id,)).fetchone()[0]
+            if counts['tasks'] > task_cap or queries > query_cap:
+                raise ValueError('Identity preflight exceeds configured hard cap')
+            actual = conn.execute('''SELECT COALESCE(SUM(logical_call_count),0),
+                COALESCE(SUM(provider_request_count),0) FROM identity_search_queries WHERE task_id IN
+                (SELECT task_id FROM identity_resolution_tasks WHERE job_id=?)''', (job_id,)).fetchone()
+            conn.execute('''UPDATE control_jobs SET import_identity_unmatched_rows=?,
+                import_identity_task_count=?,import_identity_local_resolved_count=?,
+                import_identity_search_eligible_count=?,import_identity_search_ineligible_count=?,
+                import_identity_planned_query_count=?,import_identity_actual_query_count=?,
+                import_identity_actual_provider_request_count=?,identity_task_cap=?,identity_query_cap=?,
+                identity_estimated_provider_requests=?,identity_max_provider_requests=? WHERE job_id=?''',
+                (unmatched, counts['tasks'] or 0, counts['local_resolved'] or 0,
+                 counts['search_eligible'] or 0, counts['ineligible'] or 0, queries,
+                 actual[0], actual[1], task_cap, query_cap, queries,
+                 queries * max_attempts_per_query, job_id))
+            return {'unmatched_rows': unmatched, 'identity_tasks': counts['tasks'] or 0,
+                    'local_resolved': counts['local_resolved'] or 0,
+                    'search_eligible': counts['search_eligible'] or 0,
+                    'search_ineligible': counts['ineligible'] or 0,
+                    'planned_queries': queries, 'estimated_provider_requests': queries,
+                    'maximum_provider_requests': queries * max_attempts_per_query}
         finally:
             conn.close()
 
@@ -669,6 +975,8 @@ class JobRepository:
                 item = dict(row)
                 item['match_evidence'] = json.loads(item['match_evidence_json'])
                 item['conflicts'] = json.loads(item['conflicts_json'])
+                item['initial_match_evidence'] = json.loads(item['initial_match_evidence_json'])
+                item['initial_conflicts'] = json.loads(item['initial_conflicts_json'])
                 item['enrichment'] = json.loads(item['enrichment_json'])
                 result.append(item)
             return result

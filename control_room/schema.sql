@@ -41,6 +41,21 @@ CREATE TABLE IF NOT EXISTS control_jobs (
     import_discovery_processed_company_count INTEGER NOT NULL DEFAULT 0,
     import_discovery_usable_company_count INTEGER NOT NULL DEFAULT 0,
     import_discovery_missing_company_count INTEGER NOT NULL DEFAULT 0,
+    import_identity_unmatched_rows INTEGER NOT NULL DEFAULT 0,
+    import_identity_task_count INTEGER NOT NULL DEFAULT 0,
+    import_identity_local_resolved_count INTEGER NOT NULL DEFAULT 0,
+    import_identity_search_eligible_count INTEGER NOT NULL DEFAULT 0,
+    import_identity_search_ineligible_count INTEGER NOT NULL DEFAULT 0,
+    import_identity_planned_query_count INTEGER NOT NULL DEFAULT 0,
+    import_identity_actual_query_count INTEGER NOT NULL DEFAULT 0,
+    import_identity_actual_provider_request_count INTEGER NOT NULL DEFAULT 0,
+    identity_task_cap INTEGER NOT NULL DEFAULT 1000,
+    identity_query_cap INTEGER NOT NULL DEFAULT 2000,
+    identity_estimated_provider_requests INTEGER NOT NULL DEFAULT 0,
+    identity_max_provider_requests INTEGER NOT NULL DEFAULT 0,
+    identity_estimated_cost REAL,
+    identity_actual_cost REAL,
+    identity_approval_status TEXT NOT NULL DEFAULT 'NOT_CONFIGURED',
     CHECK(processed_company_count <= selected_company_count)
 );
 
@@ -132,8 +147,79 @@ CREATE TABLE IF NOT EXISTS job_items (
     enrichment_status TEXT NOT NULL DEFAULT 'NOT_EVALUATED',
     enrichment_json TEXT NOT NULL DEFAULT '{}',
     discovery_status TEXT,
+    initial_match_status TEXT,
+    initial_match_method TEXT,
+    initial_match_evidence_json TEXT NOT NULL DEFAULT '[]',
+    initial_conflicts_json TEXT NOT NULL DEFAULT '[]',
+    identity_task_id TEXT,
+    identity_status TEXT NOT NULL DEFAULT 'NOT_EVALUATED',
     PRIMARY KEY(job_id,item_position),
     FOREIGN KEY(upload_id,upload_row_number) REFERENCES upload_rows(upload_id,row_number)
+);
+
+CREATE TABLE IF NOT EXISTS identity_resolution_tasks (
+    task_id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL REFERENCES control_jobs(job_id) ON DELETE CASCADE,
+    identity_fingerprint TEXT NOT NULL,
+    normalized_input_json TEXT NOT NULL,
+    origin_status TEXT NOT NULL CHECK(origin_status IN ('AMBIGUOUS','UNRESOLVED')),
+    origin_candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+    origin_conflicts_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL CHECK(status IN ('PENDING','LOCAL_RESOLVED','SEARCH_ELIGIBLE',
+        'SEARCH_PLANNED','SEARCH_RESOLVED','AMBIGUOUS','UNRESOLVED','NOT_ELIGIBLE',
+        'EXTERNAL_ENTITY_IDENTIFIED','CANONICAL_NOT_FOUND','FAILED')),
+    canonical_company_id INTEGER,
+    identity_resolution_status TEXT NOT NULL DEFAULT 'UNRESOLVED' CHECK(
+        identity_resolution_status IN ('RESOLVED_EXISTING','RESOLVED_NEW_ENTITY',
+        'AMBIGUOUS','UNRESOLVED','NOT_ELIGIBLE')),
+    canonical_persistence_status TEXT NOT NULL DEFAULT 'NOT_APPLICABLE' CHECK(
+        canonical_persistence_status IN ('EXISTING','PENDING_CREATE','CREATED',
+        'NOT_APPLICABLE','FAILED')),
+    resolution_rule TEXT,
+    decisive_evidence_json TEXT NOT NULL DEFAULT '[]',
+    alternative_company_ids_json TEXT NOT NULL DEFAULT '[]',
+    conflicts_json TEXT NOT NULL DEFAULT '[]',
+    resolver_version TEXT NOT NULL,
+    proposed_identity_json TEXT,
+    enrichment_scope TEXT NOT NULL DEFAULT 'NOT_EVALUATED' CHECK(enrichment_scope IN (
+        'BULK_IN_SCOPE','OUTSIDE_BULK_SCOPE','ON_DEMAND','NOT_EVALUATED')),
+    research_mode TEXT NOT NULL DEFAULT 'ON_DEMAND' CHECK(research_mode IN (
+        'BULK','ON_DEMAND')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    error_message TEXT,
+    UNIQUE(job_id,identity_fingerprint)
+);
+
+CREATE TABLE IF NOT EXISTS identity_task_rows (
+    task_id TEXT NOT NULL REFERENCES identity_resolution_tasks(task_id) ON DELETE CASCADE,
+    job_id TEXT NOT NULL,
+    item_position INTEGER NOT NULL,
+    PRIMARY KEY(task_id,item_position),
+    UNIQUE(job_id,item_position),
+    FOREIGN KEY(job_id,item_position) REFERENCES job_items(job_id,item_position) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS identity_search_queries (
+    query_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES identity_resolution_tasks(task_id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 2),
+    provider TEXT NOT NULL,
+    query_text TEXT NOT NULL,
+    query_strategy TEXT NOT NULL,
+    strategy_version TEXT NOT NULL,
+    locale_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('PLANNED','RUNNING','COMPLETED','FAILED','INTERRUPTED')),
+    sanitized_error TEXT,
+    raw_result_json TEXT,
+    logical_call_count INTEGER NOT NULL DEFAULT 0,
+    provider_request_count INTEGER NOT NULL DEFAULT 0,
+    uncertain_billing INTEGER NOT NULL DEFAULT 0 CHECK(uncertain_billing IN (0,1)),
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    UNIQUE(task_id,sequence),
+    UNIQUE(task_id,query_text)
 );
 
 CREATE TABLE IF NOT EXISTS job_artifacts (
@@ -160,5 +246,7 @@ CREATE INDEX IF NOT EXISTS job_items_job ON job_items(job_id,item_position);
 CREATE INDEX IF NOT EXISTS job_items_processing ON job_items(job_id,processing_status,item_position);
 CREATE INDEX IF NOT EXISTS job_items_company ON job_items(job_id,company_id,match_status);
 CREATE INDEX IF NOT EXISTS job_artifacts_job ON job_artifacts(job_id,artifact_type);
+CREATE INDEX IF NOT EXISTS identity_tasks_job ON identity_resolution_tasks(job_id,status);
+CREATE INDEX IF NOT EXISTS identity_queries_task ON identity_search_queries(task_id,sequence);
 
-PRAGMA user_version=5;
+PRAGMA user_version=6;

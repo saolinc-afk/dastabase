@@ -2,6 +2,7 @@
 from pathlib import Path
 
 from control_room.enrichment_index import EnrichmentIndex
+from control_room.identity_adapter import IdentityResolutionAdapter
 from control_room.matching import ImportMatcher
 from control_room.uploads import normalize_import_row
 
@@ -17,12 +18,16 @@ def enrichment_sufficient(record):
 
 class ImportEnrichAdapter:
     def __init__(self, repository, canonical_db, discovery_results=(), *,
-                 discovery_adapter=None, item_hook=None):
+                 discovery_adapter=None, item_hook=None, identity_results=None,
+                 identity_task_cap=1000, identity_query_cap=2000):
         self.repository = repository
         self.canonical_db = Path(canonical_db).expanduser().absolute()
         self.discovery_results = tuple(discovery_results)
         self.discovery_adapter = discovery_adapter
         self.item_hook = item_hook
+        self.identity_results = identity_results
+        self.identity_task_cap = identity_task_cap
+        self.identity_query_cap = identity_query_cap
         self.worker_id = None
 
     def run(self, job, progress):
@@ -41,6 +46,10 @@ class ImportEnrichAdapter:
                 job['job_id'], item['item_position'], match, self.worker_id)
             if self.item_hook:
                 self.item_hook(item, summary)
+        identity = IdentityResolutionAdapter(self.repository, index,
+            injected_results=self.identity_results, task_cap=self.identity_task_cap,
+            query_cap=self.identity_query_cap)
+        identity.run(job['job_id'], self.worker_id)
         self.repository.set_import_stage(job['job_id'], 'EXISTING_ENRICHMENT', self.worker_id)
         matched_ids = sorted({item['company_id'] for item in
             self.repository.job_items(job['job_id'])
