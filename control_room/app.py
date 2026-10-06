@@ -36,11 +36,11 @@ def present_job(job):
 def create_app(config=None):
     app = Flask(__name__)
     app.json.sort_keys = False
+    configured_canonical = os.environ.get('CONTROL_ROOM_CANONICAL_DB')
     app.config.update(
         CONTROL_DB=Path(os.environ.get('CONTROL_ROOM_DB',
             Path.home()/'.local/share/dastabase-control/control_room.sqlite3')),
-        CANONICAL_DB=Path(os.environ.get('CONTROL_ROOM_CANONICAL_DB',
-            ROOT/'database/dastabase_lite.db')),
+        CANONICAL_DB=Path(configured_canonical) if configured_canonical else None,
         DISCOVERY_V2_PATH=Path(os.environ.get('CONTROL_ROOM_DISCOVERY_V2',
             Path.home()/'dastabase-runs/discovery-v2')),
         WORKER_STALE_SECONDS=float(os.environ.get('CONTROL_ROOM_WORKER_STALE', '15')),
@@ -55,6 +55,8 @@ def create_app(config=None):
     )
     if config:
         app.config.update(config)
+    if app.config['CANONICAL_DB'] is None:
+        raise RuntimeError('Set CONTROL_ROOM_CANONICAL_DB or configure CANONICAL_DB explicitly')
     repository = JobRepository(app.config['CONTROL_DB'])
     repository.initialize()
     app.extensions['control_repository'] = repository

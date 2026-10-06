@@ -16,7 +16,8 @@ Configuration:
 | --- | --- |
 | `CONTROL_ROOM_DB` | `~/.local/share/dastabase-control/control_room.sqlite3` |
 | `CONTROL_ROOM_STORAGE_ROOT` | `~/.local/share/dastabase-control` |
-| `CONTROL_ROOM_CANONICAL_DB` | repository `database/dastabase_lite.db` |
+| `CONTROL_ROOM_CANONICAL_DB` | required explicit canonical Lite database for the worker |
+| `CONTROL_ROOM_IMPORT_DISCOVERY_RESULTS` | ordered, `os.pathsep`-separated Discovery v2 result databases |
 | `CONTROL_ROOM_DISCOVERY_V2` | `~/dastabase-runs/discovery-v2` |
 | `CONTROL_ROOM_HOST` | `127.0.0.1` |
 | `CONTROL_ROOM_PORT` | `8770` |
@@ -33,6 +34,7 @@ Terminal A:
 
 ```sh
 export CONTROL_ROOM_DB="$HOME/.local/share/dastabase-control/control_room.sqlite3"
+export CONTROL_ROOM_CANONICAL_DB="/absolute/path/to/database/dastabase_lite_18916_20261001.db"
 .venv/bin/python -m control_room.app
 ```
 
@@ -40,6 +42,7 @@ Terminal B:
 
 ```sh
 export CONTROL_ROOM_DB="$HOME/.local/share/dastabase-control/control_room.sqlite3"
+export CONTROL_ROOM_CANONICAL_DB="/absolute/path/to/database/dastabase_lite_18916_20261001.db"
 .venv/bin/python -m control_room.worker
 ```
 
@@ -69,6 +72,13 @@ Uploaded files use generated names, mode `0600`, and live outside static files.
 CSV supports UTF-8, UTF-8 BOM, Windows-1250, comma, semicolon, and tab input.
 XLSX parsing uses the first visible worksheet with `read_only=True` and
 `data_only=True`.
+
+Import & Enrich reads accepted enrichment through the read-only
+`KnowledgeRepository`. Discovery result databases must be listed explicitly;
+the repository never scans a directory. Newer REVIEW or missing values do not
+erase older accepted facts, and conflicting accepted values remain available
+in snapshot conflict metadata. Registry-order precedence is also available for
+audits that require caller-controlled source priority.
 
 ## Discovery v2 jobs
 

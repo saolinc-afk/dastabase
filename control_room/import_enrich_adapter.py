@@ -3,6 +3,7 @@ from pathlib import Path
 
 from control_room.enrichment_index import EnrichmentIndex
 from control_room.identity_adapter import IdentityResolutionAdapter
+from control_room.knowledge_repository import KnowledgeRepository
 from control_room.matching import ImportMatcher
 from control_room.uploads import normalize_import_row
 
@@ -34,7 +35,8 @@ class ImportEnrichAdapter:
         if job['module'] != 'IMPORT_ENRICH':
             raise ValueError('ImportEnrichAdapter requires an IMPORT_ENRICH job')
         self.repository.set_import_stage(job['job_id'], 'PARSING', self.worker_id)
-        index = EnrichmentIndex(self.canonical_db, self.discovery_results)
+        knowledge = KnowledgeRepository(self.canonical_db, self.discovery_results)
+        index = EnrichmentIndex(self.canonical_db, knowledge=knowledge)
         matcher = ImportMatcher(index)
         self.repository.set_import_stage(job['job_id'], 'MATCHING', self.worker_id)
         for item in self.repository.pending_import_items(job['job_id']):
@@ -73,8 +75,10 @@ class ImportEnrichAdapter:
             job, sorted(discovery_ids), lambda counts:
                 self.repository.update_import_discovery_progress(
                     job['job_id'], counts, self.worker_id))
-        refreshed = EnrichmentIndex(self.canonical_db, [results_path],
+        refreshed_knowledge = KnowledgeRepository(self.canonical_db,
+            [*self.discovery_results, results_path],
             run_ids={str(Path(results_path).resolve()): run_id})
+        refreshed = EnrichmentIndex(self.canonical_db, knowledge=refreshed_knowledge)
         discovery_status = {row['company_id']: row.get('website_status') or 'REVIEW'
                             for row in export_rows}
         merged = {company_id: (refreshed.enrichment[company_id]

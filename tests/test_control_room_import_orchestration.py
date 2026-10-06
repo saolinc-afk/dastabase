@@ -157,8 +157,8 @@ def test_import_job_persists_rows_evidence_partitions_and_deduplicated_future_wo
             completed['import_matched_requires_enrichment_count']) == (4, 0)
     assert (completed['import_matched_company_count'],
             completed['import_existing_satisfied_company_count'],
-            completed['import_discovery_required_company_count']) == (2, 0, 2)
-    assert selective.calls == [(1, 2)]
+            completed['import_discovery_required_company_count']) == (2, 1, 1)
+    assert selective.calls == [(2,)]
     assert repository.import_summary(job['job_id']) == {
         'total_rows': 6, 'processed_rows': 6, 'matched': 4, 'ambiguous': 1,
         'unresolved': 1, 'resolved_without_ai': 4,
@@ -177,7 +177,8 @@ def test_import_job_persists_rows_evidence_partitions_and_deduplicated_future_wo
     assert all(item['ai_eligibility'] == 'NOT_EVALUATED' for item in items)
     assert all(item['estimated_cost'] is None and item['actual_cost'] is None for item in items)
     assert repository.import_enrichment_company_ids(job['job_id']) == []
-    assert items[0]['enrichment']['official_website'] == 'https://company-1.si/'
+    assert items[0]['enrichment']['official_website'] == 'https://alfa.si/'
+    assert items[0]['enrichment']['default_email'] == 'info@alfa.si'
     assert items[2]['enrichment']['official_website'] == 'https://company-2.si/'
     assert items[2]['enrichment']['default_email'] == 'info2@company-2.si'
     assert items[2]['enrichment']['default_phone'] == '+386100002'
@@ -263,7 +264,7 @@ def test_review_or_non_legal_sparrow_does_not_suppress_selective_discovery(tmp_p
     job = repository.create_import_enrich_job('u', 'Rejected legacy', mapping)
     selective = SelectiveDiscovery(tmp_path)
     run(repository, source, job, discovery=selective)
-    assert selective.calls == [(1, 2)]
+    assert selective.calls == [(2,)]
 
 
 def test_review_discovery_preserves_existing_data_and_routes_missing_for_later_policy(tmp_path):
@@ -274,11 +275,11 @@ def test_review_discovery_preserves_existing_data_and_routes_missing_for_later_p
     selective = SelectiveDiscovery(tmp_path, usable=False)
     result = run(repository, source, job, discovery=selective)
     assert (result['import_discovery_usable_company_count'],
-            result['import_discovery_missing_company_count']) == (0, 2)
+            result['import_discovery_missing_company_count']) == (0, 1)
     items = repository.job_items(job['job_id'])
     assert items[0]['enrichment']['official_website'] == 'https://alfa.si/'
-    assert items[0]['discovery_status'] == 'REVIEW'
-    assert items[0]['route_hint'] == 'MATCHED_REQUIRES_ENRICHMENT'
+    assert items[0]['discovery_status'] == 'VERIFIED'
+    assert items[0]['route_hint'] == 'RESOLVED_WITHOUT_AI'
     assert items[2]['enrichment']['official_website'] is None
     assert items[2]['enrichment_status'] == 'MISSING_AFTER_DISCOVERY'
     assert all(item['ai_eligibility'] == 'NOT_EVALUATED' for item in items)
@@ -298,7 +299,8 @@ def test_accepted_sparrow_is_persisted_before_selective_discovery(tmp_path):
     items = repository.job_items(job['job_id'])
     assert items[0]['enrichment']['official_website'] == 'https://alfa.si/'
     assert items[0]['enrichment']['sources'] == ['SPARROW']
-    assert items[0]['enrichment_status'] == 'NEEDS_DISCOVERY'
+    assert items[0]['enrichment_status'] == 'SATISFIED_EXISTING'
+    assert items[0]['enrichment']['default_email'] == 'info@alfa.si'
     assert items[4]['enrichment'] == {}
     assert items[5]['enrichment'] == {}
 
@@ -349,7 +351,7 @@ def test_import_discovery_resume_reuses_completed_run_without_second_runner_call
     assert len(runner_calls) == 1
     result = repository.get_job(job['job_id'])
     assert result['status'] == 'COMPLETED'
-    assert result['import_discovery_processed_company_count'] == 2
+    assert result['import_discovery_processed_company_count'] == 1
 
 
 def test_v3_control_room_migrates_without_losing_existing_discovery_job(tmp_path):

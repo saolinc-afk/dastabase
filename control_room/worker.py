@@ -90,8 +90,10 @@ def main(argv=None):
                         default=float(os.environ.get('CONTROL_ROOM_WORKER_POLL', '1')))
     parser.add_argument('--fake-delay', type=float,
                         default=float(os.environ.get('CONTROL_ROOM_FAKE_DELAY', '0.25')))
-    parser.add_argument('--canonical', default=os.environ.get('CONTROL_ROOM_CANONICAL_DB',
-                        str(Path(__file__).resolve().parents[1]/'database/dastabase_lite.db')))
+    configured_canonical = os.environ.get('CONTROL_ROOM_CANONICAL_DB')
+    parser.add_argument('--canonical', default=configured_canonical,
+                        required=configured_canonical is None,
+                        help='Explicit canonical Lite database (or CONTROL_ROOM_CANONICAL_DB)')
     parser.add_argument('--storage-root', default=os.environ.get('CONTROL_ROOM_STORAGE_ROOT',
                         str(Path.home()/'.local/share/dastabase-control')))
     parser.add_argument('--real-discovery-max-companies',type=int,default=int(os.environ.get(
