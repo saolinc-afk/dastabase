@@ -135,14 +135,26 @@ def parse_xlsx(path, max_rows):
         headers = next(iterator, None)
         if headers is None:
             raise UploadError('The worksheet is empty')
+        headers = list(headers)
+        while headers and not _plain(headers[-1]):
+            headers.pop()
+        if not headers:
+            raise UploadError('The uploaded file has no header row')
         rows = []
         for row in iterator:
-            if not any(value is not None and _plain(value) for value in row):
-                continue
-            rows.append(list(row))
+            values = list(row)
+            if any(value is not None and _plain(value) for value in values[len(headers):]):
+                raise UploadError('Malformed file: a row exceeds the header width')
+            values = values[:len(headers)]
+            values.extend([None] * (len(headers)-len(values)))
+            rows.append(values)
             if len(rows) > max_rows:
                 raise UploadError(f'The upload exceeds the {max_rows}-row limit')
-        headers, rows = _validate(list(headers), rows, max_rows)
+        # Preserve blank rows inside the registration data so worksheet row
+        # numbers remain stable, but ignore unused blank rows after the data.
+        while rows and not any(value is not None and _plain(value) for value in rows[-1]):
+            rows.pop()
+        headers, rows = _validate(headers, rows, max_rows)
         return headers, rows, sheet.title
     finally:
         workbook.close()

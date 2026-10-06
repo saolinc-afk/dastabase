@@ -8,7 +8,8 @@ from discovery_v2.evidence import public_email_domain
 from discovery_v2.export import result_candidates, resolve_candidates
 
 from control_room.matching import (normalize_email, normalize_name, normalize_phone,
-                                   normalize_registration, normalize_tax, normalize_text)
+                                   normalize_registration, normalize_tax, normalize_text,
+                                   canonical_name_aliases)
 
 
 CANONICAL_COLUMNS = (
@@ -176,11 +177,17 @@ class EnrichmentIndex:
         self.domains = defaultdict(set)
         self.emails = defaultdict(set)
         self.phones = defaultdict(set)
+        self.aliases = defaultdict(set)
+        self.alias_rules = defaultdict(set)
         for company in self.companies:
             company_id = company['id']
             self._add(self.tax, normalize_tax(company['tax_number']), company_id)
             self._add(self.registration, normalize_registration(company['registration_number']), company_id)
             self._add(self.names, normalize_name(company['company_name']), company_id)
+            for alias, rule, preserved in canonical_name_aliases(company['company_name']):
+                if alias != normalize_name(company['company_name']):
+                    self._add(self.aliases, alias, company_id)
+                    self.alias_rules[(alias, company_id)].add((rule, preserved))
             self._add(self.addresses, normalize_text(company['address']), company_id)
             self._add(self.municipalities, normalize_text(company['municipality']), company_id)
             enrichment = self.enrichment[company_id]

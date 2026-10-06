@@ -55,6 +55,35 @@ class ParserAndMatcherTests(unittest.TestCase):
             self.assertEqual(rows[0][0],'ALFA')
             self.assertEqual(rows[0][1],'')  # formulas are never evaluated
 
+    def test_xlsx_pads_trailing_cells_and_preserves_interstitial_rows(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'registrations.xlsx'; workbook = Workbook()
+            sheet = workbook.active; sheet.title = 'Registrations'
+            sheet.append(['Ime', 'Email', 'Podjetje', 'Source'])
+            sheet.append(['Ana', 'ana@example.si'])
+            sheet.append([None, None, None, None])
+            sheet.append(['Bine', None, 'BETA'])
+            sheet.append([None, None, None, None])  # unused trailing row
+            workbook.save(path)
+            headers, rows, title = parse_xlsx(path, 10)
+            self.assertEqual(title, 'Registrations')
+            self.assertEqual(headers, ['Ime', 'Email', 'Podjetje', 'Source'])
+            self.assertEqual(rows, [
+                ['Ana', 'ana@example.si', '', ''],
+                ['', '', '', ''],
+                ['Bine', '', 'BETA', ''],
+            ])
+
+    def test_xlsx_rejects_cells_beyond_header_width(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'malformed.xlsx'; workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(['Ime', 'Podjetje'])
+            sheet.append(['Ana', 'ALFA', 'unexpected'])
+            workbook.save(path)
+            with self.assertRaisesRegex(UploadError, 'exceeds the header width'):
+                parse_xlsx(path, 10)
+
     def test_slovenian_mapping_identifiers_only_and_ambiguous_headers(self):
         mapping = suggest_mapping(['Naziv podjetja','Davčna številka','Matična','Naslov','Občina'])
         self.assertEqual(mapping,{'company_name':0,'tax_number':1,'registration_number':2,

@@ -23,7 +23,18 @@ def canonical(path):
         (3,'DVOJNIK d.o.o.','1000003','33333333','Prva 3','Celje',30,3,4,40,7,'g3','u3','COMPLETE','now'),
         (4,'DVOJNIK d.o.o.','1000004','44444444','Druga 4','Maribor',40,4,5,50,8,'g4','u4','COMPLETE','now'),
         (5,'KOVINARSTVO HORVAT d.o.o.','1000005','55555555','Peta 5','Ptuj',50,5,6,60,9,'g5','u5','COMPLETE','now'),
-        (6,'PUBLIC d.o.o.','1000006','66666666','Sesta 6','Koper',60,6,7,70,10,'g6','u6','COMPLETE','now');
+        (6,'PUBLIC d.o.o.','1000006','66666666','Sesta 6','Koper',60,6,7,70,10,'g6','u6','COMPLETE','now'),
+        (7,'ANDREJA d.o.o.','1000007','77777777','Sedma 7','Kranj',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        (8,'ZAK d.o.o.','1000008','88888888','Osma 8','Kranj',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        (9,'PSE d.o.o.','1000009','99999999','Deveta 9','Kranj',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        (10,'OMEGA AIR d.o.o. Ljubljana','1000010','10101010','Deseta 10','Ljubljana',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        (11,'REBOLJ, d.o.o. Medvode','1000011','11110000','Enajsta 11','Medvode',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        (12,'IRBIS d.o.o.','1000012','12121212','Dvanajsta 12','Trnovo',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        (13,'AERO 4 M d.o.o.','1000013','13131313','Trinajsta 13','Kranj',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        (14,'TURK M & Z d.o.o.','1000014','14141414','Stirinajsta 14','Kranj',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        (15,'MOJA ČOKOLADA, prodaja čokolad, d.o.o.','1000015','15151515','Petnajsta 15','Kranj',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        (16,'VIZUALNE KOMUNIKACIJE, Andraž Jenkole s.p.','1000016','16161616','Sestnajsta 16','Kranj',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL),
+        (17,'OBMOČNA OBRTNO-PODJETNIŠKA ZBORNICA SEŽANA','1000017','17171717','Sedemnajsta 17','Sežana',NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
       CREATE TABLE website_discovery(
         id INTEGER PRIMARY KEY,company_id INTEGER,website TEXT,status TEXT,
         verified_scope TEXT,relationship TEXT);
@@ -116,7 +127,7 @@ def test_index_is_read_only_and_reuses_only_strict_accepted_data(tmp_path):
     discovery(results)
     before = digest(lite), digest(results)
     index = EnrichmentIndex(lite, [results])
-    assert len(index.companies) == 6
+    assert len(index.companies) == 17
     assert index.company(1)['profit_2025'] == 1
     assert index.company(1)['assets_2025'] == 20
     assert index.enrichment[1]['website'] == 'https://alfa.si/'
@@ -182,6 +193,48 @@ def test_weak_or_public_signals_never_auto_match(tmp_path):
     assert fuzzy.outcome == 'AMBIGUOUS'
     assert fuzzy.company_id is None
     assert any(item.kind == 'FUZZY_NAME' for item in fuzzy.evidence)
+
+
+def test_exact_name_safety_guards_short_single_token_and_diacritics(tmp_path):
+    lite = tmp_path / 'lite.db'; canonical(lite)
+    matcher = ImportMatcher(EnrichmentIndex(lite))
+
+    person_like = matcher.match(row(company_name='andreja'))
+    assert person_like.outcome == 'AMBIGUOUS'
+    assert person_like.conflicts == ('EXACT_NAME_REQUIRES_CORROBORATION',)
+    folded_only = matcher.match(row(company_name='ŽAK d.o.o.'))
+    assert folded_only.outcome == 'AMBIGUOUS'
+    assert folded_only.conflicts == ('EXACT_NAME_REQUIRES_CORROBORATION',)
+    explicit_short_legal_name = matcher.match(row(company_name='PSE d.o.o.'))
+    assert (explicit_short_legal_name.outcome, explicit_short_legal_name.company_id,
+            explicit_short_legal_name.match_method) == ('MATCHED', 9, 'NAME_EXACT')
+
+
+def test_controlled_structural_aliases_authorize_only_unique_strong_shapes(tmp_path):
+    lite = tmp_path / 'lite.db'; canonical(lite)
+    matcher = ImportMatcher(EnrichmentIndex(lite))
+
+    expected = {
+        'Omega Air': (10, 'ALIAS_LEGAL_CORE'),
+        'Rebolj d.o.o.': (11, 'ALIAS_LEGAL_CORE'),
+        'IRBIS d.o.o., PE Trnovo': (12, 'ALIAS_BRANCH_ALIAS'),
+        'Aero4M': (13, 'ALIAS_COMPACT_FULL_NAME'),
+        'Turk mz': (14, 'ALIAS_COMPACT_FULL_NAME'),
+        'Moja Čokolada doo': (15, 'ALIAS_LEADING_CLAUSE'),
+        'Andraz Jenkole sp': (16, 'ALIAS_PROPRIETOR'),
+    }
+    for submitted, (company_id, method) in expected.items():
+        match = matcher.match(row(company_name=submitted))
+        assert (match.outcome, match.company_id, match.match_method) == (
+            'MATCHED', company_id, method), submitted
+        assert any(item.kind == 'ALIAS_RULE' for item in match.evidence)
+
+    # Expanded-name acronyms are useful candidates, but do not authorize alone.
+    acronym = matcher.match(row(company_name='OOZ'))
+    assert acronym.outcome == 'AMBIGUOUS'
+    assert acronym.company_id is None
+    assert any(item.kind == 'CONTROLLED_ALIAS' and item.company_ids == (17,)
+               for item in acronym.evidence)
 
 
 def test_conflicting_strong_evidence_fails_closed(tmp_path):

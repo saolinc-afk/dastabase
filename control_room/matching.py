@@ -11,6 +11,12 @@ from matching.company_matcher import (extract_email_domain, normalize_phone as
 
 
 LEGAL_FORMS = re.compile(r'\b(?:d\s*o\s*o|s\s*p|d\s*d|d\s*n\s*o|k\s*d)\b')
+RAW_LEGAL_FORM = re.compile(
+    r'\b(?:d\s*[.\-]?\s*o\s*[.\-]?\s*o|s\s*[.\-]?\s*p|d\s*[.\-]?\s*d|'
+    r'd\s*[.\-]?\s*n\s*[.\-]?\s*o|k\s*[.\-]?\s*d)\b', re.I)
+BRANCH_SUFFIX = re.compile(
+    r'(?:\s*[,;:/\-]\s*|\s+)(?:p\s*[.\-]?\s*e\s*[.]?|poslovna\s+enota|'
+    r'podru[zž]nica)\b.*$', re.I)
 
 
 def normalize_text(value):
@@ -20,6 +26,77 @@ def normalize_text(value):
 
 def normalize_name(value):
     return ' '.join(LEGAL_FORMS.sub(' ', normalize_text(value)).split())
+
+
+def normalize_name_preserving_diacritics(value):
+    text = str(value or '').strip().lower()
+    text = ''.join(character if character.isalnum() else ' ' for character in text)
+    return ' '.join(LEGAL_FORMS.sub(' ', ' '.join(text.split())).split())
+
+
+def has_explicit_legal_form(value):
+    return bool(RAW_LEGAL_FORM.search(str(value or '')))
+
+
+def canonical_name_aliases(value):
+    """Return deterministic structural aliases, never fuzzy similarity."""
+    raw = str(value or '').strip()
+    aliases = []
+
+    def add(source, rule):
+        alias = normalize_name(source)
+        if alias:
+            aliases.append((alias, rule, normalize_name_preserving_diacritics(source)))
+
+    legal = RAW_LEGAL_FORM.search(raw)
+    if legal:
+        add(raw[:legal.start()], 'LEGAL_CORE')
+    if ',' in raw:
+        add(raw.split(',', 1)[0], 'LEADING_CLAUSE')
+    if legal and re.search(r's\s*[.\-]?\s*p', legal.group(0), re.I) and ',' in raw:
+        add(raw.rsplit(',', 1)[-1], 'PROPRIETOR')
+    for alias, rule, preserved in list(aliases) + [(
+            normalize_name(raw), 'FULL_NAME', normalize_name_preserving_diacritics(raw))]:
+        compact = alias.replace(' ', '')
+        if compact and compact != alias:
+            aliases.append((compact, 'COMPACT_'+rule, preserved.replace(' ', '')))
+    words = normalize_name(raw).split()
+    if len(words) >= 3:
+        aliases.append((''.join(word[0] for word in words), 'ACRONYM',
+                        ''.join(word[0] for word in words)))
+    lexical_words = [word for word in re.findall(
+        r'[^\W_]+(?:-[^\W_]+)*', raw.lower(), re.UNICODE)
+        if word not in {'in', 'ter', 'za'}]
+    if len(lexical_words) >= 3:
+        initials = ''.join(word[0] for word in lexical_words)
+        aliases.append((normalize_text(initials), 'LEXICAL_ACRONYM', initials))
+        # Many organization names end in a locality. This shorter form is only
+        # a review candidate; acronym aliases never authorize by themselves.
+        if len(lexical_words) >= 4:
+            without_last = ''.join(word[0] for word in lexical_words[:-1])
+            aliases.append((normalize_text(without_last),
+                            'LEXICAL_ACRONYM_WITHOUT_SUFFIX', without_last))
+    return tuple(dict.fromkeys(aliases))
+
+
+def submitted_name_aliases(value):
+    raw = str(value or '').strip()
+    aliases = []
+
+    def add(source, rule):
+        alias = normalize_name(source)
+        if alias:
+            aliases.append((alias, rule, normalize_name_preserving_diacritics(source)))
+            compact = alias.replace(' ', '')
+            if compact != alias:
+                aliases.append((compact, 'COMPACT_'+rule,
+                                normalize_name_preserving_diacritics(source).replace(' ', '')))
+
+    add(raw, 'SUBMITTED')
+    without_branch = BRANCH_SUFFIX.sub('', raw).strip()
+    if without_branch != raw:
+        add(without_branch, 'BRANCH_QUALIFIER')
+    return tuple(dict.fromkeys(aliases))
 
 
 def normalize_tax(value):
@@ -166,7 +243,8 @@ class ImportMatcher:
         return MatchEvidence(kind, value, hits, strength) if value else None
 
     def match(self, row, row_key=None):
-        name = normalize_name(self._value(row, 'company_name', 'normalized_name'))
+        raw_name = self._value(row, 'company_name', 'normalized_name')
+        name = normalize_name(raw_name)
         tax = normalize_tax(self._value(row, 'tax_number', 'normalized_tax_number'))
         registration = normalize_registration(self._value(
             row, 'registration_number', 'normalized_registration_number'))
@@ -226,10 +304,93 @@ class ImportMatcher:
                     if narrowed:
                         candidates = narrowed
             if not conflicts and len(candidates) == 1:
+                company_id = next(iter(candidates))
+                corroborated = bool(identity_signals or any(
+                    company_id in signal for signal in location_signals))
+                submitted_preserved = normalize_name_preserving_diacritics(raw_name)
+                canonical_preserved = normalize_name_preserving_diacritics(
+                    self.index.by_id[company_id]['company_name'])
+                tokens = name.split()
+                safe_name = (corroborated or (submitted_preserved == canonical_preserved
+                    and ((len(tokens) >= 2 and len(name) >= 4)
+                         or (has_explicit_legal_form(raw_name) and len(name) >= 3))))
+                if not safe_name:
+                    conflicts.append('EXACT_NAME_REQUIRES_CORROBORATION')
+                    return self._unresolved(row_key, 'AMBIGUOUS', evidence, conflicts)
                 method = ('NAME_DOMAIN' if identity_signals else
                           'NAME_LOCATION' if location_signals else 'NAME_EXACT')
-                return self._matched(row_key, candidates.pop(), method, evidence)
+                return self._matched(row_key, company_id, method, evidence)
             return self._unresolved(row_key, 'AMBIGUOUS', evidence, conflicts)
+
+        alias_evidence = []
+        alias_matches = []
+        for alias, submitted_rule, submitted_preserved in submitted_name_aliases(raw_name):
+            if submitted_rule == 'BRANCH_QUALIFIER':
+                for company_id in sorted(self.index.names.get(alias, ())):
+                    canonical_preserved = normalize_name_preserving_diacritics(
+                        self.index.by_id[company_id]['company_name'])
+                    alias_matches.append((company_id, alias, submitted_rule,
+                                          submitted_preserved, 'FULL_NAME',
+                                          canonical_preserved))
+            for company_id in sorted(self.index.aliases.get(alias, ())):
+                for canonical_rule, canonical_preserved in self.index.alias_rules.get(
+                        (alias, company_id), ()):
+                    alias_matches.append((company_id, alias, submitted_rule,
+                                          submitted_preserved, canonical_rule,
+                                          canonical_preserved))
+            hits = set(self.index.aliases.get(alias, ()))
+            if submitted_rule == 'BRANCH_QUALIFIER':
+                hits.update(self.index.names.get(alias, ()))
+            hits = tuple(sorted(hits))
+            if hits:
+                alias_evidence.append(MatchEvidence('CONTROLLED_ALIAS', alias, hits,
+                                                    'CANDIDATE_ONLY'))
+        alias_candidates = {item[0] for item in alias_matches}
+        if alias_candidates:
+            evidence += tuple(alias_evidence)
+            if len(alias_candidates) == 1:
+                company_id = next(iter(alias_candidates))
+                identity_hit = company_id in (by_kind.get('EMAIL_EXACT', set()) |
+                                              by_kind.get('EMAIL_DOMAIN', set()))
+                authorized = []
+                for item in alias_matches:
+                    _, alias, submitted_rule, submitted_preserved, canonical_rule, canonical_preserved = item
+                    tokens = alias.split()
+                    preserved_equal = submitted_preserved == canonical_preserved
+                    proprietor = (canonical_rule == 'PROPRIETOR'
+                                  and has_explicit_legal_form(raw_name)
+                                  and len(tokens) >= 2)
+                    compact = (canonical_rule.startswith('COMPACT_')
+                               and len(alias) >= 6 and preserved_equal
+                               and (submitted_rule.startswith('COMPACT_')
+                                    or normalize_name(raw_name) == alias))
+                    branch = (submitted_rule == 'BRANCH_QUALIFIER'
+                              and (identity_hit or len(tokens) >= 2
+                                   or (has_explicit_legal_form(raw_name)
+                                       and len(alias) >= 5))
+                              and preserved_equal)
+                    legal_core = (canonical_rule in ('LEGAL_CORE', 'LEADING_CLAUSE')
+                                  and ((len(tokens) >= 2 and len(alias) >= 8)
+                                       or (len(tokens) == 1 and len(alias) >= 5
+                                           and has_explicit_legal_form(raw_name)))
+                                  and preserved_equal)
+                    distinctive_folded_core = (
+                        canonical_rule in ('LEGAL_CORE', 'LEADING_CLAUSE')
+                        and len(tokens) >= 2 and len(alias) >= 10
+                        and normalize_name(raw_name) == alias)
+                    if proprietor or compact or branch or legal_core or distinctive_folded_core:
+                        authorized.append((canonical_rule, submitted_rule))
+                if authorized:
+                    priority = {'PROPRIETOR': 0, 'LEGAL_CORE': 1,
+                                'LEADING_CLAUSE': 2}
+                    canonical_rule, submitted_rule = min(
+                        authorized, key=lambda item: (priority.get(item[0], 3), item))
+                    rule = ('BRANCH_ALIAS' if submitted_rule == 'BRANCH_QUALIFIER'
+                            else canonical_rule)
+                    evidence += (MatchEvidence('ALIAS_RULE', rule, (company_id,), 'STRONG'),)
+                    return self._matched(row_key, company_id, 'ALIAS_'+rule, evidence)
+            return self._unresolved(row_key, 'AMBIGUOUS', evidence,
+                                    ('CONTROLLED_ALIAS_REVIEW',))
 
         domain_candidates = by_kind.get('EMAIL_DOMAIN', set()) | by_kind.get('EMAIL_EXACT', set())
         if domain_candidates:
