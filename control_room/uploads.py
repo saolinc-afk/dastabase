@@ -11,7 +11,11 @@ from openpyxl import load_workbook
 
 
 FIELDS = ('company_name', 'tax_number', 'registration_number', 'address', 'municipality')
+IMPORT_FIELDS = ('person_name', 'email', 'phone', *FIELDS)
 HEADER_ALIASES = {
+    'person_name': {'ime', 'name', 'ime in priimek', 'full name'},
+    'email': {'email', 'e mail', 'e posta', 'elektronska posta'},
+    'phone': {'telefon', 'phone', 'mobile', 'mobitel', 'mobilni telefon'},
     'company_name': {'naziv', 'naziv podjetja', 'podjetje', 'firma', 'company', 'company name'},
     'tax_number': {'davcna', 'davcna stevilka', 'davcna st', 'tax number', 'vat number'},
     'registration_number': {'maticna', 'maticna stevilka', 'maticna st', 'registration number'},
@@ -34,12 +38,48 @@ def header_key(value):
     return re.sub(r'[^a-z0-9]+', ' ', text).strip()
 
 
-def suggest_mapping(headers):
+def _suggest_mapping(headers, fields):
     suggestions = {}
-    for field, aliases in HEADER_ALIASES.items():
+    for field in fields:
+        aliases = HEADER_ALIASES[field]
         matches = [index for index, header in enumerate(headers) if header_key(header) in aliases]
         suggestions[field] = matches[0] if len(matches) == 1 else None
     return suggestions
+
+
+def suggest_mapping(headers):
+    """Preserve the existing company-list mapping contract."""
+    return _suggest_mapping(headers, FIELDS)
+
+
+def suggest_import_mapping(headers):
+    return _suggest_mapping(headers, IMPORT_FIELDS)
+
+
+def normalize_import_row(headers, values, mapping=None, row_key=None):
+    """Create a matching-only registration view without altering source values."""
+    from control_room.matching import (normalize_email, normalize_name, normalize_phone,
+                                       normalize_registration, normalize_tax, normalize_text)
+    if len(headers) != len(values):
+        raise UploadError('Registration row width does not match its headers')
+    mapping = suggest_import_mapping(headers) if mapping is None else dict(mapping)
+    used = [index for index in mapping.values() if index is not None]
+    if (any(type(index) is not int or not 0 <= index < len(headers) for index in used)
+            or len(used) != len(set(used))):
+        raise UploadError('Invalid or duplicate registration column mapping')
+    raw = {field: (values[mapping[field]] if mapping.get(field) is not None else '')
+           for field in IMPORT_FIELDS}
+    return {
+        'row_key': row_key, **raw,
+        'normalized_person_name': normalize_text(raw['person_name']),
+        'normalized_email': normalize_email(raw['email']),
+        'normalized_phone': normalize_phone(raw['phone']),
+        'normalized_name': normalize_name(raw['company_name']),
+        'normalized_tax_number': normalize_tax(raw['tax_number']),
+        'normalized_registration_number': normalize_registration(raw['registration_number']),
+        'normalized_address': normalize_text(raw['address']),
+        'normalized_municipality': normalize_text(raw['municipality']),
+    }
 
 
 def _validate(headers, rows, max_rows, max_columns=100):
