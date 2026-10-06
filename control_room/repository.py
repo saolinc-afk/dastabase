@@ -24,7 +24,7 @@ class JobRepository:
         try:
             conn.executescript(Path(__file__).with_name('schema.sql').read_text())
             self._migrate_adapter_columns(conn)
-            conn.execute('PRAGMA user_version=4')
+            conn.execute('PRAGMA user_version=5')
         finally:
             conn.close()
 
@@ -45,6 +45,12 @@ class JobRepository:
             'import_unresolved_count': 'INTEGER NOT NULL DEFAULT 0',
             'import_resolved_without_ai_count': 'INTEGER NOT NULL DEFAULT 0',
             'import_matched_requires_enrichment_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_matched_company_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_existing_satisfied_company_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_discovery_required_company_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_discovery_processed_company_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_discovery_usable_company_count': 'INTEGER NOT NULL DEFAULT 0',
+            'import_discovery_missing_company_count': 'INTEGER NOT NULL DEFAULT 0',
         }
         for name, definition in additions.items():
             if name not in columns:
@@ -91,6 +97,12 @@ class JobRepository:
                     import_unresolved_count INTEGER NOT NULL DEFAULT 0,
                     import_resolved_without_ai_count INTEGER NOT NULL DEFAULT 0,
                     import_matched_requires_enrichment_count INTEGER NOT NULL DEFAULT 0,
+                    import_matched_company_count INTEGER NOT NULL DEFAULT 0,
+                    import_existing_satisfied_company_count INTEGER NOT NULL DEFAULT 0,
+                    import_discovery_required_company_count INTEGER NOT NULL DEFAULT 0,
+                    import_discovery_processed_company_count INTEGER NOT NULL DEFAULT 0,
+                    import_discovery_usable_company_count INTEGER NOT NULL DEFAULT 0,
+                    import_discovery_missing_company_count INTEGER NOT NULL DEFAULT 0,
                     CHECK(processed_company_count <= selected_company_count))''')
                 source = [row[1] for row in conn.execute('PRAGMA table_info(control_jobs)')]
                 target = {row[1] for row in conn.execute('PRAGMA table_info(control_jobs_import_v4)')}
@@ -116,11 +128,14 @@ class JobRepository:
                     'estimated_input_tokens': 'INTEGER', 'estimated_output_tokens': 'INTEGER',
                     'estimated_cost': 'REAL', 'actual_input_tokens': 'INTEGER',
                     'actual_output_tokens': 'INTEGER', 'actual_cost': 'REAL',
+                    'enrichment_status': "TEXT NOT NULL DEFAULT 'NOT_EVALUATED'",
+                    'enrichment_json': "TEXT NOT NULL DEFAULT '{}'",
+                    'discovery_status': 'TEXT',
                 }
                 for name, definition in additions.items():
                     if name not in columns:
                         conn.execute(f'ALTER TABLE job_items ADD COLUMN {name} {definition}')
-            conn.execute('PRAGMA user_version=4')
+            conn.execute('PRAGMA user_version=5')
         except BaseException:
             if conn.in_transaction:
                 conn.rollback()
@@ -570,6 +585,81 @@ class JobRepository:
         finally:
             conn.close()
 
+    def persist_import_enrichment(self, job_id, payloads, sufficient_ids,
+                                  discovery_ids, *, after_discovery=False):
+        """Fan company enrichment out to matched registration rows atomically."""
+        sufficient_ids = set(sufficient_ids)
+        discovery_ids = set(discovery_ids)
+        conn = self._connect()
+        try:
+            conn.execute('BEGIN IMMEDIATE')
+            job = conn.execute('SELECT * FROM control_jobs WHERE job_id=?',
+                               (job_id,)).fetchone()
+            if not job or job['module'] != 'IMPORT_ENRICH' or job['status'] != 'RUNNING':
+                raise ValueError('Import enrichment requires a running IMPORT_ENRICH job')
+            matched_ids = {row[0] for row in conn.execute('''SELECT DISTINCT company_id
+                FROM job_items WHERE job_id=? AND processing_status='COMPLETED'
+                  AND match_status='MATCHED' AND company_id IS NOT NULL''', (job_id,))}
+            if set(payloads) != matched_ids or not sufficient_ids <= matched_ids:
+                raise ValueError('Import enrichment payload does not match persisted companies')
+            if not discovery_ids <= matched_ids:
+                raise ValueError('Discovery subset contains an unmatched company')
+            for company_id in sorted(matched_ids):
+                sufficient = company_id in sufficient_ids
+                if sufficient:
+                    status = ('SATISFIED_AFTER_DISCOVERY' if after_discovery
+                              and company_id in discovery_ids else 'SATISFIED_EXISTING')
+                    route = 'RESOLVED_WITHOUT_AI'
+                else:
+                    status = ('MISSING_AFTER_DISCOVERY' if after_discovery
+                              and company_id in discovery_ids else 'NEEDS_DISCOVERY')
+                    route = 'MATCHED_REQUIRES_ENRICHMENT'
+                conn.execute('''UPDATE job_items SET enrichment_status=?,enrichment_json=?,
+                    discovery_status=?,route_hint=?,reusable_enrichment=?
+                    WHERE job_id=? AND company_id=? AND match_status='MATCHED' ''',
+                    (status, json.dumps(payloads[company_id], ensure_ascii=False,
+                        sort_keys=True, separators=(',', ':')),
+                     payloads[company_id].get('discovery_status'), route, int(sufficient),
+                     job_id, company_id))
+            row_counts = {row['route_hint']: row['count'] for row in conn.execute('''
+                SELECT route_hint,COUNT(*) count FROM job_items WHERE job_id=?
+                  AND processing_status='COMPLETED' AND match_status='MATCHED'
+                GROUP BY route_hint''', (job_id,))}
+            existing_satisfied = matched_ids - discovery_ids
+            usable_discovery = sufficient_ids & discovery_ids if after_discovery else set()
+            missing_discovery = discovery_ids - usable_discovery if after_discovery else set()
+            stage = 'DISCOVERY' if after_discovery else 'EXISTING_ENRICHMENT'
+            conn.execute('''UPDATE control_jobs SET progress_stage=?,
+                import_matched_company_count=?,import_existing_satisfied_company_count=?,
+                import_discovery_required_company_count=?,import_discovery_usable_company_count=?,
+                import_discovery_missing_company_count=?,import_resolved_without_ai_count=?,
+                import_matched_requires_enrichment_count=? WHERE job_id=?''',
+                (stage, len(matched_ids), len(existing_satisfied), len(discovery_ids),
+                 len(usable_discovery), len(missing_discovery),
+                 row_counts.get('RESOLVED_WITHOUT_AI', 0),
+                 row_counts.get('MATCHED_REQUIRES_ENRICHMENT', 0), job_id))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def update_import_discovery_progress(self, job_id, counts, worker_id):
+        processed = sum(counts.get(key, 0) for key in
+                        ('COMPLETED', 'PARTIAL', 'FAILED', 'INELIGIBLE'))
+        conn = self._connect()
+        try:
+            updated = conn.execute('''UPDATE control_jobs SET progress_stage='DISCOVERY',
+                import_discovery_processed_company_count=?,worker_id=?,worker_heartbeat_at=?
+                WHERE job_id=? AND module='IMPORT_ENRICH' AND status='RUNNING'
+                  AND import_discovery_processed_company_count<=?''',
+                (processed, worker_id, now(), job_id, processed)).rowcount
+            if updated != 1:
+                raise ValueError('Import Discovery progress is invalid or non-monotonic')
+        finally:
+            conn.close()
+
     def job_items(self, job_id):
         conn = self._connect()
         try:
@@ -579,6 +669,7 @@ class JobRepository:
                 item = dict(row)
                 item['match_evidence'] = json.loads(item['match_evidence_json'])
                 item['conflicts'] = json.loads(item['conflicts_json'])
+                item['enrichment'] = json.loads(item['enrichment_json'])
                 result.append(item)
             return result
         finally:

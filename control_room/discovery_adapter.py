@@ -127,11 +127,11 @@ class DiscoveryV2JobAdapter:
         counts.update(websites=result[0] or 0,emails=result[1] or 0,phones=result[2] or 0)
         return counts
 
-    def _sync(self, job_id, results_path, run_id):
+    def _sync(self, results_path, run_id, callback):
         try:
             store = Store(results_path)
             try:
-                self.repository.update_discovery_progress(job_id,self._counts(store,run_id),self.worker_id)
+                callback(self._counts(store,run_id))
             finally:
                 store.close()
         except (OSError,sqlite3.Error,ValueError):
@@ -162,44 +162,60 @@ class DiscoveryV2JobAdapter:
 
     def run(self, job, progress):
         ids = self.repository.selected_company_ids(job['job_id'])
+        outcome, export_rows, _, _ = self.run_subset(job, ids,
+            lambda counts: self.repository.update_discovery_progress(
+                job['job_id'], counts, self.worker_id))
+        directory = self._job_directory(job['job_id'])
+        reconciliation = directory/'enriched_upload.csv'
+        self._reconciliation(job,export_rows,reconciliation)
+        self._record_artifact(job,reconciliation,'UPLOAD_RECONCILIATION')
+        return outcome['status']
+
+    def run_subset(self, job, ids, counts_callback):
+        """Run the existing engine for an explicit immutable company subset."""
         if not ids or len(ids) != len(set(ids)) or any(type(value) is not int or value < 0 for value in ids):
             raise DiscoveryAdapterError('Invalid or empty immutable Discovery manifest')
         if len(ids) > self.max_companies:
             raise DiscoveryAdapterError(
                 f'Live Discovery is limited to {self.max_companies} companies; {len(ids)} were selected')
-        key = self.environ.get('SERPER_API_KEY')
-        if not key:
-            raise DiscoveryAdapterError('SERPER_API_KEY is required for live Discovery')
         directory = self._job_directory(job['job_id'])
         self._write_manifest(job,ids,directory)
         results = directory/'results.sqlite3'
+        if not results.exists() and not self.environ.get('SERPER_API_KEY'):
+            raise DiscoveryAdapterError('SERPER_API_KEY is required for live Discovery')
         store,run_id = self._ensure_run(job,ids,results)
         store.close()
         self._record_artifact(job,results,'DISCOVERY_RESULTS_DB')
-        self._sync(job['job_id'],results,run_id)
+        self._sync(results,run_id,counts_callback)
         stop = threading.Event()
-        monitor = threading.Thread(target=lambda: self._monitor(stop,job['job_id'],results,run_id),daemon=True)
+        monitor = threading.Thread(target=lambda: self._monitor(
+            stop,results,run_id,counts_callback),daemon=True)
         monitor.start()
         try:
             active = Store(results)
             try:
-                outcome = self.runner(active,run_id,provider=self.provider_factory(key))
+                run_status = active.conn.execute(
+                    'SELECT status FROM discovery_runs WHERE run_id=?', (run_id,)).fetchone()['status']
+                if run_status == 'COMPLETED':
+                    outcome = {'status': 'COMPLETED', 'run_id': run_id}
+                else:
+                    key = self.environ.get('SERPER_API_KEY')
+                    if not key:
+                        raise DiscoveryAdapterError('SERPER_API_KEY is required for live Discovery')
+                    outcome = self.runner(active,run_id,provider=self.provider_factory(key))
             finally:
                 active.close()
         finally:
             stop.set(); monitor.join(timeout=2)
-        self._sync(job['job_id'],results,run_id)
+        self._sync(results,run_id,counts_callback)
         self._record_artifact(job,results,'DISCOVERY_RESULTS_DB')
         export_rows = self.export_builder(self.canonical_db,[results],ids,
             run_ids={str(results.resolve()):run_id})
         discovery_csv = directory/'companies.csv'
         self.export_writer(discovery_csv,export_rows,[self.canonical_db,results])
         self._record_artifact(job,discovery_csv,'DISCOVERY_EXPORT')
-        reconciliation = directory/'enriched_upload.csv'
-        self._reconciliation(job,export_rows,reconciliation)
-        self._record_artifact(job,reconciliation,'UPLOAD_RECONCILIATION')
-        return outcome['status']
+        return outcome, export_rows, results, run_id
 
-    def _monitor(self,stop,job_id,results,run_id):
+    def _monitor(self,stop,results,run_id,counts_callback):
         while not stop.wait(self.poll_interval):
-            self._sync(job_id,results,run_id)
+            self._sync(results,run_id,counts_callback)

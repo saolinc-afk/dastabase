@@ -35,6 +35,12 @@ CREATE TABLE IF NOT EXISTS control_jobs (
     import_unresolved_count INTEGER NOT NULL DEFAULT 0,
     import_resolved_without_ai_count INTEGER NOT NULL DEFAULT 0,
     import_matched_requires_enrichment_count INTEGER NOT NULL DEFAULT 0,
+    import_matched_company_count INTEGER NOT NULL DEFAULT 0,
+    import_existing_satisfied_company_count INTEGER NOT NULL DEFAULT 0,
+    import_discovery_required_company_count INTEGER NOT NULL DEFAULT 0,
+    import_discovery_processed_company_count INTEGER NOT NULL DEFAULT 0,
+    import_discovery_usable_company_count INTEGER NOT NULL DEFAULT 0,
+    import_discovery_missing_company_count INTEGER NOT NULL DEFAULT 0,
     CHECK(processed_company_count <= selected_company_count)
 );
 
@@ -123,6 +129,9 @@ CREATE TABLE IF NOT EXISTS job_items (
     actual_input_tokens INTEGER,
     actual_output_tokens INTEGER,
     actual_cost REAL,
+    enrichment_status TEXT NOT NULL DEFAULT 'NOT_EVALUATED',
+    enrichment_json TEXT NOT NULL DEFAULT '{}',
+    discovery_status TEXT,
     PRIMARY KEY(job_id,item_position),
     FOREIGN KEY(upload_id,upload_row_number) REFERENCES upload_rows(upload_id,row_number)
 );
@@ -152,4 +161,4 @@ CREATE INDEX IF NOT EXISTS job_items_processing ON job_items(job_id,processing_s
 CREATE INDEX IF NOT EXISTS job_items_company ON job_items(job_id,company_id,match_status);
 CREATE INDEX IF NOT EXISTS job_artifacts_job ON job_artifacts(job_id,artifact_type);
 
-PRAGMA user_version=4;
+PRAGMA user_version=5;

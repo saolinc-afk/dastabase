@@ -106,7 +106,8 @@ def main(argv=None):
                                            max_companies=args.real_discovery_max_companies)
         result_paths = tuple(filter(None, os.environ.get(
             'CONTROL_ROOM_IMPORT_DISCOVERY_RESULTS', '').split(os.pathsep)))
-        import_enrich = ImportEnrichAdapter(repository, args.canonical, result_paths)
+        import_enrich = ImportEnrichAdapter(repository, args.canonical, result_paths,
+                                             discovery_adapter=discovery)
         Worker(repository,fake,adapters={'FAKE':fake,'DISCOVERY_V2':discovery,
             'IMPORT_ENRICH':import_enrich}).run_forever(args.poll_interval)
     except KeyboardInterrupt:
