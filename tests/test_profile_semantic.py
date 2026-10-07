@@ -1,10 +1,11 @@
-import json
+import json, threading
 
 import pytest
 import requests
 
 from profile_v1.contracts import CandidateClaim, Citation, JsonInterpreter
-from profile_v1.runner import _interpret, _publish, replay
+import profile_v1.runner as runner_module
+from profile_v1.runner import _interpret, _publish, main, recover_response, replay
 from profile_v1.semantic import LiveConfig, LiveInterpreter, PROMPT_VERSION, parse_response
 from profile_v1.store import Store, encode, now, uid
 from profile_v1.taxonomy import TAXONOMY_VERSION
@@ -80,6 +81,23 @@ def test_actual_provider_value_and_evidence_shape_maps_to_contract():
     assert [(x.block_id,x.quote) for x in claims[1].citations]==[
       ('one','Cargo delivery'),('two','Warehousing')]
     assert claims[2].normalized_value=='TRANSPORT_LOGISTICS'
+
+
+def test_normalized_value_only_shapes_map_to_contract():
+    claims=parse_response(response([
+      {'claim_type':'INDUSTRY_CATEGORY','normalized_value':'MANUFACTURING',
+       'evidence':[{'block_id':'one','quote':'manufacturing'}]},
+      {'claim_type':'CUSTOMER_TYPES','normalized_value':['Corporate users','Legal entities'],
+       'evidence':[{'block_id':'two','quote':'corporate users'}]},
+      {'claim_type':'BUSINESS_DESCRIPTION','normalized_value':'Operates a B2B platform.',
+       'evidence':[{'block_id':'three','quote':'B2B platform'}]},
+      {'claim_type':'INTERNATIONAL_SIGNAL','normalized_value':'UNKNOWN','evidence':[]}]))
+    assert [(claim.normalized_value,claim.display_value) for claim in claims]==[
+      ('MANUFACTURING','MANUFACTURING'),
+      (['Corporate users','Legal entities'],'Corporate users, Legal entities'),
+      ('Operates a B2B platform.','Operates a B2B platform.'),
+      ('UNKNOWN','UNKNOWN')]
+    assert claims[-1].citations==()
 
 
 def test_malformed_live_response():
@@ -187,3 +205,114 @@ def test_offline_replay_reparses_preserved_successful_raw_response(tmp_path):
       ('SERVICES','Metal fabrication, Domestic sales','SUPPORTED'),
       ('BUSINESS_DESCRIPTION','Fabricates metal parts for customers.','SUPPORTED')]
     store.close()
+
+
+def failed_recovery_case(tmp_path,citation_block='block'):
+    store,run_id,failed_attempt,company,blocks=corpus(tmp_path)
+    raw=response([
+      {'claim_type':'ACTUAL_PRIMARY_ACTIVITY','normalized_value':'Fabricates metal parts.',
+       'evidence':[{'block_id':citation_block,'quote':'We fabricate metal parts'}]},
+      {'claim_type':'INTERNATIONAL_SIGNAL','normalized_value':'UNKNOWN','evidence':[]},
+      {'claim_type':'BUSINESS_DESCRIPTION','normalized_value':'Fabricates metal parts.',
+       'evidence':[{'block_id':citation_block,'quote':'We fabricate metal parts'}]}])
+    request_id=uid()
+    with store.conn:
+        store.conn.execute("UPDATE profile_runs SET status='RUNNING',started_at=? WHERE run_id=?",(now(),run_id))
+        store.conn.execute("UPDATE profile_attempts SET status='FAILED',finished_at=? WHERE attempt_id=?",(now(),failed_attempt))
+        store.conn.execute("UPDATE profile_run_companies SET status='FAILED' WHERE run_id=? AND company_id=1",(run_id,))
+        store.insert('profile_interpretation_requests',{'request_id':request_id,'run_id':run_id,
+          'attempt_id':failed_attempt,'company_id':1,'provider':'mock','model':'model','model_config_json':'{}',
+          'prompt_version':PROMPT_VERSION,'taxonomy_version':TAXONOMY_VERSION,'input_hash':'input',
+          'request_payload_json':'{}','raw_response_json':encode(raw),'candidate_claims_json':None,
+          'requested_at':now(),'completed_at':now(),'status':'ERROR',
+          'error_message':'Malformed semantic interpreter response','cached_from_request_id':None})
+    path=store.path; store.close(); return path,run_id,failed_attempt,request_id,raw
+
+
+def test_explicit_recovery_of_parser_failed_raw_response(tmp_path):
+    path,run_id,failed_attempt,request_id,raw=failed_recovery_case(tmp_path)
+    assert recover_response(path,run_id,1,request_id)=='PROFILED'
+    store=Store(path)
+    attempts=store.conn.execute('SELECT attempt_id,status,diagnostics_json FROM profile_attempts ORDER BY attempt_number').fetchall()
+    assert attempts[0]['attempt_id']==failed_attempt and attempts[0]['status']=='FAILED'
+    assert attempts[1]['status']=='COMPLETED'
+    assert json.loads(attempts[1]['diagnostics_json'])['recovered_from_request_id']==request_id
+    request=store.conn.execute('SELECT status,raw_response_json FROM profile_interpretation_requests WHERE request_id=?',(request_id,)).fetchone()
+    assert request['status']=='ERROR' and request['raw_response_json']==encode(raw)
+    result=store.conn.execute('SELECT profile_status,claim_count,rejected_claim_ids_json FROM profile_company_results').fetchone()
+    assert result['profile_status']=='PROFILED' and result['claim_count']==2
+    assert len(json.loads(result['rejected_claim_ids_json']))==1
+    rejected=store.conn.execute("SELECT rejection_reason FROM profile_claims WHERE status='REJECTED'").fetchone()[0]
+    assert rejected=='EVIDENCE_REQUIRED'
+    run=store.conn.execute('SELECT status,finished_at FROM profile_runs WHERE run_id=?',(run_id,)).fetchone()
+    assert run['status']=='COMPLETED' and run['finished_at'] is not None
+    selected=store.conn.execute('SELECT selected_attempt_id FROM profile_run_companies').fetchone()[0]
+    citations=store.conn.execute('''SELECT ce.block_id,b.attempt_id FROM profile_claim_evidence ce
+      JOIN profile_content_blocks b ON b.block_id=ce.block_id ORDER BY ce.rowid''').fetchall()
+    assert citations and all(row['block_id']!='block' and row['attempt_id']==selected for row in citations)
+    store.close()
+
+
+def test_repeated_recovery_refuses_without_another_attempt(tmp_path):
+    path,run_id,failed_attempt,request_id,raw=failed_recovery_case(tmp_path)
+    recover_response(path,run_id,1,request_id)
+    with pytest.raises(ValueError,match='failed attempt/company|replace an existing selected attempt'):
+        recover_response(path,run_id,1,request_id)
+    store=Store(path)
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_attempts').fetchone()[0]==2
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_company_results').fetchone()[0]==1
+    store.close()
+
+
+def test_competing_recovery_claims_allow_only_one_success(tmp_path,monkeypatch):
+    path,run_id,failed_attempt,request_id,raw=failed_recovery_case(tmp_path)
+    claimed=threading.Event(); release=threading.Event(); original=runner_module._clone_corpus
+    def paused_clone(*args):
+        claimed.set()
+        assert release.wait(5)
+        return original(*args)
+    monkeypatch.setattr(runner_module,'_clone_corpus',paused_clone)
+    outcomes=[]
+    def invoke():
+        try: outcomes.append(('success',recover_response(path,run_id,1,request_id)))
+        except Exception as error: outcomes.append(('error',error))
+    first=threading.Thread(target=invoke); first.start(); assert claimed.wait(5)
+    second=threading.Thread(target=invoke); second.start(); second.join(5)
+    assert not second.is_alive()
+    release.set(); first.join(5); assert not first.is_alive()
+    assert sum(kind=='success' for kind,_ in outcomes)==1
+    assert sum(kind=='error' and isinstance(value,ValueError) for kind,value in outcomes)==1
+    store=Store(path)
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_attempts').fetchone()[0]==2
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_company_results').fetchone()[0]==1
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_run_companies WHERE selected_attempt_id IS NOT NULL').fetchone()[0]==1
+    store.close()
+
+
+def test_unmapped_recovery_citation_fails_new_attempt_only(tmp_path):
+    path,run_id,failed_attempt,request_id,raw=failed_recovery_case(tmp_path,'missing-block')
+    with pytest.raises(KeyError): recover_response(path,run_id,1,request_id)
+    store=Store(path)
+    attempts=store.conn.execute('SELECT attempt_id,status FROM profile_attempts ORDER BY attempt_number').fetchall()
+    assert [row['status'] for row in attempts]==['FAILED','FAILED']
+    assert attempts[0]['attempt_id']==failed_attempt
+    company=store.conn.execute('SELECT status,selected_attempt_id FROM profile_run_companies').fetchone()
+    assert tuple(company)==('FAILED',None)
+    request=store.conn.execute('SELECT status,raw_response_json FROM profile_interpretation_requests').fetchone()
+    assert request['status']=='ERROR' and request['raw_response_json']==encode(raw)
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_company_results').fetchone()[0]==0
+    store.close()
+
+
+def test_recover_response_cli_dispatch(tmp_path,monkeypatch):
+    captured={}
+    monkeypatch.setattr(runner_module,'recover_response',lambda *args:captured.setdefault('args',args))
+    main(['recover-response','--results','profile.sqlite3','--run-id','run-id',
+      '--company-id','669','--request-id','request-id'])
+    assert captured['args']==('profile.sqlite3','run-id',669,'request-id')
+
+
+def test_recovery_never_calls_live_provider(tmp_path,monkeypatch):
+    path,run_id,failed_attempt,request_id,raw=failed_recovery_case(tmp_path)
+    monkeypatch.setattr(LiveInterpreter,'call',lambda *args:pytest.fail('live provider called'))
+    assert recover_response(path,run_id,1,request_id)=='PROFILED'

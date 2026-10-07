@@ -139,6 +139,7 @@ def parse_response(response):
         candidates=[]
         for row in rows:
             value=row.get('value',row.get('display_value'))
+            if value is None: value=row.get('normalized_value')
             if isinstance(value,str): display=value
             elif isinstance(value,list) and all(isinstance(item,str) for item in value):
                 display=', '.join(value)
