@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 
 from discovery.domain_generator import normalize_domain
 from discovery.domain_policy import blocks_official
@@ -48,10 +49,32 @@ def row_value(row, name):
 
 
 def timestamp(value):
+    """Comparable timestamp; malformed/missing legacy values sort oldest."""
     if not value:
-        return datetime.min
-    parsed = datetime.fromisoformat(value)
-    return parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
+        return float('-inf')
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return float('-inf')
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).timestamp()
+
+
+def freeze(value):
+    if isinstance(value, dict):
+        return MappingProxyType({key:freeze(item) for key,item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(freeze(item) for item in value)
+    return value
+
+
+def thaw(value):
+    if isinstance(value, dict) or isinstance(value, MappingProxyType):
+        return {key:thaw(item) for key,item in value.items()}
+    if isinstance(value, tuple):
+        return [thaw(item) for item in value]
+    return value
 
 
 @dataclass(frozen=True)
@@ -69,8 +92,12 @@ class CompanyKnowledgeSnapshot:
     company_id: int
     identity: dict
     financials: dict
+    identity_provenance: dict = field(default_factory=dict)
+    financial_provenance: dict = field(default_factory=dict)
     website: KnowledgeFact | None = None
+    emails: tuple[KnowledgeFact, ...] = ()
     default_email: KnowledgeFact | None = None
+    phones: tuple[KnowledgeFact, ...] = ()
     default_phone: KnowledgeFact | None = None
     conflicts: tuple[dict, ...] = ()
     missing_fields: tuple[str, ...] = ()
@@ -135,6 +162,12 @@ class KnowledgeRepository:
                 'source_database': str(database), 'source_company_id': company_id,
                 **values}
 
+    def _canonical_provenance(self, company_id, field_name):
+        company = self.by_id[company_id]
+        return self._provenance('CANONICAL', 'CANONICAL_LITE', self.canonical_path,
+            company_id, table='companies_lite', record_id=company_id, field=field_name,
+            observed_at=company.get('collected_at'))
+
     def _load_sparrow(self):
         result = {company_id: {'websites': [], 'emails': []} for company_id in self.by_id}
         _, conn = readonly(self.canonical_path)
@@ -171,7 +204,7 @@ class KnowledgeRepository:
                 prov = self._provenance('SPARROW','SPARROW_0.9',self.canonical_path,
                     company_id, record_id=row['id'], table='website_discovery',
                     confidence=row_value(row,'confidence'), status=row['status'],
-                    rule_version=row_value(row,'rule_version'), evidence_reference=row['id'],
+                    rule_version=row_value(row,'rule_version'), evidence_ids=(str(row['id']),),
                     observed_at=row_value(row,'checked_at') or row_value(row,'discovered_at'))
                 result[company_id]['websites'].append(
                     {'value': value, 'status': 'VERIFIED', 'provenance': prov})
@@ -208,7 +241,7 @@ class KnowledgeRepository:
                 prov = self._provenance('SPARROW','SPARROW_0.9',self.canonical_path,
                     company_id, record_id=row['id'], table='email_discovery',
                     confidence=row_value(row,'confidence'), status='ATTRIBUTED_FIRST_PARTY_DOMAIN',
-                    role='UNKNOWN', evidence_reference=row['id'],
+                    role='UNKNOWN', evidence_ids=(str(row['id']),),
                     page_url=row_value(row,'page_url'), observed_at=row_value(row,'checked_at') or
                     row_value(row,'discovered_at'))
                 result[company_id]['emails'].append(
@@ -261,62 +294,100 @@ class KnowledgeRepository:
                     result_id=row['discovery_result_id'], completed_at=row['discovery_completed_at'],
                     rule_version=row['discovery_rule_version'], source_index=source_index)
                 if row['website'] and row['website_status'] in USABLE:
+                    website_evidence = tuple(json.loads(row['website_evidence_ids']))
                     result[company_id]['websites'].append({'value':row['website'],
                         'status':row['website_status'], 'completed_at':row['discovery_completed_at'],
                         'source_index':source_index, 'provenance':{**base,
                         'status':row['website_status'],
-                        'evidence_reference':row['website_evidence_ids'],
+                        'evidence_ids':website_evidence,
                         'observation_id':row['website_observation_id']}})
-                    if row['default_email']:
-                        result[company_id]['emails'].append({'value':row['default_email'],
-                            'status':row['email_attribution_status'],
-                            'completed_at':row['discovery_completed_at'],'source_index':source_index,
-                            'provenance':{**base,'status':row['email_attribution_status'],
-                            'role':row['email_role'],
-                            'evidence_reference':row['email_supporting_observation_ids'],
-                            'observation_id':row['email_primary_observation_id']}})
-                    if row['default_phone']:
-                        result[company_id]['phones'].append({'value':row['default_phone'],
-                            'status':row['phone_attribution_status'],
-                            'completed_at':row['discovery_completed_at'],'source_index':source_index,
-                            'provenance':{**base,'status':row['phone_attribution_status'],
-                            'role':row['phone_role'],
-                            'evidence_reference':row['phone_supporting_observation_ids'],
-                            'observation_id':row['phone_primary_observation_id']}})
+                if row['default_email']:
+                    email_evidence = tuple(json.loads(row['email_supporting_observation_ids']))
+                    result[company_id]['emails'].append({'value':row['default_email'],
+                        'status':row['email_attribution_status'],
+                        'completed_at':row['discovery_completed_at'],'source_index':source_index,
+                        'provenance':{**base,'status':row['email_attribution_status'],
+                        'role':row['email_role'], 'contact_rule_version':row['email_rule_version'],
+                        'evidence_ids':email_evidence,
+                        'observation_id':row['email_primary_observation_id']}})
+                if row['default_phone']:
+                    phone_evidence = tuple(json.loads(row['phone_supporting_observation_ids']))
+                    result[company_id]['phones'].append({'value':row['default_phone'],
+                        'status':row['phone_attribution_status'],
+                        'completed_at':row['discovery_completed_at'],'source_index':source_index,
+                        'provenance':{**base,'status':row['phone_attribution_status'],
+                        'role':row['phone_role'], 'contact_rule_version':row['phone_rule_version'],
+                        'evidence_ids':phone_evidence,
+                        'observation_id':row['phone_primary_observation_id']}})
         return result
 
     def _ordered(self, entries):
+        def identity(item):
+            return (item.get('source_index', 10**9), str(item.get('run_id') or
+                    item.get('provenance', {}).get('run_id') or ''),
+                    str(item.get('provenance', {}).get('attempt_id') or ''),
+                    str(item.get('provenance', {}).get('result_id') or ''), item['value'])
         if self.precedence == 'input-order':
             return sorted(entries, key=lambda item: (
-                item.get('source_index', 10**9), -timestamp(item.get('completed_at')).timestamp()))
-        return sorted(entries, key=lambda item: timestamp(item.get('completed_at')), reverse=True)
+                item.get('source_index', 10**9), -timestamp(item.get('completed_at')),
+                identity(item)))
+        return sorted(entries, key=lambda item: (
+            -timestamp(item.get('completed_at')), identity(item)))
 
-    def _fact(self, discovery, sparrow=()):
+    @staticmethod
+    def _knowledge_fact(selected, same, conflicts=()):
+        observed = selected.get('completed_at') or selected['provenance'].get('observed_at')
+        return KnowledgeFact(selected['value'], selected.get('status'),
+            tuple(freeze(entry['provenance']) for entry in same),
+            tuple(freeze(conflict) for conflict in conflicts), observed,
+            selected.get('stale'))
+
+    def _singular_fact(self, field_name, discovery, sparrow=()):
         entries = self._ordered(discovery)
         entries.extend(sparrow)
         if not entries: return None
-        selected = entries[0]
-        same = [entry for entry in entries if entry['value'] == selected['value']]
-        distinct = []
+        grouped = []
         for entry in entries:
-            if entry['value'] != selected['value'] and entry['value'] not in {
-                    item['value'] for item in distinct}:
-                distinct.append(entry)
-        conflicts = tuple({'selected_value':selected['value'],
-            'conflicting_value':entry['value'], 'provenance':entry['provenance']}
-            for entry in distinct)
-        observed = selected.get('completed_at') or selected['provenance'].get('observed_at')
-        stale = self.stale_policy(selected) if self.stale_policy else None
-        return KnowledgeFact(selected['value'], selected.get('status'),
-            tuple(entry['provenance'] for entry in same), conflicts, observed, stale)
+            same = next((group for group in grouped if group[0]['value'] == entry['value']), None)
+            if same is None:
+                grouped.append([entry])
+            else:
+                same.append(entry)
+        selected, same = grouped[0][0], grouped[0]
+        conflicts = tuple({'field':field_name, 'selected_value':selected['value'],
+            'conflicting_value':group[0]['value'],
+            'evidence_locators':tuple(entry['provenance'] for entry in group)}
+            for group in grouped[1:])
+        selected = {**selected, 'stale':self.stale_policy(selected)
+                    if self.stale_policy else None}
+        return self._knowledge_fact(selected, same, conflicts)
+
+    def _multi_facts(self, discovery, sparrow=()):
+        entries = self._ordered(discovery)
+        entries.extend(sparrow)
+        grouped = []
+        for entry in entries:
+            same = next((group for group in grouped if group[0]['value'] == entry['value']), None)
+            if same is None:
+                grouped.append([entry])
+            else:
+                same.append(entry)
+        facts = []
+        for same in grouped:
+            selected = {**same[0], 'stale':self.stale_policy(same[0])
+                        if self.stale_policy else None}
+            facts.append(self._knowledge_fact(selected, same))
+        return tuple(facts)
 
     def _snapshot(self, company_id):
         company = self.by_id[company_id]
         discovered = self._discovery[company_id]
         sparrow = self._sparrow[company_id]
-        website = self._fact(discovered['websites'], sparrow['websites'])
-        email = self._fact(discovered['emails'], sparrow['emails'])
-        phone = self._fact(discovered['phones'])
+        website = self._singular_fact('website', discovered['websites'], sparrow['websites'])
+        emails = self._multi_facts(discovered['emails'], sparrow['emails'])
+        phones = self._multi_facts(discovered['phones'])
+        email = emails[0] if emails else None
+        phone = phones[0] if phones else None
         facts = {'website':website, 'default_email':email, 'default_phone':phone}
         conflicts = tuple(conflict for fact in facts.values() if fact
                           for conflict in fact.conflicts)
@@ -326,35 +397,83 @@ class KnowledgeRepository:
                     'registration_number','address','municipality')}
         financials = {key:company.get(key) for key in ('revenue_2025','profit_2025',
                       'employees_2025','assets_2025','capital_2025')}
-        return CompanyKnowledgeSnapshot(company_id,identity,financials,website,email,phone,
-                                        conflicts,missing,stale)
+        identity_provenance = {key:freeze(self._canonical_provenance(company_id,key))
+                               for key in identity}
+        financial_provenance = {key:freeze(self._canonical_provenance(company_id,key))
+                                for key in financials}
+        return CompanyKnowledgeSnapshot(company_id,freeze(identity),freeze(financials),
+            freeze(identity_provenance),freeze(financial_provenance),website,emails,email,
+            phones,phone,conflicts,missing,stale)
 
     def snapshot(self, company_id):
         try: return self._snapshots[company_id]
         except KeyError as exc: raise ValueError(f'Unknown canonical company {company_id}') from exc
+
+    def iter_snapshots(self, company_ids=None):
+        """Yield this point-in-time snapshot in canonical company-ID order."""
+        if company_ids is None:
+            ids = sorted(self._snapshots)
+        else:
+            requested = tuple(company_ids)
+            if any(type(value) is not int for value in requested):
+                raise ValueError('Company subset must contain unique integer IDs')
+            if len(set(requested)) != len(requested):
+                raise ValueError('Company subset must contain unique integer IDs')
+            ids = sorted(requested)
+        for company_id in ids:
+            yield self.snapshot(company_id)
+
+    @staticmethod
+    def _fact_record(fact):
+        if fact is None: return None
+        return {'value':fact.value, 'status':fact.status, 'observed_at':fact.observed_at,
+                'stale':fact.stale,
+                'evidence_locators':[thaw(item) for item in fact.provenance]}
+
+    def record(self, company_id):
+        """Return an independent JSON-serializable company knowledge record."""
+        snapshot = self.snapshot(company_id)
+        return {'company_id':company_id, 'identity':thaw(snapshot.identity),
+            'identity_provenance':thaw(snapshot.identity_provenance),
+            'financials':thaw(snapshot.financials),
+            'financial_provenance':thaw(snapshot.financial_provenance),
+            'website':self._fact_record(snapshot.website),
+            'emails':[self._fact_record(fact) for fact in snapshot.emails],
+            'default_email':self._fact_record(snapshot.default_email),
+            'phones':[self._fact_record(fact) for fact in snapshot.phones],
+            'default_phone':self._fact_record(snapshot.default_phone),
+            'conflicts':thaw(snapshot.conflicts),
+            'missing_fields':list(snapshot.missing_fields),
+            'stale_fields':list(snapshot.stale_fields)}
 
     def missing(self, company_id, requested=('website','default_email','default_phone')):
         snapshot = self.snapshot(company_id)
         return tuple(name for name in requested if getattr(snapshot,name) is None)
 
     def as_enrichment(self):
+        """Compatibility projection for matching and durable Import payloads."""
         values = {}
         for company_id, snapshot in self._snapshots.items():
             provenance = []
-            for fact in (snapshot.website,snapshot.default_email,snapshot.default_phone):
+            for fact in ((snapshot.website,) if snapshot.website else ()) + snapshot.emails + snapshot.phones:
                 if fact: provenance.extend(fact.provenance)
             sources = list(dict.fromkeys(item['source_type'] for item in provenance))
             values[company_id] = {'website':snapshot.website.value if snapshot.website else None,
                 'website_status':snapshot.website.status if snapshot.website else None,
                 'default_email':snapshot.default_email.value if snapshot.default_email else None,
                 'default_phone':snapshot.default_phone.value if snapshot.default_phone else None,
-                'sources':sources, 'provenance':provenance,
-                'knowledge_conflicts':list(snapshot.conflicts)}
-            if snapshot.default_email:
-                values[company_id]['accepted_emails']=[{'value':snapshot.default_email.value,
-                    'source':snapshot.default_email.provenance[0]['source_type'],
-                    'record_id':snapshot.default_email.provenance[0].get('record_id') or
-                                snapshot.default_email.provenance[0].get('result_id')}]
+                'sources':sources, 'provenance':[thaw(item) for item in provenance],
+                'knowledge_conflicts':thaw(snapshot.conflicts),
+                'accepted_emails':[{'value':fact.value,
+                    'source':fact.provenance[0]['source_type'],
+                    'record_id':fact.provenance[0].get('record_id') or
+                                fact.provenance[0].get('result_id')}
+                    for fact in snapshot.emails],
+                'accepted_phones':[{'value':fact.value,
+                    'source':fact.provenance[0]['source_type'],
+                    'record_id':fact.provenance[0].get('record_id') or
+                                fact.provenance[0].get('result_id')}
+                    for fact in snapshot.phones]}
         return values
 
     def inventory(self):

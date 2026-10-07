@@ -82,5 +82,9 @@ class EnrichmentIndex:
 
     def has_reusable_enrichment(self, company_id):
         record = self.enrichment[company_id]
-        return bool(record.get('website') or record.get('default_email') or
-                    record.get('default_phone'))
+        # Matching's historical routing signal meant that an accepted official
+        # website existed. Contacts used to be loaded only alongside one. The
+        # knowledge layer now correctly retains independently attributed
+        # contacts, but a contact-only REVIEW result must still route through
+        # normal enrichment rather than changing matcher business outcomes.
+        return bool(record.get('website'))

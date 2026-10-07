@@ -80,6 +80,53 @@ erase older accepted facts, and conflicting accepted values remain available
 in snapshot conflict metadata. Registry-order precedence is also available for
 audits that require caller-controlled source priority.
 
+### Shared company knowledge
+
+`KnowledgeRepository` is the shared, read-only company view used by Control
+Room. It combines canonical identity and 2025 financial fields with strictly
+accepted SPARROW 0.9 and Discovery v2 website/contact results. It does not write
+to any source database, retrieve raw evidence, or perform network requests.
+
+The stable public API is:
+
+- `snapshot(company_id)` for a deeply read-only typed snapshot;
+- `iter_snapshots(company_ids=None)` for deterministic canonical-ID iteration,
+  optionally restricted to an explicit subset;
+- `record(company_id)` for an independent JSON-serializable projection.
+
+The record projection contains `company_id`, `identity` and
+`identity_provenance`, `financials` and `financial_provenance`, the selected
+`website`, all `emails` plus `default_email`, all `phones` plus
+`default_phone`, and `conflicts`, `missing_fields`, and `stale_fields`. Each
+website/contact fact contains `value`, `status`, `observed_at`, `stale`, and
+`evidence_locators`.
+
+Canonical identity and financial fields retain per-field canonical provenance.
+Website is singular: accepted Discovery statuses are `VERIFIED`, `HIGH`, and
+`MEDIUM`, with the existing safe SPARROW fallback. Under the default `newest`
+policy, the newest accepted Discovery value wins; `input-order` lets an audit
+use the explicitly supplied database order. Distinct accepted website values
+remain field-labelled conflicts with evidence locators.
+
+Emails and phones are multi-value knowledge. All accepted contacts are retained
+and the first value under the same deterministic source precedence is the
+explicit default. A persisted Discovery default contact is eligible when its
+attribution is `ATTRIBUTED`, even when the result's website remains `REVIEW`.
+Normal alternative contacts are not conflicts. SPARROW email acceptance keeps
+its existing first-party domain and attribution restrictions.
+
+Each accepted SPARROW or Discovery fact exposes structured evidence locators:
+the source namespace/database and company ID, plus the applicable legacy row or
+Discovery run, attempt, result, observation, evidence, and rule identifiers.
+Locators identify the persisted source; they do not embed raw HTML or create a
+second evidence store.
+
+A repository instance is an immutable point-in-time view. It never live-refreshes
+while a Discovery run writes new results. Construct a new repository instance
+to observe newly completed results. Import & Enrich persists the selected
+record into its durable job payload, and XLSX export continues to read that
+payload rather than reopening live source databases.
+
 ## Discovery v2 jobs
 
 Upload jobs explicitly select either `FAKE` or `DISCOVERY_V2` at confirmation.

@@ -9,15 +9,6 @@ from control_room.matching import ImportMatcher
 from control_room.uploads import normalize_import_row
 
 
-def enrichment_sufficient(record):
-    """Initial Import policy: official website plus attributed default email.
-
-    Phone is retained when available but its absence alone does not justify a
-    paid Discovery call.
-    """
-    return bool(record.get('website') and record.get('default_email'))
-
-
 class ImportEnrichAdapter:
     def __init__(self, repository, canonical_db, discovery_results=(), *,
                  discovery_adapter=None, item_hook=None, identity_results=None,
@@ -59,10 +50,10 @@ class ImportEnrichAdapter:
         matched_ids = sorted({item['company_id'] for item in
             self.repository.job_items(job['job_id'])
             if item['match_status'] == 'MATCHED' and item['company_id'] is not None})
-        payloads = {company_id: self._payload(index, company_id)
+        payloads = {company_id: self._payload(knowledge, company_id)
                     for company_id in matched_ids}
         sufficient = {company_id for company_id in matched_ids
-                      if enrichment_sufficient(index.enrichment[company_id])}
+                      if knowledge.snapshot(company_id).sufficient_for_import()}
         discovery_ids = set(matched_ids) - sufficient
         for company_id in discovery_ids:
             payloads[company_id]['discovery_status'] = 'PENDING'
@@ -82,17 +73,13 @@ class ImportEnrichAdapter:
         refreshed_knowledge = KnowledgeRepository(self.canonical_db,
             [*self.discovery_results, results_path],
             run_ids={str(Path(results_path).resolve()): run_id})
-        refreshed = EnrichmentIndex(self.canonical_db, knowledge=refreshed_knowledge)
         discovery_status = {row['company_id']: row.get('website_status') or 'REVIEW'
                             for row in export_rows}
-        merged = {company_id: (refreshed.enrichment[company_id]
-                  if refreshed.enrichment[company_id].get('website')
-                  else index.enrichment[company_id]) for company_id in matched_ids}
-        payloads = {company_id: self._payload(refreshed, company_id,
-                    discovery_status.get(company_id), merged[company_id])
+        payloads = {company_id: self._payload(refreshed_knowledge, company_id,
+                    discovery_status.get(company_id))
                     for company_id in matched_ids}
         sufficient = {company_id for company_id in matched_ids
-                      if enrichment_sufficient(merged[company_id])}
+                      if refreshed_knowledge.snapshot(company_id).sufficient_for_import()}
         self.repository.persist_import_enrichment(job['job_id'], payloads, sufficient,
             discovery_ids, after_discovery=True)
         self._export(job['job_id'])
@@ -109,9 +96,12 @@ class ImportEnrichAdapter:
         return export_import_xlsx(self.repository, job_id, self.storage_root)
 
     @staticmethod
-    def _payload(index, company_id, discovery_status=None, enrichment=None):
-        company = index.by_id[company_id]
-        enrichment = enrichment or index.enrichment[company_id]
+    def _payload(knowledge, company_id, discovery_status=None):
+        record = knowledge.record(company_id)
+        company = record['identity']
+        financials = record['financials']
+        facts = ([record['website']] if record['website'] else []) + record['emails'] + record['phones']
+        provenance = [locator for fact in facts for locator in fact['evidence_locators']]
         return {
             'canonical_company_id': company_id,
             'canonical_company_name': company.get('company_name'),
@@ -119,16 +109,20 @@ class ImportEnrichAdapter:
             'registration_number': company.get('registration_number'),
             'address': company.get('address'),
             'municipality': company.get('municipality'),
-            'revenue_2025': company.get('revenue_2025'),
-            'profit_2025': company.get('profit_2025'),
-            'employees_2025': company.get('employees_2025'),
-            'assets_2025': company.get('assets_2025'),
-            'capital_2025': company.get('capital_2025'),
-            'official_website': enrichment.get('website'),
-            'website_status': enrichment.get('website_status'),
-            'default_email': enrichment.get('default_email'),
-            'default_phone': enrichment.get('default_phone'),
-            'sources': list(enrichment.get('sources', ())),
-            'provenance': list(enrichment.get('provenance', ())),
-            'discovery_status': discovery_status or enrichment.get('website_status'),
+            'revenue_2025': financials.get('revenue_2025'),
+            'profit_2025': financials.get('profit_2025'),
+            'employees_2025': financials.get('employees_2025'),
+            'assets_2025': financials.get('assets_2025'),
+            'capital_2025': financials.get('capital_2025'),
+            'official_website': record['website']['value'] if record['website'] else None,
+            'website_status': record['website']['status'] if record['website'] else None,
+            'default_email': (record['default_email']['value']
+                              if record['default_email'] else None),
+            'default_phone': (record['default_phone']['value']
+                              if record['default_phone'] else None),
+            'sources': list(dict.fromkeys(item['source_type'] for item in provenance)),
+            'provenance': provenance,
+            'knowledge_conflicts': record['conflicts'],
+            'discovery_status': (discovery_status or
+                                 (record['website']['status'] if record['website'] else None)),
         }

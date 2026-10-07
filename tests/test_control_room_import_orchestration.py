@@ -7,6 +7,7 @@ import pytest
 
 from control_room.import_enrich_adapter import ImportEnrichAdapter
 from control_room.discovery_adapter import DiscoveryV2JobAdapter
+from control_room.knowledge_repository import KnowledgeRepository
 from control_room.repository import JobRepository
 from control_room.worker import Worker
 
@@ -183,6 +184,13 @@ def test_import_job_persists_rows_evidence_partitions_and_deduplicated_future_wo
     assert items[2]['enrichment']['default_email'] == 'info2@company-2.si'
     assert items[2]['enrichment']['default_phone'] == '+386100002'
     assert items[2]['enrichment'] == items[3]['enrichment']
+    initial_knowledge = KnowledgeRepository(source)
+    assert items[0]['enrichment'] == ImportEnrichAdapter._payload(initial_knowledge, 1)
+    refreshed_path = tmp_path/'results-1.sqlite3'
+    refreshed_knowledge = KnowledgeRepository(source, [refreshed_path],
+        run_ids={str(refreshed_path.resolve()): 'run'})
+    assert items[2]['enrichment'] == ImportEnrichAdapter._payload(
+        refreshed_knowledge, 2, 'HIGH')
     assert len(repository.upload_rows('u')) == 6
     assert digest(source) == before
 
