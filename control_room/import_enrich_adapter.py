@@ -3,6 +3,7 @@ from pathlib import Path
 
 from control_room.enrichment_index import EnrichmentIndex
 from control_room.identity_adapter import IdentityResolutionAdapter
+from control_room.import_export import export_import_xlsx
 from control_room.knowledge_repository import KnowledgeRepository
 from control_room.matching import ImportMatcher
 from control_room.uploads import normalize_import_row
@@ -20,7 +21,7 @@ def enrichment_sufficient(record):
 class ImportEnrichAdapter:
     def __init__(self, repository, canonical_db, discovery_results=(), *,
                  discovery_adapter=None, item_hook=None, identity_results=None,
-                 identity_task_cap=1000, identity_query_cap=2000):
+                 identity_task_cap=1000, identity_query_cap=2000, storage_root=None):
         self.repository = repository
         self.canonical_db = Path(canonical_db).expanduser().absolute()
         self.discovery_results = tuple(discovery_results)
@@ -29,6 +30,8 @@ class ImportEnrichAdapter:
         self.identity_results = identity_results
         self.identity_task_cap = identity_task_cap
         self.identity_query_cap = identity_query_cap
+        self.storage_root = (Path(storage_root).expanduser().absolute()
+                             if storage_root is not None else None)
         self.worker_id = None
 
     def run(self, job, progress):
@@ -66,6 +69,7 @@ class ImportEnrichAdapter:
         self.repository.persist_import_enrichment(
             job['job_id'], payloads, sufficient, discovery_ids)
         if not discovery_ids:
+            self._export(job['job_id'])
             return 'COMPLETED'
         if self.discovery_adapter is None:
             raise ValueError('Selective Discovery adapter is not configured')
@@ -91,7 +95,18 @@ class ImportEnrichAdapter:
                       if enrichment_sufficient(merged[company_id])}
         self.repository.persist_import_enrichment(job['job_id'], payloads, sufficient,
             discovery_ids, after_discovery=True)
+        self._export(job['job_id'])
         return 'PARTIAL' if outcome['status'] == 'PARTIAL' else 'COMPLETED'
+
+    def _export(self, job_id):
+        if self.storage_root is None:
+            return None
+        items = self.repository.job_items(job_id)
+        upload = self.repository.get_upload(items[0]['upload_id']) if items else None
+        if not upload or upload['format'] != 'XLSX':
+            return None
+        self.repository.set_import_stage(job_id, 'EXPORT', self.worker_id)
+        return export_import_xlsx(self.repository, job_id, self.storage_root)
 
     @staticmethod
     def _payload(index, company_id, discovery_status=None, enrichment=None):

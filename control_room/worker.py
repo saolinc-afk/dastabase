@@ -109,7 +109,8 @@ def main(argv=None):
         result_paths = tuple(filter(None, os.environ.get(
             'CONTROL_ROOM_IMPORT_DISCOVERY_RESULTS', '').split(os.pathsep)))
         import_enrich = ImportEnrichAdapter(repository, args.canonical, result_paths,
-                                             discovery_adapter=discovery)
+                                             discovery_adapter=discovery,
+                                             storage_root=args.storage_root)
         Worker(repository,fake,adapters={'FAKE':fake,'DISCOVERY_V2':discovery,
             'IMPORT_ENRICH':import_enrich}).run_forever(args.poll_interval)
     except KeyboardInterrupt:
