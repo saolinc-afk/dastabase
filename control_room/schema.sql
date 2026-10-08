@@ -1,5 +1,12 @@
 PRAGMA foreign_keys=ON;
 
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ACTIVE' CHECK(status IN ('ACTIVE','DISABLED')),
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS control_jobs (
     job_number INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id TEXT NOT NULL UNIQUE,
@@ -56,6 +63,10 @@ CREATE TABLE IF NOT EXISTS control_jobs (
     identity_estimated_cost REAL,
     identity_actual_cost REAL,
     identity_approval_status TEXT NOT NULL DEFAULT 'NOT_CONFIGURED',
+    workspace_id TEXT REFERENCES workspaces(workspace_id),
+    origin_surface TEXT NOT NULL DEFAULT 'CONTROL_ROOM'
+        CHECK(origin_surface IN ('CONTROL_ROOM','MERLIN')),
+    CHECK(origin_surface != 'MERLIN' OR workspace_id IS NOT NULL),
     CHECK(processed_company_count <= selected_company_count)
 );
 
@@ -90,7 +101,11 @@ CREATE TABLE IF NOT EXISTS uploads (
     headers_json TEXT NOT NULL,
     mapping_json TEXT NOT NULL DEFAULT '{}',
     row_count INTEGER NOT NULL CHECK(row_count >= 0),
-    status TEXT NOT NULL CHECK(status IN ('MAPPING','REVIEW','CONFIRMED'))
+    status TEXT NOT NULL CHECK(status IN ('MAPPING','REVIEW','CONFIRMED')),
+    workspace_id TEXT REFERENCES workspaces(workspace_id),
+    origin_surface TEXT NOT NULL DEFAULT 'CONTROL_ROOM'
+        CHECK(origin_surface IN ('CONTROL_ROOM','MERLIN')),
+    CHECK(origin_surface != 'MERLIN' OR workspace_id IS NOT NULL)
 );
 
 CREATE TABLE IF NOT EXISTS upload_rows (
@@ -249,4 +264,4 @@ CREATE INDEX IF NOT EXISTS job_artifacts_job ON job_artifacts(job_id,artifact_ty
 CREATE INDEX IF NOT EXISTS identity_tasks_job ON identity_resolution_tasks(job_id,status);
 CREATE INDEX IF NOT EXISTS identity_queries_task ON identity_search_queries(task_id,sequence);
 
-PRAGMA user_version=6;
+PRAGMA user_version=7;

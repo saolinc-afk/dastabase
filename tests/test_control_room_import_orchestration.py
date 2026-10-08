@@ -393,7 +393,7 @@ def test_v3_control_room_migrates_without_losing_existing_discovery_job(tmp_path
     )
     lines = [line for line in schema.splitlines()
              if not line.strip().startswith(remove_prefixes)]
-    schema = '\n'.join(lines).replace('PRAGMA user_version=6', 'PRAGMA user_version=3')
+    schema = '\n'.join(lines).replace('PRAGMA user_version=7', 'PRAGMA user_version=3')
     conn = sqlite3.connect(database)
     conn.executescript(schema)
     conn.execute('''INSERT INTO control_jobs(job_id,display_name,input_kind,module,status,
@@ -411,7 +411,7 @@ def test_v3_control_room_migrates_without_losing_existing_discovery_job(tmp_path
         'DISCOVERY_CONTACTS', 'DISCOVERY_V2', 'Existing Discovery')
     assert repository.events('existing')[0]['event_code'] == 'OLD_EVENT'
     conn = sqlite3.connect(database)
-    assert conn.execute('PRAGMA user_version').fetchone()[0] == 6
+    assert conn.execute('PRAGMA user_version').fetchone()[0] == 7
     sql = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='control_jobs'"
     ).fetchone()[0]

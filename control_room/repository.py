@@ -22,12 +22,89 @@ class JobRepository:
         self._migrate_import_enrich()
         conn = self._connect()
         try:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='control_jobs'").fetchone():
+                # Migrate existing databases before schema.sql advances the
+                # declared version. A failure therefore cannot advertise v7.
+                self._migrate_workspace_ownership(conn)
             conn.executescript(Path(__file__).with_name('schema.sql').read_text())
             self._migrate_adapter_columns(conn)
             self._migrate_identity_columns(conn)
-            conn.execute('PRAGMA user_version=6')
+            # New databases already have the columns; this installs the same
+            # indexes/triggers and is deliberately repeat-safe.
+            self._migrate_workspace_ownership(conn)
+            conn.execute('PRAGMA user_version=7')
         finally:
             conn.close()
+
+    @staticmethod
+    def _migrate_workspace_ownership(conn):
+        """Add tenant-ready ownership without changing existing admin resources."""
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            conn.execute('''CREATE TABLE IF NOT EXISTS workspaces (
+                workspace_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ACTIVE'
+                    CHECK(status IN ('ACTIVE','DISABLED')),
+                created_at TEXT NOT NULL)''')
+            for table in ('control_jobs', 'uploads'):
+                columns = {row[1] for row in conn.execute(f'PRAGMA table_info({table})')}
+                if 'workspace_id' not in columns:
+                    conn.execute(f'''ALTER TABLE {table} ADD COLUMN workspace_id TEXT
+                        REFERENCES workspaces(workspace_id)''')
+                if 'origin_surface' not in columns:
+                    conn.execute(f'''ALTER TABLE {table} ADD COLUMN origin_surface TEXT NOT NULL
+                        DEFAULT 'CONTROL_ROOM'
+                        CHECK(origin_surface IN ('CONTROL_ROOM','MERLIN'))''')
+            statements = (
+                '''CREATE INDEX IF NOT EXISTS control_jobs_workspace
+                   ON control_jobs(workspace_id,origin_surface,job_number)''',
+                '''CREATE INDEX IF NOT EXISTS uploads_workspace
+                   ON uploads(workspace_id,origin_surface,created_at)''',
+                '''CREATE TRIGGER IF NOT EXISTS merlin_job_requires_workspace_insert
+                   BEFORE INSERT ON control_jobs
+                   WHEN NEW.origin_surface='MERLIN' AND NEW.workspace_id IS NULL
+                   BEGIN SELECT RAISE(ABORT,'MERLIN job requires workspace'); END''',
+                '''CREATE TRIGGER IF NOT EXISTS merlin_upload_requires_workspace_insert
+                   BEFORE INSERT ON uploads
+                   WHEN NEW.origin_surface='MERLIN' AND NEW.workspace_id IS NULL
+                   BEGIN SELECT RAISE(ABORT,'MERLIN upload requires workspace'); END''',
+                '''CREATE TRIGGER IF NOT EXISTS control_job_ownership_immutable
+                   BEFORE UPDATE OF workspace_id,origin_surface ON control_jobs
+                   WHEN NEW.workspace_id IS NOT OLD.workspace_id
+                     OR NEW.origin_surface IS NOT OLD.origin_surface
+                   BEGIN SELECT RAISE(ABORT,'job ownership is immutable'); END''',
+                '''CREATE TRIGGER IF NOT EXISTS upload_ownership_immutable
+                   BEFORE UPDATE OF workspace_id,origin_surface ON uploads
+                   WHEN NEW.workspace_id IS NOT OLD.workspace_id
+                     OR NEW.origin_surface IS NOT OLD.origin_surface
+                   BEGIN SELECT RAISE(ABORT,'upload ownership is immutable'); END''',
+                '''CREATE TRIGGER IF NOT EXISTS job_item_ownership_insert
+                   BEFORE INSERT ON job_items
+                   WHEN NOT EXISTS (SELECT 1 FROM control_jobs WHERE job_id=NEW.job_id)
+                     OR NOT EXISTS (SELECT 1 FROM uploads WHERE upload_id=NEW.upload_id)
+                     OR (SELECT workspace_id FROM control_jobs WHERE job_id=NEW.job_id)
+                          IS NOT (SELECT workspace_id FROM uploads WHERE upload_id=NEW.upload_id)
+                     OR (SELECT origin_surface FROM control_jobs WHERE job_id=NEW.job_id)
+                          IS NOT (SELECT origin_surface FROM uploads WHERE upload_id=NEW.upload_id)
+                   BEGIN SELECT RAISE(ABORT,'job/upload ownership mismatch'); END''',
+                '''CREATE TRIGGER IF NOT EXISTS job_item_ownership_update
+                   BEFORE UPDATE OF job_id,upload_id ON job_items
+                   WHEN NOT EXISTS (SELECT 1 FROM control_jobs WHERE job_id=NEW.job_id)
+                     OR NOT EXISTS (SELECT 1 FROM uploads WHERE upload_id=NEW.upload_id)
+                     OR (SELECT workspace_id FROM control_jobs WHERE job_id=NEW.job_id)
+                          IS NOT (SELECT workspace_id FROM uploads WHERE upload_id=NEW.upload_id)
+                     OR (SELECT origin_surface FROM control_jobs WHERE job_id=NEW.job_id)
+                          IS NOT (SELECT origin_surface FROM uploads WHERE upload_id=NEW.upload_id)
+                   BEGIN SELECT RAISE(ABORT,'job/upload ownership mismatch'); END''',
+            )
+            for statement in statements:
+                conn.execute(statement)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
     @staticmethod
     def _migrate_adapter_columns(conn):
@@ -116,6 +193,7 @@ class JobRepository:
             return
         conn = sqlite3.connect(self.path, timeout=5, isolation_level=None)
         try:
+            original_version = conn.execute('PRAGMA user_version').fetchone()[0]
             job_sql = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='control_jobs'"
             ).fetchone()
@@ -189,7 +267,7 @@ class JobRepository:
                 for name, definition in additions.items():
                     if name not in columns:
                         conn.execute(f'ALTER TABLE job_items ADD COLUMN {name} {definition}')
-            conn.execute('PRAGMA user_version=5')
+            conn.execute(f'PRAGMA user_version={max(original_version, 5)}')
         except BaseException:
             if conn.in_transaction:
                 conn.rollback()
@@ -253,6 +331,32 @@ class JobRepository:
             (job_id, sequence, now(), level, code, message,
              json.dumps(details or {}, sort_keys=True, separators=(',', ':'))))
 
+    def create_workspace(self, display_name, workspace_id=None):
+        name = str(display_name or '').strip()
+        if not 1 <= len(name) <= 120:
+            raise ValueError('Workspace name must be between 1 and 120 characters')
+        workspace_id = workspace_id or uuid.uuid4().hex
+        if (not isinstance(workspace_id, str) or not workspace_id
+                or len(workspace_id) > 120):
+            raise ValueError('Invalid workspace ID')
+        conn = self._connect()
+        try:
+            conn.execute('''INSERT INTO workspaces
+                (workspace_id,display_name,status,created_at)
+                VALUES (?,?,'ACTIVE',?)''', (workspace_id, name, now()))
+            return self.get_workspace(workspace_id)
+        finally:
+            conn.close()
+
+    def get_workspace(self, workspace_id):
+        conn = self._connect()
+        try:
+            row = conn.execute('SELECT * FROM workspaces WHERE workspace_id=?',
+                               (workspace_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
     def create_job(self, display_name, selected_company_count):
         name = str(display_name or '').strip()
         if not 1 <= len(name) <= 120:
@@ -280,17 +384,27 @@ class JobRepository:
             conn.close()
 
     def create_upload(self, metadata):
+        """Create an intentionally unscoped Control Room/admin upload."""
+        return self._create_upload(metadata, None, 'CONTROL_ROOM')
+
+    def create_workspace_upload(self, workspace_id, metadata):
+        """Create a MERLIN upload owned by one existing workspace."""
+        return self._create_upload(metadata, workspace_id, 'MERLIN')
+
+    def _create_upload(self, metadata, workspace_id, origin_surface):
         created = now()
         conn = self._connect()
         try:
             conn.execute('BEGIN IMMEDIATE')
             conn.execute('''INSERT INTO uploads(upload_id,original_filename,relative_path,sha256,
-                size_bytes,format,worksheet_name,created_at,headers_json,row_count,status)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                size_bytes,format,worksheet_name,created_at,headers_json,row_count,status,
+                workspace_id,origin_surface)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (metadata['upload_id'], metadata['original_filename'], metadata['relative_path'],
                  metadata['sha256'], metadata['size_bytes'], metadata['format'],
                  metadata.get('worksheet_name'), created,
-                 json.dumps(metadata['headers'], ensure_ascii=False), len(metadata['rows']), 'MAPPING'))
+                 json.dumps(metadata['headers'], ensure_ascii=False), len(metadata['rows']),
+                 'MAPPING', workspace_id, origin_surface))
             conn.executemany('''INSERT INTO upload_rows(upload_id,row_number,original_values_json,match_status)
                 VALUES (?,?,?,'PENDING')''', ((metadata['upload_id'], number,
                 json.dumps(values, ensure_ascii=False)) for number, values in enumerate(metadata['rows'], 2)))
@@ -314,6 +428,26 @@ class JobRepository:
             return result
         finally:
             conn.close()
+
+    def get_upload_for_workspace(self, workspace_id, upload_id):
+        conn = self._connect()
+        try:
+            row = conn.execute('''SELECT * FROM uploads WHERE upload_id=?
+                AND workspace_id=? AND origin_surface='MERLIN' ''',
+                (upload_id, workspace_id)).fetchone()
+            if not row:
+                return None
+            result = dict(row)
+            result['headers'] = json.loads(result['headers_json'])
+            result['mapping'] = json.loads(result['mapping_json'])
+            return result
+        finally:
+            conn.close()
+
+    def upload_rows_for_workspace(self, workspace_id, upload_id, status=None):
+        if self.get_upload_for_workspace(workspace_id, upload_id) is None:
+            return []
+        return self.upload_rows(upload_id, status)
 
     def upload_rows(self, upload_id, status=None):
         conn = self._connect()
@@ -452,9 +586,10 @@ class JobRepository:
                                      f'{len(unique)} were selected')
             job_id = uuid.uuid4().hex; created = now()
             conn.execute('''INSERT INTO control_jobs(job_id,display_name,input_kind,module,status,created_at,
-                queued_at,selected_company_count,execution_adapter) VALUES (?,?,?,?,?,?,?,?,?)''',
+                queued_at,selected_company_count,execution_adapter,workspace_id,origin_surface)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
                 (job_id,name,'UPLOAD','DISCOVERY_CONTACTS','QUEUED',created,created,len(unique),
-                 execution_adapter))
+                 execution_adapter,upload['workspace_id'],upload['origin_surface']))
             conn.execute("UPDATE upload_rows SET match_status='EXCLUDED',selected=0,match_method=COALESCE(match_method,'UNRESOLVED_EXCLUDED') WHERE upload_id=? AND match_status IN ('AMBIGUOUS','NOT_FOUND')",(upload_id,))
             snapshot_rows = conn.execute('SELECT * FROM upload_rows WHERE upload_id=? ORDER BY row_number',
                                          (upload_id,)).fetchall()
@@ -505,9 +640,11 @@ class JobRepository:
             created = now()
             conn.execute('''INSERT INTO control_jobs(job_id,display_name,input_kind,module,status,
                 created_at,queued_at,selected_company_count,execution_adapter,progress_stage,
-                import_total_rows) VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+                import_total_rows,workspace_id,origin_surface)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (job_id, name, 'UPLOAD', 'IMPORT_ENRICH', 'QUEUED', created, created,
-                 len(rows), 'IMPORT_ENRICH', 'PARSING', len(rows)))
+                 len(rows), 'IMPORT_ENRICH', 'PARSING', len(rows),
+                 upload['workspace_id'], upload['origin_surface']))
             for position, row in enumerate(rows, 1):
                 conn.execute('''INSERT INTO job_items(job_id,item_position,upload_id,
                     upload_row_number,company_id,match_status,match_method,selected,
@@ -1047,6 +1184,16 @@ class JobRepository:
         finally:
             conn.close()
 
+    def artifacts_for_workspace(self, workspace_id, job_id):
+        conn = self._connect()
+        try:
+            return [dict(row) for row in conn.execute('''SELECT a.*
+                FROM job_artifacts a JOIN control_jobs j ON j.job_id=a.job_id
+                WHERE a.job_id=? AND j.workspace_id=? AND j.origin_surface='MERLIN'
+                ORDER BY a.created_at''', (job_id, workspace_id))]
+        finally:
+            conn.close()
+
     def get_artifact(self, artifact_id):
         conn = self._connect()
         try:
@@ -1055,10 +1202,32 @@ class JobRepository:
         finally:
             conn.close()
 
+    def get_artifact_for_workspace(self, workspace_id, artifact_id):
+        conn = self._connect()
+        try:
+            row = conn.execute('''SELECT a.* FROM job_artifacts a
+                JOIN control_jobs j ON j.job_id=a.job_id
+                WHERE a.artifact_id=? AND j.workspace_id=?
+                  AND j.origin_surface='MERLIN' ''',
+                (artifact_id, workspace_id)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
     def get_job(self, job_id):
         conn = self._connect()
         try:
             row = conn.execute('SELECT * FROM control_jobs WHERE job_id=?', (job_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def get_job_for_workspace(self, workspace_id, job_id):
+        conn = self._connect()
+        try:
+            row = conn.execute('''SELECT * FROM control_jobs WHERE job_id=?
+                AND workspace_id=? AND origin_surface='MERLIN' ''',
+                (job_id, workspace_id)).fetchone()
             return dict(row) if row else None
         finally:
             conn.close()
