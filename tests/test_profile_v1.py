@@ -4,6 +4,8 @@ from pathlib import Path
 import pytest
 
 from discovery_v2.store import APPLICATION_ID, SCHEMA_VERSION
+import profile_v1.importer as importer_module
+import profile_v1.runner as runner_module
 from profile_v1.contracts import CandidateClaim, Citation
 from profile_v1.blocks import extract_blocks
 from profile_v1.export import export
@@ -61,6 +63,8 @@ def test_vertical_slice_import_validation_export_and_read_only(tmp_path):
     assert any('Organization' in x for x in texts)
     result=store.conn.execute('SELECT * FROM profile_company_results').fetchone()
     assert result['profile_status']=='PROFILED' and result['claim_count']==4
+    deterministic=store.conn.execute('SELECT * FROM profile_deterministic_results').fetchone()
+    assert deterministic['corpus_hash'] and deterministic['rule_version']=='profile-deterministic-1'
     store.close(); assert source.read_bytes()==before
     csv_path=tmp_path/'review.csv'; json_path=tmp_path/'review.json'; export(profile,run_id,csv_path,json_path)
     row=next(csv.DictReader(csv_path.open(encoding='utf-8-sig')))
@@ -125,3 +129,125 @@ def test_nested_noise_decomposition_does_not_crash_or_remove_valid_content():
     assert 'Useful heading' in texts
     assert 'Useful company activity content.' in texts
     assert 'Discarded navigation' not in texts
+
+
+def test_deterministic_only_runner_has_no_semantic_result(tmp_path,monkeypatch):
+    source,_=discovery_db(tmp_path); profile=tmp_path/'deterministic.sqlite3'
+    run_id=create(source,'dr',[7],profile)
+    monkeypatch.setattr('profile_v1.semantic.LiveInterpreter.call',
+      lambda *args:pytest.fail('provider called'))
+    monkeypatch.setattr('requests.sessions.Session.request',
+      lambda *args,**kwargs:pytest.fail('network called'))
+    run(profile,run_id,deterministic_only=True)
+    store=Store(profile)
+    company=store.conn.execute('SELECT status,selected_attempt_id FROM profile_run_companies').fetchone()
+    assert company['status']=='COMPLETED' and company['selected_attempt_id']
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_deterministic_results').fetchone()[0]==1
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_company_results').fetchone()[0]==0
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_interpretation_requests').fetchone()[0]==0
+    store.close()
+
+
+def test_deterministic_only_replay_has_no_network_or_semantic_path(tmp_path,monkeypatch):
+    source,_=discovery_db(tmp_path); profile=tmp_path/'deterministic-replay.sqlite3'
+    run_id=create(source,'dr',[7],profile); run(profile,run_id,deterministic_only=True)
+    monkeypatch.setattr('profile_v1.semantic.LiveInterpreter.call',
+      lambda *args:pytest.fail('provider called'))
+    monkeypatch.setattr('requests.sessions.Session.request',
+      lambda *args,**kwargs:pytest.fail('network called'))
+    replay(profile,run_id,deterministic_only=True)
+    store=Store(profile)
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_deterministic_results').fetchone()[0]==2
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_interpretation_requests').fetchone()[0]==0
+    store.close()
+
+
+def test_review_fetched_page_is_preserved_as_candidate_but_not_interpreted(tmp_path):
+    source,_=discovery_db(tmp_path); conn=sqlite3.connect(source)
+    conn.execute("UPDATE discovery_company_results SET website_status='REVIEW',official_website=NULL,verified_scope=NULL")
+    conn.commit(); conn.close()
+    profile=tmp_path/'review.sqlite3'; run_id=create(source,'dr',[7],profile)
+    run(profile,run_id,deterministic_only=True)
+    store=Store(profile)
+    assert store.conn.execute("SELECT COUNT(*) FROM profile_evidence WHERE source_class='CANDIDATE'").fetchone()[0]==1
+    result=store.conn.execute('SELECT corpus_status FROM profile_deterministic_results').fetchone()[0]
+    title=store.conn.execute("SELECT state FROM profile_deterministic_facts WHERE field_name='site_title'").fetchone()[0]
+    assert result=='CANDIDATE_ONLY' and title=='UNKNOWN'
+    store.close()
+
+
+def test_out_of_scope_final_redirect_is_candidate_and_cannot_create_any_company_fact(tmp_path):
+    source,_=discovery_db(tmp_path); conn=sqlite3.connect(source)
+    html='''<html lang="en"><head><title>Third-party title</title>
+      <meta name="description" content="Third-party description">
+      <script type="application/ld+json">{"@graph":[
+       {"@type":"Organization","name":"PUMPA d.o.o."},
+       {"@type":"Product","name":"Pump","manufacturer":{"@type":"Organization","name":"PUMPA d.o.o."}},
+       {"@type":"Service","name":"Installation"}]}</script></head><body>
+      <h1>Products</h1><p>We manufacture and export industrial pumps B2B and B2C.</p></body></html>'''
+    digest=hashlib.sha256(html.encode()).hexdigest()
+    conn.execute("""UPDATE discovery_evidence SET final_url=?,evidence_payload_json=?,content_hash=?
+      WHERE evidence_id='page'""",('https://third-party.example/redirected',json.dumps({'html':html}),digest))
+    conn.commit(); conn.close()
+    profile=tmp_path/'redirect.sqlite3'; run_id=create(source,'dr',[7],profile)
+    run(profile,run_id,deterministic_only=True); store=Store(profile)
+    candidate=store.conn.execute("SELECT * FROM profile_evidence WHERE origin_evidence_id='page'").fetchone()
+    assert candidate['source_class']=='CANDIDATE'
+    assert candidate['requested_url']=='https://pumpa.si' and candidate['final_url']=='https://third-party.example/redirected'
+    assert 'Third-party title' in candidate['html']
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_content_blocks WHERE evidence_id=?',(candidate['evidence_id'],)).fetchone()[0]==0
+    values={row['field_name']:row['state'] for row in store.conn.execute('SELECT field_name,state FROM profile_deterministic_facts')}
+    for field in ('site_title','meta_description','page_metadata','declared_languages',
+      'structured_organizations','manufacturer_signal','international_signal',
+      'product_presence_signal','service_presence_signal','explicit_audience_markers'):
+        assert values[field]=='UNKNOWN'
+    store.close()
+
+
+def test_source_mutation_between_runner_check_and_import_is_rejected_without_corpus(tmp_path,monkeypatch):
+    source,_=discovery_db(tmp_path); profile=tmp_path/'mutated.sqlite3'
+    run_id=create(source,'dr',[7],profile); original=runner_module.import_company
+    def mutate_then_import(*args,**kwargs):
+        conn=sqlite3.connect(source)
+        conn.execute("UPDATE discovery_evidence SET title='changed after runner hash check' WHERE evidence_id='page'")
+        conn.commit(); conn.close()
+        return original(*args,**kwargs)
+    monkeypatch.setattr(runner_module,'import_company',mutate_then_import)
+    with pytest.raises(ValueError,match='hash mismatch'): run(profile,run_id,deterministic_only=True)
+    store=Store(profile)
+    attempt=store.conn.execute('SELECT status,diagnostics_json FROM profile_attempts').fetchone()
+    assert attempt['status']=='FAILED' and 'hash mismatch' in json.loads(attempt['diagnostics_json'])['error']
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_evidence').fetchone()[0]==0
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_content_blocks').fetchone()[0]==0
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_deterministic_results').fetchone()[0]==0
+    store.close()
+
+
+def test_source_mutation_during_import_rolls_back_copied_corpus(tmp_path,monkeypatch):
+    source,_=discovery_db(tmp_path); profile=tmp_path/'mutated-during-import.sqlite3'
+    run_id=create(source,'dr',[7],profile); original_hash=importer_module.file_hash
+    def mutate_before_final_hash(path):
+        conn=sqlite3.connect(source)
+        conn.execute("UPDATE discovery_evidence SET title='changed during import' WHERE evidence_id='page'")
+        conn.commit(); conn.close()
+        return original_hash(path)
+    monkeypatch.setattr(importer_module,'file_hash',mutate_before_final_hash)
+    with pytest.raises(ValueError,match='changed during import'):
+        run(profile,run_id,deterministic_only=True)
+    store=Store(profile)
+    assert store.conn.execute('SELECT status FROM profile_attempts').fetchone()[0]=='FAILED'
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_evidence').fetchone()[0]==0
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_content_blocks').fetchone()[0]==0
+    assert store.conn.execute('SELECT COUNT(*) FROM profile_deterministic_results').fetchone()[0]==0
+    store.close()
+
+
+def test_schema_two_semantic_artifact_remains_readable_by_export(tmp_path):
+    source,profile,run_id,_=prepared(tmp_path)
+    conn=sqlite3.connect(profile)
+    conn.executescript('''DROP TABLE profile_deterministic_fact_evidence;
+      DROP TABLE profile_deterministic_facts; DROP TABLE profile_deterministic_results;
+      PRAGMA user_version=2;'''); conn.close()
+    csv_path=tmp_path/'version-two.csv'; export(profile,run_id,csv_path)
+    row=next(csv.DictReader(csv_path.open(encoding='utf-8-sig')))
+    assert row['profile_status']=='PROFILED' and row['company_name']=='PUMPA d.o.o.'

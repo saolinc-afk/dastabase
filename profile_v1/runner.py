@@ -3,6 +3,7 @@ import argparse, json
 from pathlib import Path
 
 from profile_v1.contracts import CandidateClaim, Citation, EmptyInterpreter, JsonInterpreter
+from profile_v1.deterministic import evaluate_and_store
 from profile_v1.importer import discovery_manifest, file_hash, import_company
 from profile_v1.store import Store, encode, now, uid
 from profile_v1.taxonomy import TAXONOMY_VERSION
@@ -130,8 +131,17 @@ def _remap_candidates(candidates,block_map):
     return deserialize_candidates(raw)
 
 
-def run(results_db, run_id, interpreter=None, limit=None):
+def _publish_deterministic_only(store,run_id,company_id,attempt_id):
+    with store.conn:
+        store.conn.execute("UPDATE profile_attempts SET status='COMPLETED',finished_at=? WHERE attempt_id=?",
+          (now(),attempt_id))
+        store.conn.execute("""UPDATE profile_run_companies SET status='COMPLETED',selected_attempt_id=?
+          WHERE run_id=? AND company_id=?""",(attempt_id,run_id,company_id))
+
+
+def run(results_db, run_id, interpreter=None, limit=None, deterministic_only=False):
     if limit is not None and limit <= 0: raise ValueError('limit must be greater than zero')
+    if deterministic_only and interpreter is not None: raise ValueError('deterministic-only run cannot use an interpreter')
     interpreter=interpreter or EmptyInterpreter(); store=Store(results_db)
     try:
         runrow=store.conn.execute('SELECT * FROM profile_runs WHERE run_id=?',(run_id,)).fetchone()
@@ -144,7 +154,12 @@ def run(results_db, run_id, interpreter=None, limit=None):
         for row in rows:
             company=json.loads(row['identity_snapshot_json']); attempt=store.start_attempt(run_id,row['company_id'])
             try:
-                import_company(store,run_id,attempt,company,descriptor['database_path'],descriptor['run_id'],row['discovery_attempt_id'],row['discovery_result_id'])
+                import_company(store,run_id,attempt,company,descriptor['database_path'],descriptor['run_id'],
+                  row['discovery_attempt_id'],row['discovery_result_id'])
+                evaluate_and_store(store,run_id,attempt,row['company_id'])
+                if deterministic_only:
+                    _publish_deterministic_only(store,run_id,row['company_id'],attempt)
+                    continue
                 context={'run_id':run_id,'attempt_id':attempt,'company_id':row['company_id']}
                 candidates=_interpret(store,context,company,_blocks(store,attempt),interpreter)
                 _publish(store,run_id,row['company_id'],attempt,candidates,interpreter.version)
@@ -163,7 +178,7 @@ def _finish_run(store,run_id):
     with store.conn: store.conn.execute('UPDATE profile_runs SET status=?,finished_at=? WHERE run_id=?',(status,now(),run_id))
 
 
-def replay(results_db, run_id, interpreter=None):
+def replay(results_db, run_id, interpreter=None, deterministic_only=False):
     """Create new attempts solely from the Profile artifact's copied corpus."""
     store=Store(results_db)
     try:
@@ -174,6 +189,10 @@ def replay(results_db, run_id, interpreter=None):
             if not old: continue
             company=json.loads(row['identity_snapshot_json']); attempt=store.start_attempt(run_id,row['company_id'])
             block_map=_clone_corpus(store,run_id,old,attempt)
+            evaluate_and_store(store,run_id,attempt,row['company_id'])
+            if deterministic_only:
+                _publish_deterministic_only(store,run_id,row['company_id'],attempt)
+                continue
             if interpreter is None:
                 request=store.conn.execute('''SELECT raw_response_json FROM profile_interpretation_requests
                   WHERE attempt_id=? AND status IN ('SUCCEEDED','CACHED') AND raw_response_json IS NOT NULL
@@ -234,6 +253,7 @@ def recover_response(results_db,run_id,company_id,request_id):
             from profile_v1.semantic import parse_response
             candidates=parse_response(json.loads(source['raw_response_json']))
             block_map=_clone_corpus(store,run_id,source['attempt_id'],attempt)
+            evaluate_and_store(store,run_id,attempt,company_id)
             candidates=_remap_candidates(candidates,block_map)
             with store.conn: store.conn.execute('UPDATE profile_attempts SET diagnostics_json=? WHERE attempt_id=?',
               (encode({'recovered_from_attempt_id':source['attempt_id'],'recovered_from_request_id':request_id}),attempt))
@@ -256,20 +276,22 @@ def recover_response(results_db,run_id,company_id,request_id):
 def main(argv=None):
     parser=argparse.ArgumentParser(prog='python -m profile_v1.runner'); sub=parser.add_subparsers(dest='command',required=True)
     create_p=sub.add_parser('create'); create_p.add_argument('--discovery-results',required=True); create_p.add_argument('--discovery-run-id',required=True); create_p.add_argument('--company-id',type=int,action='append',required=True); create_p.add_argument('--output',required=True)
-    run_p=sub.add_parser('run'); run_p.add_argument('--results',required=True); run_p.add_argument('--run-id',required=True); run_p.add_argument('--interpretations'); run_p.add_argument('--live',action='store_true'); run_p.add_argument('--limit',type=int)
-    replay_p=sub.add_parser('replay'); replay_p.add_argument('--results',required=True); replay_p.add_argument('--run-id',required=True)
+    run_p=sub.add_parser('run'); run_p.add_argument('--results',required=True); run_p.add_argument('--run-id',required=True); run_p.add_argument('--interpretations'); run_p.add_argument('--live',action='store_true'); run_p.add_argument('--limit',type=int); run_p.add_argument('--deterministic-only',action='store_true')
+    replay_p=sub.add_parser('replay'); replay_p.add_argument('--results',required=True); replay_p.add_argument('--run-id',required=True); replay_p.add_argument('--deterministic-only',action='store_true')
     recover_p=sub.add_parser('recover-response'); recover_p.add_argument('--results',required=True); recover_p.add_argument('--run-id',required=True); recover_p.add_argument('--company-id',type=int,required=True); recover_p.add_argument('--request-id',required=True)
     args=parser.parse_args(argv)
     if args.command=='create': print(create(args.discovery_results,args.discovery_run_id,args.company_id,args.output))
     elif args.command=='run':
         if args.interpretations and args.live: parser.error('--live and --interpretations are mutually exclusive')
+        if args.deterministic_only and (args.interpretations or args.live): parser.error('--deterministic-only cannot use an interpreter')
         if args.limit is not None and args.limit <= 0: parser.error('--limit must be greater than zero')
         if args.live:
             from profile_v1.semantic import LiveConfig, LiveInterpreter
             interpreter=LiveInterpreter(LiveConfig.from_env())
         else: interpreter=JsonInterpreter(json.loads(Path(args.interpretations).read_text())) if args.interpretations else EmptyInterpreter()
-        run(args.results,args.run_id,interpreter,limit=args.limit)
-    elif args.command=='replay': replay(args.results,args.run_id)
+        run(args.results,args.run_id,None if args.deterministic_only else interpreter,
+          limit=args.limit,deterministic_only=args.deterministic_only)
+    elif args.command=='replay': replay(args.results,args.run_id,deterministic_only=args.deterministic_only)
     else: recover_response(args.results,args.run_id,args.company_id,args.request_id)
 
 

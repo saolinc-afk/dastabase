@@ -59,6 +59,15 @@ def test_cli_passes_limit_one_to_runner(tmp_path,monkeypatch):
     assert captured['limit']==1
 
 
+def test_cli_passes_deterministic_only_without_interpreter(monkeypatch):
+    captured={}
+    monkeypatch.setattr('profile_v1.runner.run',lambda *args,**kwargs:captured.update(
+      {'args':args,**kwargs}))
+    main(['run','--results','profile.sqlite3','--run-id','run-id','--deterministic-only'])
+    assert captured['args']==('profile.sqlite3','run-id',None)
+    assert captured['deterministic_only'] is True
+
+
 @pytest.mark.parametrize('value',['0','-1'])
 def test_cli_rejects_nonpositive_limit(value,capsys):
     with pytest.raises(SystemExit) as error:

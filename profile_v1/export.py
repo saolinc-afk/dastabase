@@ -20,7 +20,8 @@ MAP={'ACTUAL_PRIMARY_ACTIVITY':'actual_primary_activity','INDUSTRY_CATEGORY':'in
 def load(path,run_id):
     conn=sqlite3.connect(Path(path).resolve().as_uri()+'?mode=ro',uri=True); conn.row_factory=sqlite3.Row
     try:
-        if conn.execute('PRAGMA application_id').fetchone()[0]!=APPLICATION_ID or conn.execute('PRAGMA user_version').fetchone()[0]!=SCHEMA_VERSION: raise ValueError('Incompatible Profile result database')
+        version=conn.execute('PRAGMA user_version').fetchone()[0]
+        if conn.execute('PRAGMA application_id').fetchone()[0]!=APPLICATION_ID or version not in (2,3,SCHEMA_VERSION): raise ValueError('Incompatible Profile result database')
         if not conn.execute('SELECT 1 FROM profile_runs WHERE run_id=?',(run_id,)).fetchone(): raise ValueError('Unknown Profile run')
         output=[]
         for item in conn.execute('''SELECT rc.*,r.* FROM profile_run_companies rc JOIN profile_company_results r
