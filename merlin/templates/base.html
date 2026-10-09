@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}MERLIN{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='merlin.css') }}">
+  <script defer src="{{ url_for('static', filename='merlin.js') }}"></script>
+</head>
+<body>
+  {% block header %}
+  <header><a class="wordmark" href="{{ url_for('index') }}">MERLIN</a></header>
+  {% endblock %}
+  <main>{% block content %}{% endblock %}</main>
+  <footer>Powered by Dastabase</footer>
+</body>
+</html>

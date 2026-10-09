@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Progress · MERLIN{% endblock %}
+{% block content %}
+<section class="progress-view" data-job-progress
+         data-state="{{ job.state }}"
+         data-progress-url="{{ url_for('job_progress', job_id=job_id) }}"
+         data-download-url="{{ url_for('download', job_id=job_id) }}">
+  <div class="sparkles" aria-hidden="true">
+    <span>✧</span><span>✦</span><span>✧</span>
+  </div>
+  <h1 data-stage>{{ job.stage }}</h1>
+  <p class="count" data-count>{{ job.processed }} / {{ job.total }}</p>
+  <progress max="100" value="{{ job.percent }}" data-progress>{{ job.percent }}%</progress>
+  <div class="working-status" data-working-status
+       {% if job.state != 'working' %}hidden{% endif %}>
+    <p>Working on it…</p>
+    <p class="eta-fallback" data-eta-fallback>
+      Time estimate will appear once Merlin has enough information.
+    </p>
+  </div>
+  <div data-complete {% if job.state != 'done' %}hidden{% endif %}>
+    <p class="summary"><span data-matched>{{ job.matched_rows }}</span> rows matched<br>
+      <span data-review>{{ job.review_rows }}</span> need your review</p>
+    <a class="download" href="{{ url_for('download', job_id=job_id) }}">Download Excel</a>
+    <a class="start-again" href="{{ url_for('index') }}">Enrich another file</a>
+  </div>
+  <div data-failed {% if job.state != 'failed' %}hidden{% endif %}>
+    <p>Return to the start and try again. If the problem continues, ask for help.</p>
+    <a href="{{ url_for('index') }}">Back to start</a>
+  </div>
+</section>
+{% endblock %}

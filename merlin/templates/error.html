@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · MERLIN{% endblock %}
+{% block content %}
+<section class="flow error-page">
+  <div class="mark" aria-hidden="true">✦</div>
+  <h1>{{ title }}</h1>
+  <p>{{ message }}</p>
+  <a href="{{ url_for('index') }}">Back to start</a>
+</section>
+{% endblock %}

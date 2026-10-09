@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Configure · MERLIN{% endblock %}
+{% block content %}
+<section class="flow">
+  <p class="eyebrow">{{ upload.original_filename }}</p>
+  <h1>{{ upload.row_count }} rows detected</h1>
+  {% if detected %}
+  <p class="detected">Detected:
+    {% for label, header in detected %}<span>{{ label }} → {{ header }}</span>{% endfor %}
+  </p>
+  {% endif %}
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <form action="{{ url_for('enrich_upload', upload_id=upload.upload_id) }}" method="post">
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+    {% if correction_required %}
+    <fieldset class="mapping">
+      <legend>Which columns identify the company?</legend>
+      <p>Choose at least one identifier so Merlin can continue safely.</p>
+      {% for field in identity_fields %}
+      <label>{{ field_labels[field] }}
+        <select name="mapping_{{ field }}">
+          <option value="">Not provided</option>
+          {% for header in upload.headers %}
+          <option value="{{ loop.index0 }}">{{ header }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      {% endfor %}
+    </fieldset>
+    {% endif %}
+    <fieldset class="outputs">
+      <legend>What do you need?</legend>
+      {% for value, label in outputs %}
+      <label><input type="checkbox" name="requested_outputs" value="{{ value }}" checked>
+        <span>{{ label }}</span></label>
+      {% endfor %}
+    </fieldset>
+    <button class="primary" type="submit">Enrich</button>
+  </form>
+</section>
+{% endblock %}

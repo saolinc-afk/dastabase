@@ -9,7 +9,8 @@ from openpyxl.styles import Font, PatternFill
 from werkzeug.datastructures import FileStorage
 
 from control_room.import_enrich_adapter import ImportEnrichAdapter
-from control_room.import_export import export_import_xlsx
+from control_room.import_export import (canonical_merlin_website,
+                                        export_import_xlsx)
 from control_room.repository import JobRepository
 from control_room.worker import Worker
 from merlin.service import MerlinImportEnrichService
@@ -39,7 +40,7 @@ def _canonical(path):
     conn.commit(); conn.close()
 
 
-def _accepted_contacts(path):
+def _accepted_contacts(path, website='https://alfa.si/'):
     conn = sqlite3.connect(path)
     conn.executescript('''
       CREATE TABLE discovery_runs(
@@ -59,7 +60,7 @@ def _accepted_contacts(path):
       INSERT INTO discovery_runs VALUES ('accepted','COMPLETED','engine','rules');
       INSERT INTO discovery_run_companies VALUES ('accepted',1,'COMPLETED','attempt');
       INSERT INTO discovery_company_results VALUES
-        ('result','accepted','attempt',1,'HIGH','https://alfa.si/','website',
+        ('result','accepted','attempt',1,'HIGH',NULL,'website',
          '["website"]','email','phone','FOUND','2026-10-01T00:00:00+00:00');
       INSERT INTO discovery_contacts VALUES
         ('email','accepted','attempt',1,'EMAIL','selected@alfa.si','email-observation',
@@ -67,6 +68,7 @@ def _accepted_contacts(path):
         ('phone','accepted','attempt',1,'PHONE','+38611234567','phone-observation',
          '["phone-observation"]','ATTRIBUTED','rules','["MAIN"]');
     ''')
+    conn.execute('UPDATE discovery_company_results SET official_website=?', (website,))
     conn.commit(); conn.close()
 
 
@@ -113,10 +115,11 @@ def _csv_upload():
                        content_type='text/csv')
 
 
-def _run(tmp_path, requested_outputs, *, source_format='XLSX', collision=False):
+def _run(tmp_path, requested_outputs, *, source_format='XLSX', collision=False,
+         website='https://alfa.si/'):
     root = tmp_path/'storage'
     canonical = tmp_path/'canonical.sqlite3'; _canonical(canonical)
-    contacts = tmp_path/'contacts.sqlite3'; _accepted_contacts(contacts)
+    contacts = tmp_path/'contacts.sqlite3'; _accepted_contacts(contacts, website)
     repository = JobRepository(tmp_path/'control.sqlite3'); repository.initialize()
     service = MerlinImportEnrichService(repository, root)
     workspace = service.create_workspace('Workspace')['workspace_id']
@@ -166,6 +169,57 @@ def test_merlin_xlsx_exports_only_requested_customer_columns(tmp_path, outputs, 
                 100, 12, 3, 250, None]
             assert all(isinstance(sheet.cell(2, lookup[name]).value, (int, float))
                        for name in expected[2:-1])
+    finally:
+        workbook.close()
+
+
+@pytest.mark.parametrize(('stored', 'customer'), [
+    ('https://example.si/kontakt/', 'https://example.si/'),
+    ('https://example.si/about?q=company#team', 'https://example.si/'),
+    ('https://www.example.si/company', 'https://www.example.si/'),
+    ('http://example.si/company', 'http://example.si/'),
+    ('https://example.si:8443/company', 'https://example.si:8443/'),
+    ('not a valid website', 'not a valid website'),
+    ('https://example.si:invalid/company', 'https://example.si:invalid/company'),
+    ('ftp://example.si/company', 'ftp://example.si/company'),
+])
+def test_merlin_customer_website_projection_is_conservative(stored, customer):
+    assert canonical_merlin_website(stored) == customer
+
+
+def test_merlin_export_projects_website_root_without_mutating_stored_evidence(tmp_path):
+    evidence_url = 'https://www.example.si/kontakt/?from=directory#office'
+    root, repository, _, _, _, job, artifact = _run(
+        tmp_path, ('WEBSITE',), website=evidence_url)
+    workbook = load_workbook(root/artifact['relative_path'], data_only=False)
+    try:
+        sheet = workbook['Source data']
+        headers = [cell.value for cell in sheet[1]]
+        website_column = headers.index('Website') + 1
+        assert sheet.cell(2, website_column).value == 'https://www.example.si/'
+    finally:
+        workbook.close()
+
+    stored_item = repository.job_items(job.job_id)[0]
+    assert stored_item['enrichment']['official_website'] == evidence_url
+    connection = sqlite3.connect(tmp_path/'contacts.sqlite3')
+    try:
+        assert connection.execute(
+            'SELECT official_website FROM discovery_company_results').fetchone()[0] == evidence_url
+    finally:
+        connection.close()
+
+
+def test_email_only_merlin_export_does_not_leak_stored_website(tmp_path):
+    evidence_url = 'https://example.si/contact/'
+    root, _, _, _, _, _, artifact = _run(
+        tmp_path, ('EMAIL',), website=evidence_url)
+    workbook = load_workbook(root/artifact['relative_path'], data_only=False)
+    try:
+        sheet = workbook['Source data']
+        headers = [cell.value for cell in sheet[1]]
+        assert 'Website' not in headers
+        assert evidence_url not in [cell.value for row in sheet.iter_rows() for cell in row]
     finally:
         workbook.close()
 

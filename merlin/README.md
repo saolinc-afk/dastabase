@@ -22,5 +22,11 @@ are preserved, while the main data sheet receives only `Merlin match`,
 existing lossless workbook guarantees; CSV workbooks are built from the durable
 parsed upload rows. Legacy Control Room exports retain their existing contract.
 
-There are still no MERLIN web routes, authentication, provider implementations,
-Profile integration, or separate enrichment implementation.
+There is still no commercial authentication, provider implementation, Profile
+integration, or separate enrichment implementation.
+
+M4 adds the separate server-rendered MERLIN application in `merlin.app`. It uses
+one configured internal workspace stored in a signed session, queues the shared
+durable Import & Enrich job, polls only a customer-safe status projection, and
+downloads only the verified final workspace-owned XLSX. It does not register or
+import Control Room or Monitor routes.

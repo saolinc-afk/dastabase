@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block header %}{% endblock %}
+{% block content %}
+<section class="hero">
+  <div class="mark" aria-hidden="true">✦</div>
+  <h1>MERLIN</h1>
+  <p class="subtitle">Market Exploration, Research &amp; Lead Intelligence</p>
+  {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+  <form class="upload" action="{{ url_for('upload_file') }}" method="post"
+        enctype="multipart/form-data" data-upload-form>
+    <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+    <input class="file-input" id="company-file" name="company_file" type="file"
+           accept=".xlsx,.csv" required data-file-input>
+    <label class="upload-target" for="company-file" data-drop-area>
+      <span data-upload-empty>
+        <strong>Drop your XLSX or CSV</strong>
+        <small>or click here</small>
+      </span>
+      <span class="selected-file" data-upload-selected aria-live="polite" hidden>
+        <strong aria-hidden="true">✓</strong>
+        <span data-file-name></span>
+      </span>
+    </label>
+    <button type="submit" data-upload-continue disabled hidden>Continue</button>
+    <p class="upload-limit">XLSX or CSV · up to {{ upload_max_mb }} MB</p>
+  </form>
+</section>
+{% endblock %}

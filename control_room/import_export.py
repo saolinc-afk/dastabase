@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 
 from openpyxl import Workbook, load_workbook
 
@@ -135,6 +136,24 @@ def _merlin_match(item):
     return 'Not found', 'No matching company was found.'
 
 
+def canonical_merlin_website(value):
+    """Project an accepted HTTP(S) evidence URL as its customer-facing origin."""
+    if not isinstance(value, str) or not value or value != value.strip():
+        return value
+    if any(character.isspace() for character in value):
+        return value
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme not in ('http', 'https') or not parsed.netloc
+                or parsed.username is not None or parsed.password is not None
+                or not parsed.hostname):
+            return value
+        parsed.port  # Validate a supplied port before projecting the URL.
+    except ValueError:
+        return value
+    return urlunsplit((parsed.scheme, parsed.netloc, '/', '', ''))
+
+
 def _merlin_export_values(item, requested_outputs):
     match, note = _merlin_match(item)
     data = item['enrichment'] if item['match_status'] == 'MATCHED' else {}
@@ -142,6 +161,8 @@ def _merlin_export_values(item, requested_outputs):
     for output in requested_outputs:
         for _, key in MERLIN_OUTPUT_HEADERS[output]:
             value = data.get(key)
+            if key == 'official_website':
+                value = canonical_merlin_website(value)
             values.append(value if value is not None else '')
     return tuple(values)
 

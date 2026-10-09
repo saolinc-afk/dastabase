@@ -1,4 +1,6 @@
 """Workspace-scoped MERLIN boundary over Dastabase Import & Enrich."""
+import hashlib
+import hmac
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +29,8 @@ class MerlinJob:
     created_at: str
     finished_at: str | None
     requested_outputs: tuple[str, ...]
+    matched_rows: int
+    review_rows: int
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,13 @@ class MerlinArtifact:
     kind: str
     created_at: str
     size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class MerlinDownload:
+    content: bytes
+    filename: str
     sha256: str
 
 
@@ -50,8 +61,8 @@ class MerlinImportEnrichService:
         self.max_upload_bytes = int(max_upload_bytes)
         self.max_upload_rows = int(max_upload_rows)
 
-    def create_workspace(self, display_name):
-        return self.repository.create_workspace(display_name)
+    def create_workspace(self, display_name, workspace_id=None):
+        return self.repository.create_workspace(display_name, workspace_id)
 
     def ingest_upload(self, workspace_id, file_storage):
         if self.storage_root is None:
@@ -97,6 +108,34 @@ class MerlinImportEnrichService:
             return None
         return self._artifact(stored)
 
+    def final_workbook(self, workspace_id, job_id):
+        """Return verified final bytes without exposing an internal path."""
+        if self.storage_root is None:
+            raise ValueError('MERLIN upload storage is not configured')
+        job = self.repository.get_job_for_workspace(workspace_id, job_id)
+        if not job or job['status'] not in ('COMPLETED', 'PARTIAL'):
+            return None
+        artifacts = [item for item in
+                     self.repository.artifacts_for_workspace(workspace_id, job_id)
+                     if item['artifact_type'] == 'UPLOAD_RECONCILIATION']
+        if len(artifacts) != 1:
+            return None
+        artifact = artifacts[0]
+        root = self.storage_root.resolve()
+        candidate = self.storage_root/artifact['relative_path']
+        try:
+            path = candidate.resolve(strict=True)
+        except OSError:
+            return None
+        if not path.is_relative_to(root) or candidate.is_symlink() or not path.is_file():
+            return None
+        content = path.read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        if (len(content) != artifact['size_bytes'] or
+                not hmac.compare_digest(digest, artifact['sha256'])):
+            return None
+        return MerlinDownload(content, 'merlin-enriched.xlsx', digest)
+
     def _require_workspace(self, workspace_id):
         workspace = self.repository.get_workspace(workspace_id)
         if not workspace or workspace['status'] != 'ACTIVE':
@@ -113,7 +152,10 @@ class MerlinImportEnrichService:
         return MerlinJob(stored['job_id'], stored['status'],
             stored['selected_company_count'], stored['processed_company_count'],
             stored.get('progress_stage'), stored['created_at'], stored.get('finished_at'),
-            decode_requested_outputs(stored.get('requested_outputs_json')) or ())
+            decode_requested_outputs(stored.get('requested_outputs_json')) or (),
+            stored.get('import_matched_count') or 0,
+            ((stored.get('import_ambiguous_count') or 0) +
+             (stored.get('import_unresolved_count') or 0)))
 
     @staticmethod
     def _artifact(stored):
