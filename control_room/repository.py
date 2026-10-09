@@ -1031,16 +1031,23 @@ class JobRepository:
             actual = conn.execute('''SELECT COALESCE(SUM(logical_call_count),0),
                 COALESCE(SUM(provider_request_count),0) FROM identity_search_queries WHERE task_id IN
                 (SELECT task_id FROM identity_resolution_tasks WHERE job_id=?)''', (job_id,)).fetchone()
+            summary = self._import_summary_conn(conn, job_id)
             conn.execute('''UPDATE control_jobs SET import_identity_unmatched_rows=?,
                 import_identity_task_count=?,import_identity_local_resolved_count=?,
                 import_identity_search_eligible_count=?,import_identity_search_ineligible_count=?,
                 import_identity_planned_query_count=?,import_identity_actual_query_count=?,
                 import_identity_actual_provider_request_count=?,identity_task_cap=?,identity_query_cap=?,
-                identity_estimated_provider_requests=?,identity_max_provider_requests=? WHERE job_id=?''',
+                identity_estimated_provider_requests=?,identity_max_provider_requests=?,
+                import_matched_count=?,import_ambiguous_count=?,import_unresolved_count=?,
+                import_resolved_without_ai_count=?,import_matched_requires_enrichment_count=?
+                WHERE job_id=?''',
                 (unmatched, counts['tasks'] or 0, counts['local_resolved'] or 0,
                  counts['search_eligible'] or 0, counts['ineligible'] or 0, queries,
                  actual[0], actual[1], task_cap, query_cap, queries,
-                 queries * max_attempts_per_query, job_id))
+                 queries * max_attempts_per_query, summary['matched'],
+                 summary['ambiguous'], summary['unresolved'],
+                 summary['resolved_without_ai'], summary['matched_requires_enrichment'],
+                 job_id))
             return {'unmatched_rows': unmatched, 'identity_tasks': counts['tasks'] or 0,
                     'local_resolved': counts['local_resolved'] or 0,
                     'search_eligible': counts['search_eligible'] or 0,

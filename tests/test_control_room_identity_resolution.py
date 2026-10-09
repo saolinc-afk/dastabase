@@ -261,6 +261,8 @@ def test_durable_tasks_deduplicate_rows_plan_without_paid_calls_and_resume(tmp_p
     assert items[1]['match_status']=='MATCHED' and items[1]['company_id']==5
     assert next(task for task in tasks if task['status']=='NOT_ELIGIBLE')
     result=repo.get_job(job['job_id'])
+    assert (result['import_matched_count'], result['import_ambiguous_count'],
+            result['import_unresolved_count']) == (3, 0, 1)
     assert result['import_identity_task_count']==2
     assert result['import_identity_local_resolved_count']==0
     assert result['import_identity_actual_query_count']==0
