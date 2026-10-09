@@ -16,6 +16,11 @@ and `FINANCIALS`; Profile is not active. Existing accepted knowledge is reused
 before selective Discovery is considered. Financials come only from canonical
 2025 data and never create Discovery work.
 
-There are still no MERLIN web routes, authentication, request-aware workbook
-columns, provider implementations, Profile integration, or separate enrichment
-implementation.
+M3 produces a customer-facing XLSX for both XLSX and CSV uploads. Source rows
+are preserved, while the main data sheet receives only `Merlin match`,
+`Merlin note`, and explicitly requested output columns. XLSX inputs retain the
+existing lossless workbook guarantees; CSV workbooks are built from the durable
+parsed upload rows. Legacy Control Room exports retain their existing contract.
+
+There are still no MERLIN web routes, authentication, provider implementations,
+Profile integration, or separate enrichment implementation.

@@ -94,9 +94,12 @@ class ImportEnrichAdapter:
     def _export(self, job_id):
         if self.storage_root is None:
             return None
+        job = self.repository.get_job(job_id)
         items = self.repository.job_items(job_id)
         upload = self.repository.get_upload(items[0]['upload_id']) if items else None
-        if not upload or upload['format'] != 'XLSX':
+        if not upload or (upload['format'] != 'XLSX' and
+                          not (job and job.get('origin_surface') == 'MERLIN'
+                               and upload['format'] == 'CSV')):
             return None
         self.repository.set_import_stage(job_id, 'EXPORT', self.worker_id)
         return export_import_xlsx(self.repository, job_id, self.storage_root)

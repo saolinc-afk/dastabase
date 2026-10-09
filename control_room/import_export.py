@@ -7,7 +7,9 @@ from pathlib import Path
 import tempfile
 import uuid
 
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+
+from control_room.import_outputs import decode_requested_outputs
 
 
 EXPORT_HEADERS = (
@@ -30,6 +32,20 @@ EXPORT_HEADERS = (
     'Research Scope',
 )
 
+MERLIN_METADATA_HEADERS = ('Merlin match', 'Merlin note')
+MERLIN_OUTPUT_HEADERS = {
+    'WEBSITE': (('Website', 'official_website'),),
+    'EMAIL': (('Email', 'default_email'),),
+    'PHONE': (('Phone', 'default_phone'),),
+    'FINANCIALS': (
+        ('Revenue 2025', 'revenue_2025'),
+        ('Profit 2025', 'profit_2025'),
+        ('Employees 2025', 'employees_2025'),
+        ('Assets 2025', 'assets_2025'),
+        ('Capital 2025', 'capital_2025'),
+    ),
+}
+
 
 def _inside(root, relative_path):
     path = (root / relative_path).resolve()
@@ -48,14 +64,14 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def _unique_label(base, existing):
+def _unique_label(base, existing, owner='Dastabase'):
     key = base.strip().casefold()
     if key not in existing:
         existing.add(key)
         return base
     number = 1
     while True:
-        suffix = ' (Dastabase)' if number == 1 else f' (Dastabase {number})'
+        suffix = f' ({owner})' if number == 1 else f' ({owner} {number})'
         candidate = f'{base}{suffix}'
         key = candidate.strip().casefold()
         if key not in existing:
@@ -105,6 +121,31 @@ def _export_values(job_id, item, research_scope):
     )
 
 
+def _merlin_headers(requested_outputs):
+    return MERLIN_METADATA_HEADERS + tuple(
+        header for output in requested_outputs
+        for header, _ in MERLIN_OUTPUT_HEADERS[output])
+
+
+def _merlin_match(item):
+    if item['match_status'] == 'MATCHED':
+        return 'Matched', ''
+    if item['match_status'] == 'AMBIGUOUS':
+        return 'Ambiguous', 'Multiple possible company matches. Please review this row.'
+    return 'Not found', 'No matching company was found.'
+
+
+def _merlin_export_values(item, requested_outputs):
+    match, note = _merlin_match(item)
+    data = item['enrichment'] if item['match_status'] == 'MATCHED' else {}
+    values = [match, note]
+    for output in requested_outputs:
+        for _, key in MERLIN_OUTPUT_HEADERS[output]:
+            value = data.get(key)
+            values.append(value if value is not None else '')
+    return tuple(values)
+
+
 def _qc_metrics(items, upload_rows):
     statuses = Counter(item['match_status'] for item in items)
     fingerprints = Counter(tuple(str(value) for value in row['original_values'])
@@ -134,8 +175,46 @@ def _qc_metrics(items, upload_rows):
     )
 
 
+def _merlin_qc_metrics(items, upload_rows):
+    statuses = Counter(_merlin_match(item)[0] for item in items)
+    fingerprints = Counter(tuple(str(value) for value in row['original_values'])
+                           for row in upload_rows)
+    return (
+        ('Source rows', len(upload_rows)),
+        ('Exported rows', len(items)),
+        ('Matched rows', statuses['Matched']),
+        ('Ambiguous rows', statuses['Ambiguous']),
+        ('Not found rows', statuses['Not found']),
+        ('Duplicate source row groups', sum(count > 1 for count in fingerprints.values())),
+        ('Duplicate source rows preserved', sum(max(0, count - 1)
+                                                for count in fingerprints.values())),
+    )
+
+
+def _set_literal(cell, value):
+    """Write persisted CSV text without turning formula-looking input into code."""
+    cell.value = value
+    if isinstance(value, str):
+        cell.data_type = 's'
+
+
+def _csv_workbook(upload, upload_rows):
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = 'Merlin Results'
+    for column, header in enumerate(upload['headers'], 1):
+        _set_literal(sheet.cell(1, column), header)
+    for expected, row in enumerate(upload_rows, 2):
+        if row['row_number'] != expected or len(row['original_values']) != len(upload['headers']):
+            workbook.close()
+            raise ValueError('Stored CSV rows are incomplete or malformed')
+        for column, value in enumerate(row['original_values'], 1):
+            _set_literal(sheet.cell(expected, column), value)
+    return workbook, sheet
+
+
 def export_import_xlsx(repository, job_id, storage_root):
-    """Create/replace one enriched workbook from the immutable uploaded XLSX."""
+    """Create/replace a lossless legacy or request-aware MERLIN workbook."""
     root = Path(storage_root).expanduser().absolute()
     job = repository.get_job(job_id)
     if not job or job['module'] != 'IMPORT_ENRICH':
@@ -147,29 +226,49 @@ def export_import_xlsx(repository, job_id, storage_root):
     if len(upload_ids) != 1:
         raise ValueError('Import export requires exactly one source upload')
     upload = repository.get_upload(next(iter(upload_ids)))
-    if not upload or upload['format'] != 'XLSX' or not upload['worksheet_name']:
-        raise ValueError('Import result export currently requires an XLSX upload')
-    source = _inside(root, upload['relative_path'])
-    if not source.is_file() or source.is_symlink():
-        raise ValueError('Stored source workbook is missing or unsafe')
-    if _sha256(source) != upload['sha256']:
-        raise ValueError('Stored source workbook hash does not match upload metadata')
+    is_merlin = job.get('origin_surface') == 'MERLIN'
+    requested_outputs = (decode_requested_outputs(job.get('requested_outputs_json'))
+                         if is_merlin else None)
+    if is_merlin and requested_outputs is None:
+        raise ValueError('MERLIN export requires requested outputs')
+    if not upload or upload['format'] not in ('XLSX', 'CSV'):
+        raise ValueError('Import result export requires an XLSX or CSV upload')
+    if not is_merlin and upload['format'] != 'XLSX':
+        raise ValueError('Legacy Import result export requires an XLSX upload')
+
+    if upload['format'] == 'XLSX':
+        if not upload['worksheet_name']:
+            raise ValueError('Stored source worksheet is missing')
+        source = _inside(root, upload['relative_path'])
+        if not source.is_file() or source.is_symlink():
+            raise ValueError('Stored source workbook is missing or unsafe')
+        if _sha256(source) != upload['sha256']:
+            raise ValueError('Stored source workbook hash does not match upload metadata')
 
     directory = root / 'jobs' / job_id
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     if root.is_symlink() or directory.is_symlink():
         raise ValueError('Control Room export storage may not use symbolic links')
 
-    workbook = load_workbook(source, read_only=False, data_only=False, keep_links=True)
-    try:
+    upload_rows = repository.upload_rows(upload['upload_id'])
+    if upload['format'] == 'XLSX':
+        workbook = load_workbook(source, read_only=False, data_only=False, keep_links=True)
         if upload['worksheet_name'] not in workbook.sheetnames:
+            workbook.close()
             raise ValueError('Stored source worksheet is missing')
         sheet = workbook[upload['worksheet_name']]
+    else:
+        workbook, sheet = _csv_workbook(upload, upload_rows)
+
+    try:
         source_last_column = sheet.max_column
         existing = {str(sheet.cell(1, column).value).strip().casefold()
                     for column in range(1, source_last_column + 1)
                     if sheet.cell(1, column).value is not None}
-        labels = [_unique_label(header, existing) for header in EXPORT_HEADERS]
+        base_headers = (_merlin_headers(requested_outputs)
+                        if is_merlin else EXPORT_HEADERS)
+        owner = 'Merlin' if is_merlin else 'Dastabase'
+        labels = [_unique_label(header, existing, owner) for header in base_headers]
         for offset, label in enumerate(labels, source_last_column + 1):
             cell = sheet.cell(1, offset, label)
             if source_last_column:
@@ -179,7 +278,6 @@ def export_import_xlsx(repository, job_id, storage_root):
                 cell.alignment = copy(template.alignment)
                 cell.protection = copy(template.protection)
 
-        upload_rows = repository.upload_rows(upload['upload_id'])
         expected_rows = {row['row_number'] for row in upload_rows}
         actual_rows = [item['upload_row_number'] for item in items]
         if (len(actual_rows) != len(set(actual_rows)) or set(actual_rows) != expected_rows
@@ -187,22 +285,30 @@ def export_import_xlsx(repository, job_id, storage_root):
                        for row_number in actual_rows)):
             raise ValueError('Import job has invalid, duplicate, or out-of-range source row identity')
 
-        task_scope = {task['task_id']: task.get('enrichment_scope') or ''
-                      for task in repository.identity_tasks(job_id)}
+        task_scope = ({task['task_id']: task.get('enrichment_scope') or ''
+                       for task in repository.identity_tasks(job_id)}
+                      if not is_merlin else {})
         for item in items:
             row_number = item['upload_row_number']
-            values = _export_values(job_id, item, task_scope.get(item.get('identity_task_id')))
+            values = (_merlin_export_values(item, requested_outputs) if is_merlin else
+                      _export_values(job_id, item,
+                                     task_scope.get(item.get('identity_task_id'))))
             for offset, value in enumerate(values, source_last_column + 1):
                 sheet.cell(row_number, offset, value)
 
-        qc = workbook.create_sheet(_unique_sheet_title(workbook))
-        qc.append(('Dastabase Import & Enrich QC', 'Value'))
-        qc.append(('Job ID', job_id))
-        for metric in _qc_metrics(items, repository.upload_rows(upload['upload_id'])):
+        qc_title = 'Merlin review' if is_merlin else 'Dastabase QC'
+        qc = workbook.create_sheet(_unique_sheet_title(workbook, qc_title))
+        qc.append((('Merlin Import & Enrich review' if is_merlin else
+                    'Dastabase Import & Enrich QC'), 'Value'))
+        if not is_merlin:
+            qc.append(('Job ID', job_id))
+        metrics = (_merlin_qc_metrics(items, upload_rows) if is_merlin else
+                   _qc_metrics(items, upload_rows))
+        for metric in metrics:
             qc.append(metric)
         qc.append(())
         qc.append(('Export column', 'Workbook header'))
-        for base, actual in zip(EXPORT_HEADERS, labels):
+        for base, actual in zip(base_headers, labels):
             qc.append((base, actual))
         qc.freeze_panes = 'A2'
         qc.column_dimensions['A'].width = 38
@@ -234,5 +340,4 @@ def export_import_xlsx(repository, job_id, storage_root):
     relative = output.relative_to(root).as_posix()
     repository.add_artifact(job_id, 'UPLOAD_RECONCILIATION', relative, size, digest)
     return {'path': output, 'relative_path': relative,
-            'headers': dict(zip(EXPORT_HEADERS, labels)),
-            'qc': dict(_qc_metrics(items, repository.upload_rows(upload['upload_id'])))}
+            'headers': dict(zip(base_headers, labels)), 'qc': dict(metrics)}
