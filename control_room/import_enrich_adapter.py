@@ -4,6 +4,8 @@ from pathlib import Path
 from control_room.enrichment_index import EnrichmentIndex
 from control_room.identity_adapter import IdentityResolutionAdapter
 from control_room.import_export import export_import_xlsx
+from control_room.import_outputs import (decode_requested_outputs,
+                                         missing_discovery_outputs)
 from control_room.knowledge_repository import KnowledgeRepository
 from control_room.matching import ImportMatcher
 from control_room.uploads import normalize_import_row
@@ -28,6 +30,7 @@ class ImportEnrichAdapter:
     def run(self, job, progress):
         if job['module'] != 'IMPORT_ENRICH':
             raise ValueError('ImportEnrichAdapter requires an IMPORT_ENRICH job')
+        requested_outputs = decode_requested_outputs(job.get('requested_outputs_json'))
         self.repository.set_import_stage(job['job_id'], 'PARSING', self.worker_id)
         knowledge = KnowledgeRepository(self.canonical_db, self.discovery_results)
         index = EnrichmentIndex(self.canonical_db, knowledge=knowledge)
@@ -50,10 +53,12 @@ class ImportEnrichAdapter:
         matched_ids = sorted({item['company_id'] for item in
             self.repository.job_items(job['job_id'])
             if item['match_status'] == 'MATCHED' and item['company_id'] is not None})
-        payloads = {company_id: self._payload(knowledge, company_id)
+        payloads = {company_id: self._payload(knowledge, company_id,
+                    requested_outputs=requested_outputs)
                     for company_id in matched_ids}
         sufficient = {company_id for company_id in matched_ids
-                      if knowledge.snapshot(company_id).sufficient_for_import()}
+                      if not missing_discovery_outputs(
+                          knowledge.snapshot(company_id), requested_outputs)}
         discovery_ids = set(matched_ids) - sufficient
         for company_id in discovery_ids:
             payloads[company_id]['discovery_status'] = 'PENDING'
@@ -76,10 +81,11 @@ class ImportEnrichAdapter:
         discovery_status = {row['company_id']: row.get('website_status') or 'REVIEW'
                             for row in export_rows}
         payloads = {company_id: self._payload(refreshed_knowledge, company_id,
-                    discovery_status.get(company_id))
+                    discovery_status.get(company_id), requested_outputs)
                     for company_id in matched_ids}
         sufficient = {company_id for company_id in matched_ids
-                      if refreshed_knowledge.snapshot(company_id).sufficient_for_import()}
+                      if not missing_discovery_outputs(
+                          refreshed_knowledge.snapshot(company_id), requested_outputs)}
         self.repository.persist_import_enrichment(job['job_id'], payloads, sufficient,
             discovery_ids, after_discovery=True)
         self._export(job['job_id'])
@@ -96,13 +102,14 @@ class ImportEnrichAdapter:
         return export_import_xlsx(self.repository, job_id, self.storage_root)
 
     @staticmethod
-    def _payload(knowledge, company_id, discovery_status=None):
+    def _payload(knowledge, company_id, discovery_status=None,
+                 requested_outputs=None):
         record = knowledge.record(company_id)
         company = record['identity']
         financials = record['financials']
         facts = ([record['website']] if record['website'] else []) + record['emails'] + record['phones']
         provenance = [locator for fact in facts for locator in fact['evidence_locators']]
-        return {
+        payload = {
             'canonical_company_id': company_id,
             'canonical_company_name': company.get('company_name'),
             'tax_number': company.get('tax_number'),
@@ -126,3 +133,6 @@ class ImportEnrichAdapter:
             'discovery_status': (discovery_status or
                                  (record['website']['status'] if record['website'] else None)),
         }
+        if requested_outputs is not None:
+            payload['requested_outputs'] = list(requested_outputs)
+        return payload

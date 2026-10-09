@@ -5,6 +5,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from control_room.import_outputs import (canonicalize_requested_outputs,
+                                         encode_requested_outputs)
 from control_room.states import validate_transition
 
 
@@ -25,15 +27,17 @@ class JobRepository:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                             "AND name='control_jobs'").fetchone():
                 # Migrate existing databases before schema.sql advances the
-                # declared version. A failure therefore cannot advertise v7.
+                # declared version. A failure therefore cannot advertise v8.
                 self._migrate_workspace_ownership(conn)
+                self._migrate_requested_outputs(conn)
             conn.executescript(Path(__file__).with_name('schema.sql').read_text())
             self._migrate_adapter_columns(conn)
             self._migrate_identity_columns(conn)
             # New databases already have the columns; this installs the same
             # indexes/triggers and is deliberately repeat-safe.
             self._migrate_workspace_ownership(conn)
-            conn.execute('PRAGMA user_version=7')
+            self._migrate_requested_outputs(conn)
+            conn.execute('PRAGMA user_version=8')
         finally:
             conn.close()
 
@@ -101,6 +105,30 @@ class JobRepository:
             )
             for statement in statements:
                 conn.execute(statement)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+    @staticmethod
+    def _migrate_requested_outputs(conn):
+        """Add immutable job output selection while preserving legacy jobs."""
+        conn.execute('BEGIN IMMEDIATE')
+        try:
+            columns = {row[1] for row in conn.execute(
+                'PRAGMA table_info(control_jobs)')}
+            if 'requested_outputs_json' not in columns:
+                conn.execute('ALTER TABLE control_jobs ADD COLUMN requested_outputs_json TEXT')
+            conn.execute('''CREATE TRIGGER IF NOT EXISTS requested_outputs_immutable
+                BEFORE UPDATE OF requested_outputs_json ON control_jobs
+                WHEN OLD.status NOT IN ('DRAFT','REVIEW_REQUIRED')
+                  AND NEW.requested_outputs_json IS NOT OLD.requested_outputs_json
+                BEGIN SELECT RAISE(ABORT,'requested outputs are immutable'); END''')
+            conn.execute('''CREATE TRIGGER IF NOT EXISTS merlin_import_outputs_required
+                BEFORE INSERT ON control_jobs
+                WHEN NEW.origin_surface='MERLIN' AND NEW.module='IMPORT_ENRICH'
+                  AND NEW.requested_outputs_json IS NULL
+                BEGIN SELECT RAISE(ABORT,'MERLIN import requires requested outputs'); END''')
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -614,12 +642,14 @@ class JobRepository:
         finally:
             conn.close()
 
-    def create_import_enrich_job(self, upload_id, display_name, mapping):
+    def create_import_enrich_job(self, upload_id, display_name, mapping,
+                                 requested_outputs=None):
         """Snapshot every registration row into the existing durable job queue."""
         name = str(display_name or '').strip()
         if not 1 <= len(name) <= 120:
             raise ValueError('Job name must be between 1 and 120 characters')
         mapping = dict(mapping or {})
+        outputs = canonicalize_requested_outputs(requested_outputs, allow_none=True)
         conn = self._connect()
         try:
             conn.execute('BEGIN IMMEDIATE')
@@ -627,6 +657,8 @@ class JobRepository:
                                   (upload_id,)).fetchone()
             if not upload or upload['status'] not in ('MAPPING', 'REVIEW'):
                 raise ValueError('Upload is not available for Import & Enrich')
+            if upload['origin_surface'] == 'MERLIN' and outputs is None:
+                raise ValueError('Requested outputs are required')
             headers = json.loads(upload['headers_json'])
             used = [value for value in mapping.values() if value is not None]
             if (any(type(value) is not int or not 0 <= value < len(headers) for value in used)
@@ -640,11 +672,12 @@ class JobRepository:
             created = now()
             conn.execute('''INSERT INTO control_jobs(job_id,display_name,input_kind,module,status,
                 created_at,queued_at,selected_company_count,execution_adapter,progress_stage,
-                import_total_rows,workspace_id,origin_surface)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                import_total_rows,workspace_id,origin_surface,requested_outputs_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (job_id, name, 'UPLOAD', 'IMPORT_ENRICH', 'QUEUED', created, created,
                  len(rows), 'IMPORT_ENRICH', 'PARSING', len(rows),
-                 upload['workspace_id'], upload['origin_surface']))
+                 upload['workspace_id'], upload['origin_surface'],
+                 encode_requested_outputs(outputs, allow_none=True)))
             for position, row in enumerate(rows, 1):
                 conn.execute('''INSERT INTO job_items(job_id,item_position,upload_id,
                     upload_row_number,company_id,match_status,match_method,selected,

@@ -27,9 +27,10 @@ def setup_services(tmp_path):
     upload_a = service.ingest_upload(workspace_a, csv_upload('a.csv'))
     upload_b = service.ingest_upload(workspace_b, csv_upload('b.csv'))
     job_a = service.queue_import(workspace_a, upload_a.upload_id, 'A import', {
-        'company_name': 0, 'tax_number': 1})
+        'company_name': 0, 'tax_number': 1},
+        ('WEBSITE', 'EMAIL', 'PHONE', 'FINANCIALS'))
     job_b = service.queue_import(workspace_b, upload_b.upload_id, 'B import', {
-        'company_name': 0, 'tax_number': 1})
+        'company_name': 0, 'tax_number': 1}, ('EMAIL',))
     return repository, service, workspace_a, workspace_b, upload_a, upload_b, job_a, job_b
 
 
@@ -120,7 +121,7 @@ def test_schema_rejects_missing_or_cross_workspace_lineage(tmp_path):
 
 
 def _v6_schema():
-    schema = Path('control_room/schema.sql').read_text()
+    schema = _v7_schema()
     schema = re.sub(r'CREATE TABLE IF NOT EXISTS workspaces \(.*?\);\n\n', '',
                     schema, count=1, flags=re.S)
     ownership = re.compile(
@@ -131,6 +132,12 @@ def _v6_schema():
         re.S)
     schema = ownership.sub('', schema)
     return schema.replace('PRAGMA user_version=7', 'PRAGMA user_version=6')
+
+
+def _v7_schema():
+    schema = Path('control_room/schema.sql').read_text()
+    schema = schema.replace('    requested_outputs_json TEXT,\n', '')
+    return schema.replace('PRAGMA user_version=8', 'PRAGMA user_version=7')
 
 
 def test_v6_migration_preserves_admin_rows_and_adds_ownership(tmp_path):
@@ -159,7 +166,7 @@ def test_v6_migration_preserves_admin_rows_and_adds_ownership(tmp_path):
         None, 'CONTROL_ROOM')
     conn = sqlite3.connect(path)
     try:
-        assert conn.execute('PRAGMA user_version').fetchone()[0] == 7
+        assert conn.execute('PRAGMA user_version').fetchone()[0] == 8
         assert conn.execute('SELECT COUNT(*) FROM upload_rows').fetchone()[0] == 1
         assert conn.execute("SELECT name FROM sqlite_master WHERE type='table' "
                             "AND name='workspaces'").fetchone()
@@ -198,3 +205,70 @@ def test_merlin_service_imports_without_control_room_web_surface():
     result = subprocess.run([sys.executable, '-c', command], cwd=Path.cwd(),
                             capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
+
+
+def test_requested_outputs_persist_canonically_across_service_reload(tmp_path):
+    path = tmp_path/'control.sqlite3'
+    repository = JobRepository(path); repository.initialize()
+    service = MerlinImportEnrichService(repository, tmp_path/'storage')
+    workspace = service.create_workspace('Workspace')['workspace_id']
+    upload = service.ingest_upload(workspace, csv_upload())
+    job = service.queue_import(workspace, upload.upload_id, 'Requested',
+        {'company_name': 0, 'tax_number': 1}, ('PHONE', 'WEBSITE', 'PHONE'))
+    assert job.requested_outputs == ('WEBSITE', 'PHONE')
+    assert repository.get_job(job.job_id)['requested_outputs_json'] == '["WEBSITE","PHONE"]'
+
+    reloaded_repository = JobRepository(path); reloaded_repository.initialize()
+    reloaded = MerlinImportEnrichService(reloaded_repository, tmp_path/'storage')
+    assert reloaded.job(workspace, job.job_id).requested_outputs == ('WEBSITE', 'PHONE')
+
+
+@pytest.mark.parametrize('outputs', [None, (), ('PROFILE',), ('website',), 'EMAIL'])
+def test_merlin_rejects_missing_empty_or_unknown_requested_outputs(tmp_path, outputs):
+    repository = JobRepository(tmp_path/'control.sqlite3'); repository.initialize()
+    service = MerlinImportEnrichService(repository, tmp_path/'storage')
+    workspace = service.create_workspace('Workspace')['workspace_id']
+    upload = service.ingest_upload(workspace, csv_upload())
+    with pytest.raises(ValueError, match='Requested outputs|requested output'):
+        service.queue_import(workspace, upload.upload_id, 'Invalid',
+            {'company_name': 0}, outputs)
+    assert repository.get_upload(upload.upload_id)['status'] == 'MAPPING'
+
+
+def test_requested_outputs_are_immutable_after_queue(tmp_path):
+    repository = JobRepository(tmp_path/'control.sqlite3'); repository.initialize()
+    service = MerlinImportEnrichService(repository, tmp_path/'storage')
+    workspace = service.create_workspace('Workspace')['workspace_id']
+    upload = service.ingest_upload(workspace, csv_upload())
+    job = service.queue_import(workspace, upload.upload_id, 'Immutable',
+        {'company_name': 0}, ('WEBSITE',))
+    conn = sqlite3.connect(repository.path)
+    try:
+        with pytest.raises(sqlite3.IntegrityError, match='requested outputs are immutable'):
+            conn.execute('UPDATE control_jobs SET requested_outputs_json=? WHERE job_id=?',
+                         ('["EMAIL"]', job.job_id))
+    finally:
+        conn.close()
+    assert service.job(workspace, job.job_id).requested_outputs == ('WEBSITE',)
+
+
+def test_v7_migration_preserves_jobs_and_adds_requested_outputs(tmp_path):
+    path = tmp_path/'v7.sqlite3'
+    conn = sqlite3.connect(path)
+    conn.executescript(_v7_schema())
+    conn.execute('''INSERT INTO control_jobs(job_id,display_name,input_kind,module,status,
+        created_at,queued_at,selected_company_count,execution_adapter,progress_stage,
+        import_total_rows) VALUES ('old-job','Old','UPLOAD','IMPORT_ENRICH','QUEUED',
+        'then','then',1,'IMPORT_ENRICH','PARSING',1)''')
+    conn.commit(); conn.close()
+
+    repository = JobRepository(path); repository.initialize(); repository.initialize()
+    old = repository.get_job('old-job')
+    assert old['requested_outputs_json'] is None
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute('PRAGMA user_version').fetchone()[0] == 8
+        assert 'requested_outputs_json' in {
+            row[1] for row in conn.execute('PRAGMA table_info(control_jobs)')}
+    finally:
+        conn.close()

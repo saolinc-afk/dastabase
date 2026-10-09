@@ -2,6 +2,7 @@
 import hashlib
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -18,12 +19,12 @@ def canonical(path):
       CREATE TABLE companies_lite(
         id INTEGER PRIMARY KEY,company_name TEXT,registration_number TEXT,
         tax_number TEXT,address TEXT,municipality TEXT,revenue_2025 REAL,
-        employees_2025 REAL);
+        profit_2025 REAL,employees_2025 REAL,assets_2025 REAL,capital_2025 REAL);
       INSERT INTO companies_lite VALUES
-        (1,'ALFA d.o.o.','1001','11111111','Alfa 1','Kranj',10,2),
-        (2,'BETA d.o.o.','1002','22222222','Beta 2','Ljubljana',20,3),
-        (3,'DVOJNIK d.o.o.','1003','33333333','Prva 3','Celje',30,4),
-        (4,'DVOJNIK d.o.o.','1004','44444444','Druga 4','Maribor',40,5);
+        (1,'ALFA d.o.o.','1001','11111111','Alfa 1','Kranj',10,1,2,30,4),
+        (2,'BETA d.o.o.','1002','22222222','Beta 2','Ljubljana',20,2,3,40,5),
+        (3,'DVOJNIK d.o.o.','1003','33333333','Prva 3','Celje',30,3,4,50,6),
+        (4,'DVOJNIK d.o.o.','1004','44444444','Druga 4','Maribor',40,4,5,60,7);
       CREATE TABLE website_discovery(
         id INTEGER PRIMARY KEY,company_id INTEGER,website TEXT,status TEXT,
         verified_scope TEXT,relationship TEXT);
@@ -142,13 +143,16 @@ def test_import_job_persists_rows_evidence_partitions_and_deduplicated_future_wo
     job = repository.create_import_enrich_job('u', 'Registrations', mapping)
     assert (job['module'], job['execution_adapter'], job['import_total_rows'],
             job['progress_stage']) == ('IMPORT_ENRICH', 'IMPORT_ENRICH', 6, 'PARSING')
+    assert job['requested_outputs_json'] is None
     initial = repository.job_items(job['job_id'])
     assert len(initial) == 6
     assert [item['upload_row_number'] for item in initial] == [2, 3, 4, 5, 6, 7]
     assert all(item['processing_status'] == 'PENDING' for item in initial)
 
     selective = SelectiveDiscovery(tmp_path)
-    completed = run(repository, source, job, discovery=selective)
+    with patch('requests.sessions.Session.request',
+               side_effect=AssertionError('network/provider call forbidden')):
+        completed = run(repository, source, job, discovery=selective)
     assert completed['status'] == 'COMPLETED'
     assert completed['progress_stage'] == 'DISCOVERY'
     assert completed['processed_company_count'] == 6
@@ -193,6 +197,64 @@ def test_import_job_persists_rows_evidence_partitions_and_deduplicated_future_wo
         refreshed_knowledge, 2, 'HIGH')
     assert len(repository.upload_rows('u')) == 6
     assert digest(source) == before
+
+
+@pytest.mark.parametrize(('requested_outputs', 'expected_discovery', 'remove_email'), [
+    (('WEBSITE',), [(2,)], True),
+    (('EMAIL',), [(2,)], False),
+    (('PHONE',), [(1, 2)], False),
+    (('FINANCIALS',), [], False),
+    (('WEBSITE', 'EMAIL', 'PHONE'), [(1, 2)], False),
+])
+def test_requested_outputs_control_selective_discovery(
+        tmp_path, requested_outputs, expected_discovery, remove_email):
+    source = tmp_path/'canonical.db'; canonical(source)
+    if remove_email:
+        conn = sqlite3.connect(source)
+        conn.execute('DELETE FROM email_discovery')
+        conn.commit(); conn.close()
+    repository = JobRepository(tmp_path/'control.db'); repository.initialize()
+    mapping = upload(repository)
+    job = repository.create_import_enrich_job(
+        'u', 'Requested outputs', mapping, requested_outputs)
+    selective = SelectiveDiscovery(tmp_path)
+
+    completed = run(repository, source, job, discovery=selective)
+
+    assert completed['status'] == 'COMPLETED'
+    assert selective.calls == expected_discovery
+    assert completed['import_discovery_required_company_count'] == (
+        len(expected_discovery[0]) if expected_discovery else 0)
+    matched = next(item for item in repository.job_items(job['job_id'])
+                   if item['company_id'] == 1)
+    assert matched['enrichment']['requested_outputs'] == list(requested_outputs)
+    if requested_outputs == ('FINANCIALS',):
+        assert {key: matched['enrichment'][key] for key in (
+            'revenue_2025', 'profit_2025', 'employees_2025',
+            'assets_2025', 'capital_2025')} == {
+                'revenue_2025': 10.0, 'profit_2025': 1.0,
+                'employees_2025': 2.0, 'assets_2025': 30.0,
+                'capital_2025': 4.0}
+
+
+def test_existing_accepted_phone_prevents_unnecessary_discovery(tmp_path):
+    source = tmp_path/'canonical.db'; canonical(source)
+    historical = tmp_path/'historical.sqlite3'
+    discovery_result(historical, (1, 2), with_phone=True)
+    repository = JobRepository(tmp_path/'control.db'); repository.initialize()
+    mapping = upload(repository)
+    job = repository.create_import_enrich_job(
+        'u', 'Phone reuse', mapping, ('PHONE',))
+    selective = SelectiveDiscovery(tmp_path)
+
+    with patch('requests.sessions.Session.request',
+               side_effect=AssertionError('network/provider call forbidden')):
+        completed = run(repository, source, job, discovery=selective,
+                        historical=(historical,))
+
+    assert completed['status'] == 'COMPLETED'
+    assert selective.calls == []
+    assert completed['import_existing_satisfied_company_count'] == 2
 
 
 def test_interruption_resumes_pending_rows_without_rewriting_completed_items(tmp_path):
@@ -393,7 +455,7 @@ def test_v3_control_room_migrates_without_losing_existing_discovery_job(tmp_path
     )
     lines = [line for line in schema.splitlines()
              if not line.strip().startswith(remove_prefixes)]
-    schema = '\n'.join(lines).replace('PRAGMA user_version=7', 'PRAGMA user_version=3')
+    schema = '\n'.join(lines).replace('PRAGMA user_version=8', 'PRAGMA user_version=3')
     conn = sqlite3.connect(database)
     conn.executescript(schema)
     conn.execute('''INSERT INTO control_jobs(job_id,display_name,input_kind,module,status,
@@ -411,7 +473,7 @@ def test_v3_control_room_migrates_without_losing_existing_discovery_job(tmp_path
         'DISCOVERY_CONTACTS', 'DISCOVERY_V2', 'Existing Discovery')
     assert repository.events('existing')[0]['event_code'] == 'OLD_EVENT'
     conn = sqlite3.connect(database)
-    assert conn.execute('PRAGMA user_version').fetchone()[0] == 7
+    assert conn.execute('PRAGMA user_version').fetchone()[0] == 8
     sql = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='control_jobs'"
     ).fetchone()[0]

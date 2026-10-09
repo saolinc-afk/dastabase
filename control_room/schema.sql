@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS control_jobs (
     identity_estimated_cost REAL,
     identity_actual_cost REAL,
     identity_approval_status TEXT NOT NULL DEFAULT 'NOT_CONFIGURED',
+    requested_outputs_json TEXT,
     workspace_id TEXT REFERENCES workspaces(workspace_id),
     origin_surface TEXT NOT NULL DEFAULT 'CONTROL_ROOM'
         CHECK(origin_surface IN ('CONTROL_ROOM','MERLIN')),
@@ -264,4 +265,4 @@ CREATE INDEX IF NOT EXISTS job_artifacts_job ON job_artifacts(job_id,artifact_ty
 CREATE INDEX IF NOT EXISTS identity_tasks_job ON identity_resolution_tasks(job_id,status);
 CREATE INDEX IF NOT EXISTS identity_queries_task ON identity_search_queries(task_id,sequence);
 
-PRAGMA user_version=7;
+PRAGMA user_version=8;

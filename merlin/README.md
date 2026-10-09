@@ -10,5 +10,12 @@ workspace-scoped, customer-safe upload/job/final-artifact projections. It does n
 import the Control Room web application and does not expose database paths,
 provider details, Discovery run IDs, logs, or internal artifacts.
 
-M1 contains no web routes, authentication, requested-output selection, provider
-calls, Profile integration, or separate enrichment implementation.
+M2 persists an explicit, immutable requested-output set for every new MERLIN
+Import & Enrich job. The fixed 0.1 vocabulary is `WEBSITE`, `EMAIL`, `PHONE`,
+and `FINANCIALS`; Profile is not active. Existing accepted knowledge is reused
+before selective Discovery is considered. Financials come only from canonical
+2025 data and never create Discovery work.
+
+There are still no MERLIN web routes, authentication, request-aware workbook
+columns, provider implementations, Profile integration, or separate enrichment
+implementation.

@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+from control_room.import_outputs import decode_requested_outputs
 from control_room.repository import JobRepository
 from control_room.uploads import store_and_parse
 
@@ -25,6 +26,7 @@ class MerlinJob:
     stage: str | None
     created_at: str
     finished_at: str | None
+    requested_outputs: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -68,12 +70,13 @@ class MerlinImportEnrichService:
         stored = self.repository.get_upload_for_workspace(workspace_id, upload_id)
         return self._upload(stored) if stored else None
 
-    def queue_import(self, workspace_id, upload_id, display_name, mapping):
+    def queue_import(self, workspace_id, upload_id, display_name, mapping,
+                     requested_outputs=None):
         self._require_workspace(workspace_id)
         if self.repository.get_upload_for_workspace(workspace_id, upload_id) is None:
             raise LookupError('Upload not found')
         stored = self.repository.create_import_enrich_job(
-            upload_id, display_name, mapping)
+            upload_id, display_name, mapping, requested_outputs)
         if (stored.get('workspace_id') != workspace_id
                 or stored.get('origin_surface') != 'MERLIN'):
             raise RuntimeError('Import job ownership was not preserved')
@@ -109,7 +112,8 @@ class MerlinImportEnrichService:
     def _job(stored):
         return MerlinJob(stored['job_id'], stored['status'],
             stored['selected_company_count'], stored['processed_company_count'],
-            stored.get('progress_stage'), stored['created_at'], stored.get('finished_at'))
+            stored.get('progress_stage'), stored['created_at'], stored.get('finished_at'),
+            decode_requested_outputs(stored.get('requested_outputs_json')) or ())
 
     @staticmethod
     def _artifact(stored):
