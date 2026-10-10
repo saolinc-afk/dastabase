@@ -1,0 +1,35 @@
+{% extends 'base.html' %}{% block title %}{{ company.identity.company_name or 'Company' }}{% endblock %}
+{% macro source(locator) %}<small class="provenance">{{ locator|provenance_label }}</small>{% endmacro %}
+{% macro fact_source(fact) %}{% if fact and fact.evidence_locators %}{% for locator in fact.evidence_locators %}{{ source(locator) }}{% endfor %}{% else %}<small class="provenance">Provenance unavailable</small>{% endif %}{% endmacro %}
+{% block content %}
+<div class="page-title"><span>04</span><h1>DATA / COMPANY</h1><i>_</i></div>
+<a class="back-link" href="{{ url_for('data') }}">← COMPANY EXPLORER</a>
+<section class="company-header"><h2>CANONICAL COMPANY {{ company.company_id }}</h2><strong>{{ company.identity.company_name or 'UNKNOWN' }}</strong><span>{{ company.identity.municipality or 'Location unknown' }}</span></section>
+
+<div class="data-detail-grid">
+<section><h2>IDENTITY</h2><dl class="knowledge-list">
+  {% for field,label in [('company_name','Legal name'),('id','Canonical ID'),('tax_number','Tax number'),('registration_number','Registration number'),('address','Address'),('municipality','Municipality')] %}
+  <div><dt>{{ label }}</dt><dd>{{ company.identity[field] if company.identity[field] not in (none,'') else 'UNKNOWN' }}{{ source(company.identity_provenance[field]) if company.identity_provenance.get(field) }}</dd></div>
+  {% endfor %}
+</dl></section>
+<section><h2>FINANCIALS · 2025</h2><dl class="knowledge-list">
+  {% for field,label in [('revenue_2025','Revenue'),('profit_2025','Profit'),('employees_2025','Employees'),('assets_2025','Assets'),('capital_2025','Capital')] %}
+  <div><dt>{{ label }}</dt><dd>{{ company.financials[field]|readable_number }}{{ source(company.financial_provenance[field]) if company.financial_provenance.get(field) }}</dd></div>
+  {% endfor %}
+</dl></section>
+</div>
+
+<section class="knowledge-section"><h2>CONTACT / WEB KNOWLEDGE</h2>
+  <div class="contact-grid">
+    <div><h3>WEBSITE</h3>{% if company.website %}<a href="{{ company.website.value }}" rel="noopener noreferrer">{{ company.website.value }}</a><small>{{ company.website.status or 'Accepted' }}{% if company.website.observed_at %} · {{ company.website.observed_at }}{% endif %}</small>{{ fact_source(company.website) }}{% else %}<span class="quiet-unknown">UNKNOWN</span>{% endif %}</div>
+    <div><h3>EMAILS</h3>{% for fact in company.emails %}<p><a href="mailto:{{ fact.value }}">{{ fact.value }}</a>{% if company.default_email and fact.value == company.default_email.value %}<b>DEFAULT</b>{% endif %}<small>{{ fact.status or 'Accepted' }}{% if fact.observed_at %} · {{ fact.observed_at }}{% endif %}</small>{{ fact_source(fact) }}</p>{% else %}<span class="quiet-unknown">UNKNOWN</span>{% endfor %}</div>
+    <div><h3>PHONES</h3>{% for fact in company.phones %}<p>{{ fact.value }}{% if company.default_phone and fact.value == company.default_phone.value %}<b>DEFAULT</b>{% endif %}<small>{{ fact.status or 'Accepted' }}{% if fact.observed_at %} · {{ fact.observed_at }}{% endif %}</small>{{ fact_source(fact) }}</p>{% else %}<span class="quiet-unknown">UNKNOWN</span>{% endfor %}</div>
+  </div>
+</section>
+
+<section class="knowledge-section"><h2>KNOWLEDGE QUALITY</h2>
+  <div class="quality-grid"><div><h3>CONFLICTS</h3>{% for conflict in company.conflicts %}<p><b>{{ conflict.field|replace('_',' ')|upper }}</b><br>Selected: {{ conflict.selected_value }}<br>Alternative: {{ conflict.conflicting_value }}{% for locator in conflict.evidence_locators %}{{ source(locator) }}{% endfor %}</p>{% else %}<p class="muted">No accepted-value conflicts.</p>{% endfor %}</div>
+  <div><h3>MISSING</h3>{% if company.missing_fields %}<p>{{ company.missing_fields|join(', ')|replace('_',' ')|upper }}</p>{% else %}<p class="muted">No tracked contact fields missing.</p>{% endif %}</div>
+  <div><h3>STALE</h3>{% if company.stale_fields %}<p>{{ company.stale_fields|join(', ')|replace('_',' ')|upper }}</p>{% else %}<p class="muted">No fields marked stale.</p>{% endif %}</div></div>
+</section>
+{% endblock %}

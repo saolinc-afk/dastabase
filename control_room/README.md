@@ -1,8 +1,11 @@
-# Dastabase Control Room v0.1 foundation
+# Dastabase Control Room
 
-This milestone proves persistent upload, mapping, matching, review, manifest
-creation, and orchestration with a deterministic fake adapter. It does not
-invoke Discovery v2, search providers, canonical database writes, or exports.
+The internal Control Room provides persistent upload, mapping, matching, review,
+job orchestration, artifacts, and read-only company knowledge browsing. It supports
+the deterministic fake adapter and explicitly confirmed Discovery v2 execution.
+Canonical and configured knowledge-source databases remain read-only; operational
+state and isolated job artifacts are written only under the configured Control Room
+database and storage root.
 
 Runtime state defaults outside the repository to:
 
@@ -54,6 +57,18 @@ or reloading the browser does not affect progress.
 The fake adapter performs no network requests and never opens a Discovery result
 database. Its deterministic totals at completion are 50% email coverage, 75%
 website coverage, and one-third phone coverage.
+
+## DATA company explorer
+
+**DATA** is a read-only browser over the shared `KnowledgeRepository`. Its first
+page is bounded and ordered by canonical company ID. Exact canonical ID, tax-number,
+and registration-number searches and deterministic normalized name substring search
+are supported, with pagination. Company detail pages show canonical identity and
+2025 financials plus only accepted website/contact facts, knowledge conflicts,
+missing/stale fields, and the compact provenance already retained by the repository.
+The explorer does not read raw Discovery observations, make network calls, trigger
+enrichment, or write to any source database. The repository is an immutable
+point-in-time view; restart the web process to load later source-database changes.
 
 ## Upload workflow
 

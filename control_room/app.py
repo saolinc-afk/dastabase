@@ -8,6 +8,7 @@ from flask import Flask, abort, jsonify, redirect, render_template, request, sen
 
 from engine_identity import ENGINE_IDENTITY
 from monitor.metrics import database_metrics, discovery_v2_metrics
+from control_room.knowledge_repository import KnowledgeRepository
 from control_room.repository import JobRepository
 from control_room.matching import (CanonicalMatcher, normalize_name, normalize_registration,
                                    normalize_tax, normalize_text, read_companies)
@@ -37,6 +38,8 @@ def create_app(config=None):
     app = Flask(__name__)
     app.json.sort_keys = False
     configured_canonical = os.environ.get('CONTROL_ROOM_CANONICAL_DB')
+    configured_results = tuple(filter(None, os.environ.get(
+        'CONTROL_ROOM_IMPORT_DISCOVERY_RESULTS', '').split(os.pathsep)))
     app.config.update(
         CONTROL_DB=Path(os.environ.get('CONTROL_ROOM_DB',
             Path.home()/'.local/share/dastabase-control/control_room.sqlite3')),
@@ -52,6 +55,8 @@ def create_app(config=None):
         UPLOAD_MAX_ROWS=int(os.environ.get('CONTROL_ROOM_UPLOAD_MAX_ROWS', '5000')),
         REAL_DISCOVERY_MAX_COMPANIES=int(os.environ.get(
             'CONTROL_ROOM_REAL_DISCOVERY_MAX_COMPANIES','200')),
+        KNOWLEDGE_DISCOVERY_RESULTS=configured_results,
+        DATA_PAGE_SIZE=25,
     )
     if config:
         app.config.update(config)
@@ -60,6 +65,14 @@ def create_app(config=None):
     repository = JobRepository(app.config['CONTROL_DB'])
     repository.initialize()
     app.extensions['control_repository'] = repository
+
+    def knowledge():
+        current = app.extensions.get('knowledge_repository')
+        if current is None:
+            current = KnowledgeRepository(app.config['CANONICAL_DB'],
+                app.config['KNOWLEDGE_DISCOVERY_RESULTS'])
+            app.extensions['knowledge_repository'] = current
+        return current
 
     def canonical():
         return read_companies(app.config['CANONICAL_DB'])
@@ -110,6 +123,32 @@ def create_app(config=None):
         minutes, seconds = divmod(int(value), 60)
         hours, minutes = divmod(minutes, 60)
         return f'{hours:02d}:{minutes:02d}:{seconds:02d}'
+
+    @app.template_filter('readable_number')
+    def readable_number(value):
+        if value is None or value == '':
+            return 'UNKNOWN'
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if number.is_integer():
+            return f'{int(number):,}'
+        return f'{number:,.2f}'.rstrip('0').rstrip('.')
+
+    @app.template_filter('provenance_label')
+    def provenance_label(locator):
+        if not locator:
+            return 'UNKNOWN'
+        parts = [locator.get('source_namespace') or locator.get('source_type')]
+        if locator.get('table'):
+            record = locator.get('record_id')
+            parts.append(f'{locator["table"]}{":" + str(record) if record is not None else ""}')
+        for key, label in (('run_id','run'),('result_id','result'),
+                           ('observation_id','observation')):
+            if locator.get(key) is not None:
+                parts.append(f'{label} {locator[key]}')
+        return ' · '.join(str(part) for part in parts if part)
 
     @app.get('/')
     def overview():
@@ -272,7 +311,35 @@ def create_app(config=None):
 
     @app.get('/data')
     def data():
-        return render_template('data.html', page='data')
+        query = request.args.get('q','').strip()
+        requested_page = request.args.get('page', 1, type=int)
+        current_page = max(1, requested_page or 1)
+        page_size = app.config['DATA_PAGE_SIZE']
+        try:
+            snapshots, total = knowledge().search_snapshots(query,
+                offset=(current_page-1)*page_size, limit=page_size)
+        except (OSError, sqlite3.Error, ValueError):
+            return render_template('data.html', page='data', query=query, rows=(),
+                total=0, current_page=1, page_count=1,
+                data_error='Knowledge Repository is unavailable.'), 503
+        page_count = max(1, (total+page_size-1)//page_size)
+        if current_page > page_count:
+            abort(404)
+        return render_template('data.html', page='data', query=query,
+            rows=snapshots, total=total, current_page=current_page,
+            page_count=page_count)
+
+    @app.get('/data/company/<int:canonical_company_id>')
+    def company_data(canonical_company_id):
+        try:
+            knowledge_repository = knowledge()
+        except (OSError, sqlite3.Error, ValueError):
+            abort(503)
+        try:
+            record = knowledge_repository.record(canonical_company_id)
+        except ValueError:
+            abort(404)
+        return render_template('company_detail.html', page='data', company=record)
 
     @app.get('/api/jobs/<job_id>')
     def job_progress(job_id):

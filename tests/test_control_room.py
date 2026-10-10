@@ -167,9 +167,11 @@ class ControlRoomWebTests(unittest.TestCase):
 
     def test_pages_json_progress_and_persistence_after_app_recreation(self):
         job = self.repository.create_job('Persistent UI', 10)
-        for path in ('/', '/enrich', '/jobs', f'/jobs/{job["job_id"]}', '/data'):
+        for path in ('/', '/enrich', '/jobs', f'/jobs/{job["job_id"]}'):
             self.assertEqual(self.client.get(path).status_code, 200)
-        self.assertIn('COMING SOON', self.client.get('/data').get_data(as_text=True))
+        unavailable = self.client.get('/data')
+        self.assertEqual(unavailable.status_code, 503)
+        self.assertIn('Knowledge Repository is unavailable', unavailable.get_data(as_text=True))
         payload = self.client.get(f'/api/jobs/{job["job_id"]}').get_json()
         self.assertEqual(payload['job']['status'], 'QUEUED')
         self.assertEqual(payload['events'][0]['event_code'], 'JOB_QUEUED')

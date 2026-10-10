@@ -1,2 +1,29 @@
 {% extends 'base.html' %}{% block title %}Data{% endblock %}
-{% block content %}<div class="page-title"><span>04</span><h1>DATA</h1><i>_</i></div><section class="coming"><h2>COMING SOON</h2><p>Read-only company browsing is intentionally deferred beyond the foundation milestone.</p></section>{% endblock %}
+{% block content %}
+<div class="page-title"><span>04</span><h1>DATA</h1><i>_</i></div>
+<section class="data-browser">
+  <form class="data-search" method="get" action="{{ url_for('data') }}">
+    <label for="company-search">COMPANY SEARCH</label>
+    <div><input id="company-search" name="q" type="search" value="{{ query }}" placeholder="Name, canonical ID, tax or registration number"><button type="submit">SEARCH</button></div>
+  </form>
+  {% if data_error %}<p class="error">{{ data_error }}</p>{% else %}
+  <div class="data-summary"><span>{{ total }} {{ 'match' if total == 1 else 'matches' }}</span><span>Page {{ current_page }} / {{ page_count }}</span></div>
+  <div class="scroll"><table class="data-table"><thead><tr><th>COMPANY</th><th>LOCATION</th><th>EMPLOYEES 2025</th><th>REVENUE 2025</th><th>WEBSITE</th><th>DEFAULT EMAIL</th><th>DEFAULT PHONE</th></tr></thead><tbody>
+  {% for row in rows %}<tr>
+    <td><a href="{{ url_for('company_data',canonical_company_id=row.company_id) }}"><strong>{{ row.identity.company_name or 'UNKNOWN' }}</strong></a><small>ID {{ row.company_id }}</small></td>
+    <td>{{ row.identity.address or 'UNKNOWN' }}{% if row.identity.municipality %}<small>{{ row.identity.municipality }}</small>{% endif %}</td>
+    <td>{{ row.financials.employees_2025|readable_number }}</td>
+    <td>{{ row.financials.revenue_2025|readable_number }}</td>
+    <td>{% if row.website %}<a href="{{ row.website.value }}" rel="noopener noreferrer">{{ row.website.value }}</a>{% else %}<span class="quiet-unknown">UNKNOWN</span>{% endif %}</td>
+    <td>{% if row.default_email %}<a href="mailto:{{ row.default_email.value }}">{{ row.default_email.value }}</a>{% else %}<span class="quiet-unknown">UNKNOWN</span>{% endif %}</td>
+    <td>{% if row.default_phone %}{{ row.default_phone.value }}{% else %}<span class="quiet-unknown">UNKNOWN</span>{% endif %}</td>
+  </tr>{% else %}<tr><td colspan="7" class="muted">No canonical companies match this search.</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% if page_count > 1 %}<nav class="pagination" aria-label="Company results pages">
+    {% if current_page > 1 %}<a href="{{ url_for('data',q=query,page=current_page-1) }}">← PREVIOUS</a>{% else %}<span></span>{% endif %}
+    <span>{{ current_page }} / {{ page_count }}</span>
+    {% if current_page < page_count %}<a href="{{ url_for('data',q=query,page=current_page+1) }}">NEXT →</a>{% else %}<span></span>{% endif %}
+  </nav>{% endif %}
+  {% endif %}
+</section>
+{% endblock %}

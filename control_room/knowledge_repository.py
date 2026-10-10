@@ -13,7 +13,8 @@ from discovery.domain_policy import blocks_official
 from discovery_v2.evidence import public_email_domain
 from discovery_v2.export import result_candidates
 
-from control_room.matching import normalize_email
+from control_room.matching import (normalize_email, normalize_name, normalize_registration,
+                                   normalize_tax)
 
 
 USABLE = {'VERIFIED', 'HIGH', 'MEDIUM'}
@@ -137,6 +138,11 @@ class KnowledgeRepository:
         self._discovery = self._load_discovery()
         self._snapshots = {company_id: self._snapshot(company_id)
                            for company_id in self.by_id}
+        self._search_index = tuple((company_id,
+            normalize_name(snapshot.identity.get('company_name') or ''),
+            normalize_tax(snapshot.identity.get('tax_number') or ''),
+            normalize_registration(snapshot.identity.get('registration_number') or ''))
+            for company_id, snapshot in sorted(self._snapshots.items()))
 
     @staticmethod
     def _load_companies(path):
@@ -422,6 +428,32 @@ class KnowledgeRepository:
             ids = sorted(requested)
         for company_id in ids:
             yield self.snapshot(company_id)
+
+    def search_snapshots(self, query='', *, offset=0, limit=25):
+        """Return a deterministic page of exact-identity/name-substring matches.
+
+        Identifier matching is exact after existing canonical normalization. Names
+        use normalized substring matching; no fuzzy or inferred matching is used.
+        """
+        if type(offset) is not int or offset < 0:
+            raise ValueError('Search offset must be a non-negative integer')
+        if type(limit) is not int or not 1 <= limit <= 200:
+            raise ValueError('Search limit must be an integer from 1 to 200')
+        raw = str(query or '').strip()
+        if not raw:
+            matched = self._search_index
+        else:
+            name = '' if raw.isdecimal() else normalize_name(raw)
+            tax = normalize_tax(raw)
+            registration = normalize_registration(raw)
+            canonical_id = int(raw) if raw.isdecimal() else None
+            matched = tuple(item for item in self._search_index if
+                item[0] == canonical_id or
+                (name and name in item[1]) or
+                (tax and tax == item[2]) or
+                (registration and registration == item[3]))
+        total = len(matched)
+        return tuple(self._snapshots[item[0]] for item in matched[offset:offset+limit]), total
 
     @staticmethod
     def _fact_record(fact):

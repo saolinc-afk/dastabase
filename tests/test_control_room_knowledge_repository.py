@@ -209,6 +209,21 @@ def test_stable_record_iteration_provenance_zero_and_deep_read_only(tmp_path):
     assert repo.snapshot(1).identity['company_name']=='ALFA d.o.o.'
 
 
+def test_search_snapshots_is_exact_for_ids_and_identifiers_and_paginated(tmp_path):
+    source=tmp_path/'lite.db'; lite(source)
+    repo=KnowledgeRepository(source)
+    page,total=repo.search_snapshots('',offset=0,limit=2)
+    assert total==3 and [item.company_id for item in page]==[1,2]
+    page,total=repo.search_snapshots('gama',limit=25)
+    assert total==1 and page[0].company_id==3
+    for query,company_id in [('2',2),('22222222',2),('1000003',3)]:
+        page,total=repo.search_snapshots(query,limit=25)
+        assert total==1 and page[0].company_id==company_id
+    assert repo.search_snapshots('2222',limit=25)[1]==0
+    with pytest.raises(ValueError): repo.search_snapshots('',offset=-1)
+    with pytest.raises(ValueError): repo.search_snapshots('',limit=0)
+
+
 def test_contacts_are_multivalue_defaults_are_deterministic_and_not_conflicts(tmp_path):
     source=tmp_path/'lite.db'; lite(source)
     older=tmp_path/'older.sqlite3'; discovery(older,run='old',
