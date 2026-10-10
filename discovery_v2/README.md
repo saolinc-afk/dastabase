@@ -1,5 +1,11 @@
 # Discovery v2 — Phase A
 
+The offline, read-only recall-planning funnel is documented in
+[`COVERAGE_AUDIT.md`](COVERAGE_AUDIT.md). It is separate from Discovery execution
+and does not change search, verification, scoring, or production data. The same
+document covers the stored-evidence recovery opportunity audit for completed
+`PARTIAL` and `FAILED` populations.
+
 An isolated `DISCOVERY_CONTACTS` module. It reads company identities from a frozen
 Lite snapshot and writes only to a separate Discovery v2 SQLite database. It does
 not publish to Lite, the existing V2 database, or Monitor. `PROFILE_ACTIVITY` and
