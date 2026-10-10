@@ -8,6 +8,14 @@ document covers the stored-evidence recovery opportunity audit for completed
 deterministic resolver design, and compact human-review export are in
 [`AMBIGUITY_AUDIT.md`](AMBIGUITY_AUDIT.md).
 
+The reviewed 100-company ambiguity benchmark and its append-only Human Review /
+Ground Truth assertion artifact are in
+[`benchmarks/ambiguity_human_review_100/`](benchmarks/ambiguity_human_review_100/).
+`human_review_benchmark.py` imports the reviewed workbook without network access,
+preserves the exact reviewer-entered website/comments, and writes only a separate
+benchmark directory and assertion database. It does not promote facts into the
+canonical database, Discovery results, or `KnowledgeRepository`.
+
 An isolated `DISCOVERY_CONTACTS` module. It reads company identities from a frozen
 Lite snapshot and writes only to a separate Discovery v2 SQLite database. It does
 not publish to Lite, the existing V2 database, or Monitor. `PROFILE_ACTIVITY` and
