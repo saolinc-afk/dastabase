@@ -5,6 +5,8 @@ import io
 import os
 import re
 import uuid
+import zipfile
+import zlib
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -12,6 +14,14 @@ from openpyxl import load_workbook
 
 FIELDS = ('company_name', 'tax_number', 'registration_number', 'address', 'municipality')
 IMPORT_FIELDS = ('person_name', 'email', 'phone', *FIELDS)
+# XLSX is a ZIP container. These limits bound work before openpyxl expands XML
+# and shared-string content. They intentionally sit well above normal Merlin
+# uploads while rejecting compressed archives with disproportionate expansion.
+XLSX_MAX_ZIP_ENTRIES = 1_000
+XLSX_MAX_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
+XLSX_MAX_ENTRY_BYTES = 64 * 1024 * 1024
+XLSX_MAX_COMPRESSION_RATIO = 200
+XLSX_COMPRESSION_RATIO_MIN_BYTES = 1024 * 1024
 HEADER_ALIASES = {
     'person_name': {'ime', 'name', 'ime in priimek', 'full name'},
     'email': {'email', 'e mail', 'e posta', 'elektronska posta'},
@@ -121,7 +131,43 @@ def parse_csv(data, max_rows):
     return (*_validate(parsed[0], parsed[1:], max_rows), None)
 
 
+def validate_xlsx_archive(path):
+    """Reject malformed or disproportionately expandable XLSX containers."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            entries = archive.infolist()
+            if not entries:
+                raise UploadError('Invalid XLSX workbook')
+            if len(entries) > XLSX_MAX_ZIP_ENTRIES:
+                raise UploadError('The XLSX file is too complex to process safely')
+            total_size = 0
+            names = set()
+            for entry in entries:
+                if entry.filename in names or entry.flag_bits & 0x1:
+                    raise UploadError('Invalid XLSX workbook')
+                names.add(entry.filename)
+                if entry.file_size < 0 or entry.compress_size < 0:
+                    raise UploadError('Invalid XLSX workbook')
+                if entry.file_size > XLSX_MAX_ENTRY_BYTES:
+                    raise UploadError('The XLSX file is too complex to process safely')
+                total_size += entry.file_size
+                if total_size > XLSX_MAX_UNCOMPRESSED_BYTES:
+                    raise UploadError('The XLSX file is too complex to process safely')
+                if (entry.file_size >= XLSX_COMPRESSION_RATIO_MIN_BYTES and
+                        (entry.compress_size == 0 or
+                         entry.file_size / entry.compress_size > XLSX_MAX_COMPRESSION_RATIO)):
+                    raise UploadError('The XLSX file is too complex to process safely')
+            if archive.testzip() is not None:
+                raise UploadError('Invalid XLSX workbook')
+    except UploadError:
+        raise
+    except (OSError, EOFError, RuntimeError, NotImplementedError,
+            zipfile.BadZipFile, zipfile.LargeZipFile, zlib.error) as exc:
+        raise UploadError('Invalid XLSX workbook') from exc
+
+
 def parse_xlsx(path, max_rows):
+    validate_xlsx_archive(path)
     try:
         workbook = load_workbook(path, read_only=True, data_only=True)
     except Exception as exc:

@@ -130,7 +130,10 @@ def create_app(config=None):
             state, stage = 'failed', 'We could not finish this file.'
         elif job.status in ('COMPLETED', 'PARTIAL'):
             if final:
-                state, stage = 'done', 'Done.'
+                if job.status == 'PARTIAL':
+                    state, stage = 'partial', "Done — some information couldn't be found."
+                else:
+                    state, stage = 'done', 'Done.'
             else:
                 state, stage = 'failed', 'We could not prepare the Excel file.'
         else:
@@ -144,9 +147,11 @@ def create_app(config=None):
         return {
             'state': state, 'stage': stage, 'processed': job.processed,
             'total': job.total, 'percent': max(0, min(percent, 100)),
-            'download_ready': state == 'done',
+            'download_ready': state in ('done', 'partial'),
             'requested_outputs': list(job.requested_outputs),
             'matched_rows': job.matched_rows, 'review_rows': job.review_rows,
+            'complete_rows': job.complete_rows,
+            'incomplete_rows': job.incomplete_rows,
         }
 
     @app.before_request

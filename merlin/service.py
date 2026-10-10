@@ -4,7 +4,8 @@ import hmac
 from dataclasses import dataclass
 from pathlib import Path
 
-from control_room.import_outputs import decode_requested_outputs
+from control_room.import_outputs import (decode_requested_outputs,
+                                         missing_persisted_outputs)
 from control_room.repository import JobRepository
 from control_room.uploads import store_and_parse
 
@@ -31,6 +32,8 @@ class MerlinJob:
     requested_outputs: tuple[str, ...]
     matched_rows: int
     review_rows: int
+    complete_rows: int | None
+    incomplete_rows: int | None
 
 
 @dataclass(frozen=True)
@@ -95,7 +98,11 @@ class MerlinImportEnrichService:
 
     def job(self, workspace_id, job_id):
         stored = self.repository.get_job_for_workspace(workspace_id, job_id)
-        return self._job(stored) if stored else None
+        if not stored:
+            return None
+        items = (self.repository.job_items(job_id)
+                 if stored['status'] in ('COMPLETED', 'PARTIAL') else None)
+        return self._job(stored, items)
 
     def artifacts(self, workspace_id, job_id):
         return tuple(self._artifact(item) for item in
@@ -148,14 +155,22 @@ class MerlinImportEnrichService:
             stored['format'], stored['row_count'], tuple(stored['headers']), stored['status'])
 
     @staticmethod
-    def _job(stored):
+    def _job(stored, items=None):
+        outputs = decode_requested_outputs(stored.get('requested_outputs_json')) or ()
+        complete_rows = incomplete_rows = None
+        if items is not None and outputs:
+            matched = [item for item in items if item['match_status'] == 'MATCHED']
+            incomplete_rows = sum(bool(missing_persisted_outputs(
+                item.get('enrichment'), outputs)) for item in matched)
+            complete_rows = len(matched) - incomplete_rows
         return MerlinJob(stored['job_id'], stored['status'],
             stored['selected_company_count'], stored['processed_company_count'],
             stored.get('progress_stage'), stored['created_at'], stored.get('finished_at'),
-            decode_requested_outputs(stored.get('requested_outputs_json')) or (),
+            outputs,
             stored.get('import_matched_count') or 0,
             ((stored.get('import_ambiguous_count') or 0) +
-             (stored.get('import_unresolved_count') or 0)))
+             (stored.get('import_unresolved_count') or 0)),
+            complete_rows, incomplete_rows)
 
     @staticmethod
     def _artifact(stored):

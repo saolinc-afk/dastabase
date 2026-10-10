@@ -224,6 +224,27 @@ def test_email_only_merlin_export_does_not_leak_stored_website(tmp_path):
         workbook.close()
 
 
+def test_merlin_export_marks_matched_rows_with_missing_requested_information(tmp_path):
+    root, _, _, _, _, _, artifact = _run(tmp_path, ('FINANCIALS',))
+    workbook = load_workbook(root/artifact['relative_path'], data_only=False)
+    try:
+        sheet = workbook['Source data']
+        headers = [cell.value for cell in sheet[1]]
+        note_column = headers.index('Merlin note') + 1
+        assert sheet.cell(2, note_column).value == (
+            "Some requested information couldn't be found.")
+        review = {row[0].value: row[1].value for row in workbook['Merlin review']
+                  if row[0].value is not None}
+        assert review['Matched rows missing requested information'] == 2
+        assert review['Matched rows with all requested information'] == 0
+        visible = ' '.join(str(cell.value) for row in workbook['Merlin review']
+                           for cell in row if cell.value is not None).casefold()
+        assert not any(term in visible for term in (
+            'provider', 'run id', 'discovery status', 'sqlite', 'traceback'))
+    finally:
+        workbook.close()
+
+
 def test_merlin_collision_and_lossless_xlsx_guarantees(tmp_path):
     root, repository, _, _, upload, _, artifact = _run(
         tmp_path, ('WEBSITE',), collision=True)

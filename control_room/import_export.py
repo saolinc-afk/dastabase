@@ -10,7 +10,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from openpyxl import Workbook, load_workbook
 
-from control_room.import_outputs import decode_requested_outputs
+from control_room.import_outputs import (decode_requested_outputs,
+                                         missing_persisted_outputs)
 
 
 EXPORT_HEADERS = (
@@ -128,9 +129,12 @@ def _merlin_headers(requested_outputs):
         for header, _ in MERLIN_OUTPUT_HEADERS[output])
 
 
-def _merlin_match(item):
+def _merlin_match(item, requested_outputs):
     if item['match_status'] == 'MATCHED':
-        return 'Matched', ''
+        note = ('Some requested information couldn\'t be found.'
+                if missing_persisted_outputs(item.get('enrichment'), requested_outputs)
+                else '')
+        return 'Matched', note
     if item['match_status'] == 'AMBIGUOUS':
         return 'Ambiguous', 'Multiple possible company matches. Please review this row.'
     return 'Not found', 'No matching company was found.'
@@ -155,7 +159,7 @@ def canonical_merlin_website(value):
 
 
 def _merlin_export_values(item, requested_outputs):
-    match, note = _merlin_match(item)
+    match, note = _merlin_match(item, requested_outputs)
     data = item['enrichment'] if item['match_status'] == 'MATCHED' else {}
     values = [match, note]
     for output in requested_outputs:
@@ -196,14 +200,19 @@ def _qc_metrics(items, upload_rows):
     )
 
 
-def _merlin_qc_metrics(items, upload_rows):
-    statuses = Counter(_merlin_match(item)[0] for item in items)
+def _merlin_qc_metrics(items, upload_rows, requested_outputs):
+    statuses = Counter(_merlin_match(item, requested_outputs)[0] for item in items)
+    matched = [item for item in items if item['match_status'] == 'MATCHED']
+    incomplete = sum(bool(missing_persisted_outputs(item.get('enrichment'), requested_outputs))
+                     for item in matched)
     fingerprints = Counter(tuple(str(value) for value in row['original_values'])
                            for row in upload_rows)
     return (
         ('Source rows', len(upload_rows)),
         ('Exported rows', len(items)),
         ('Matched rows', statuses['Matched']),
+        ('Matched rows with all requested information', len(matched) - incomplete),
+        ('Matched rows missing requested information', incomplete),
         ('Ambiguous rows', statuses['Ambiguous']),
         ('Not found rows', statuses['Not found']),
         ('Duplicate source row groups', sum(count > 1 for count in fingerprints.values())),
@@ -323,7 +332,7 @@ def export_import_xlsx(repository, job_id, storage_root):
                     'Dastabase Import & Enrich QC'), 'Value'))
         if not is_merlin:
             qc.append(('Job ID', job_id))
-        metrics = (_merlin_qc_metrics(items, upload_rows) if is_merlin else
+        metrics = (_merlin_qc_metrics(items, upload_rows, requested_outputs) if is_merlin else
                    _qc_metrics(items, upload_rows))
         for metric in metrics:
             qc.append(metric)

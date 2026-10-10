@@ -4,7 +4,9 @@ import io
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from openpyxl import Workbook
 
@@ -32,6 +34,12 @@ def canonical_database(path):
 
 
 class ParserAndMatcherTests(unittest.TestCase):
+    @staticmethod
+    def zip_file(path, entries, compression=zipfile.ZIP_DEFLATED):
+        with zipfile.ZipFile(path, 'w', compression=compression) as archive:
+            for name, content in entries:
+                archive.writestr(name, content)
+
     def test_csv_utf8_bom_semicolon_and_tab(self):
         headers, rows, sheet = parse_csv('\ufeffNaziv;Davčna številka\nALFA;SI12345678\n'.encode(), 10)
         self.assertEqual((headers, rows, sheet),
@@ -83,6 +91,49 @@ class ParserAndMatcherTests(unittest.TestCase):
             workbook.save(path)
             with self.assertRaisesRegex(UploadError, 'exceeds the header width'):
                 parse_xlsx(path, 10)
+
+    def test_xlsx_rejects_excessive_zip_entry_count_before_parsing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'many-entries.xlsx'
+            self.zip_file(path, [('entry-%d.xml' % index, b'x') for index in range(3)])
+            with patch('control_room.uploads.XLSX_MAX_ZIP_ENTRIES', 2):
+                with self.assertRaisesRegex(UploadError, 'too complex'):
+                    parse_xlsx(path, 10)
+
+    def test_xlsx_rejects_excessive_total_declared_size_before_parsing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'large-total.xlsx'
+            self.zip_file(path, [('one.xml', b'123456'), ('two.xml', b'123456')])
+            with patch('control_room.uploads.XLSX_MAX_UNCOMPRESSED_BYTES', 10), \
+                    patch('control_room.uploads.XLSX_MAX_ENTRY_BYTES', 10):
+                with self.assertRaisesRegex(UploadError, 'too complex'):
+                    parse_xlsx(path, 10)
+
+    def test_xlsx_rejects_excessive_single_entry_before_parsing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'large-entry.xlsx'
+            self.zip_file(path, [('large.xml', b'12345')])
+            with patch('control_room.uploads.XLSX_MAX_ENTRY_BYTES', 4):
+                with self.assertRaisesRegex(UploadError, 'too complex'):
+                    parse_xlsx(path, 10)
+
+    def test_xlsx_rejects_suspicious_compression_ratio_before_parsing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'compressed.xlsx'
+            self.zip_file(path, [('repeated.xml', b'A' * 4096)])
+            with patch('control_room.uploads.XLSX_COMPRESSION_RATIO_MIN_BYTES', 1), \
+                    patch('control_room.uploads.XLSX_MAX_COMPRESSION_RATIO', 2):
+                with self.assertRaisesRegex(UploadError, 'too complex'):
+                    parse_xlsx(path, 10)
+
+    def test_xlsx_rejects_malformed_zip_safely_and_csv_skips_zip_validation(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp)/'malformed.xlsx'; path.write_bytes(b'not a zip')
+            with self.assertRaisesRegex(UploadError, 'Invalid XLSX workbook'):
+                parse_xlsx(path, 10)
+        with patch('control_room.uploads.validate_xlsx_archive',
+                   side_effect=AssertionError('CSV must not inspect ZIP metadata')):
+            self.assertEqual(parse_csv(b'Name,Tax\nALFA,1\n', 10)[1], [['ALFA', '1']])
 
     def test_slovenian_mapping_identifiers_only_and_ambiguous_headers(self):
         mapping = suggest_mapping(['Naziv podjetja','Davčna številka','Matična','Naslov','Občina'])

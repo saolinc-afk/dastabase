@@ -18,9 +18,14 @@
       Time estimate will appear once Merlin has enough information.
     </p>
   </div>
-  <div data-complete {% if job.state != 'done' %}hidden{% endif %}>
+  <div data-complete {% if job.state not in ('done', 'partial') %}hidden{% endif %}>
     <p class="summary"><span data-matched>{{ job.matched_rows }}</span> rows matched<br>
       <span data-review>{{ job.review_rows }}</span> need your review</p>
+    <p class="summary" data-completeness
+       {% if not job.incomplete_rows %}hidden{% endif %}>
+      Matched rows missing some requested information:
+      <span data-incomplete>{{ job.incomplete_rows or 0 }}</span>
+    </p>
     <a class="download" href="{{ url_for('download', job_id=job_id) }}">Download Excel</a>
     <a class="start-again" href="{{ url_for('index') }}">Enrich another file</a>
   </div>

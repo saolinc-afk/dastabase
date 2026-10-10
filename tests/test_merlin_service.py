@@ -62,6 +62,26 @@ def test_workspace_scoped_upload_job_and_artifact_reads_fail_closed(tmp_path):
         service.queue_import(workspace_a, 'unknown', 'unknown', {})
 
 
+def test_disabled_workspace_scoped_reads_fail_closed_like_unknown(tmp_path):
+    repository, service, workspace_a, _, upload_a, _, job_a, _ = setup_services(tmp_path)
+    repository.add_artifact(job_a.job_id, 'UPLOAD_RECONCILIATION',
+                            f'jobs/{job_a.job_id}/result.xlsx', 123, 'sha-a')
+    artifact = repository.artifacts(job_a.job_id)[0]
+    conn = sqlite3.connect(repository.path)
+    conn.execute("UPDATE workspaces SET status='DISABLED' WHERE workspace_id=?",
+                 (workspace_a,))
+    conn.commit(); conn.close()
+
+    assert service.upload(workspace_a, upload_a.upload_id) is None
+    assert service.job(workspace_a, job_a.job_id) is None
+    assert service.artifact(workspace_a, artifact['artifact_id']) is None
+    assert service.artifacts(workspace_a, job_a.job_id) == ()
+    assert repository.get_upload_for_workspace(workspace_a, upload_a.upload_id) is None
+    assert repository.get_job_for_workspace(workspace_a, job_a.job_id) is None
+    assert repository.get_artifact_for_workspace(workspace_a, artifact['artifact_id']) is None
+    assert repository.artifacts_for_workspace(workspace_a, job_a.job_id) == []
+
+
 def test_ownership_propagates_and_admin_api_remains_compatible(tmp_path):
     repository, service, workspace_a, _, upload_a, _, job_a, _ = setup_services(tmp_path)
     stored_upload = repository.get_upload(upload_a.upload_id)

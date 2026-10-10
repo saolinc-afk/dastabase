@@ -5,6 +5,13 @@ import json
 REQUESTED_OUTPUTS = ('WEBSITE', 'EMAIL', 'PHONE', 'FINANCIALS')
 CONTACT_OUTPUTS = ('WEBSITE', 'EMAIL', 'PHONE')
 LEGACY_CONTACT_OUTPUTS = ('WEBSITE', 'EMAIL')
+OUTPUT_VALUE_FIELDS = {
+    'WEBSITE': ('official_website',),
+    'EMAIL': ('default_email',),
+    'PHONE': ('default_phone',),
+    'FINANCIALS': ('revenue_2025', 'profit_2025', 'employees_2025',
+                   'assets_2025', 'capital_2025'),
+}
 
 
 def canonicalize_requested_outputs(values, *, allow_none=False):
@@ -63,3 +70,12 @@ def missing_discovery_outputs(snapshot, requested_outputs):
     }
     return tuple(output for output in CONTACT_OUTPUTS
                  if output in outputs and not predicates[output]())
+
+
+def missing_persisted_outputs(enrichment, requested_outputs):
+    """Return requested product outputs absent from a final persisted payload."""
+    outputs = canonicalize_requested_outputs(requested_outputs)
+    enrichment = enrichment if isinstance(enrichment, dict) else {}
+    return tuple(output for output in outputs
+                 if any(enrichment.get(field) in (None, '')
+                        for field in OUTPUT_VALUE_FIELDS[output]))

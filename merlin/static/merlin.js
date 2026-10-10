@@ -52,14 +52,17 @@ function renderJob(job) {
   setText('[data-count]', `${job.processed} / ${job.total}`);
   setText('[data-matched]', job.matched_rows);
   setText('[data-review]', job.review_rows);
+  setText('[data-incomplete]', job.incomplete_rows ?? 0);
   const bar = progressRoot.querySelector('[data-progress]');
   if (bar) bar.value = job.percent;
   const complete = progressRoot.querySelector('[data-complete]');
   const failed = progressRoot.querySelector('[data-failed]');
   const working = progressRoot.querySelector('[data-working-status]');
-  if (complete) complete.hidden = job.state !== 'done';
+  const completeness = progressRoot.querySelector('[data-completeness]');
+  if (complete) complete.hidden = !['done', 'partial'].includes(job.state);
   if (failed) failed.hidden = job.state !== 'failed';
   if (working) working.hidden = job.state !== 'working';
+  if (completeness) completeness.hidden = !job.incomplete_rows;
 }
 async function poll() {
   if (!progressRoot) return;

@@ -1,6 +1,8 @@
 """Functional, no-network tests for the isolated MERLIN web application."""
 import hashlib
 import io
+import json
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -80,6 +82,26 @@ def _start(repository, job_id, worker='test-worker'):
     claimed = repository.claim_oldest(worker)
     assert claimed['job_id'] == job_id
     repository.transition(job_id, 'RUNNING', worker_id=worker)
+
+
+def _finish_with_workbook(repository, root, job_id, status, enrichment=None):
+    _start(repository, job_id)
+    if enrichment is not None:
+        conn = sqlite3.connect(repository.path)
+        conn.execute('''UPDATE job_items SET processing_status='COMPLETED',
+            match_status='MATCHED',company_id=1,selected=1,enrichment_json=?
+            WHERE job_id=?''', (json.dumps(enrichment), job_id))
+        conn.execute('''UPDATE control_jobs SET processed_company_count=selected_company_count,
+            import_matched_count=selected_company_count WHERE job_id=?''', (job_id,))
+        conn.commit(); conn.close()
+    directory = root/'jobs'/job_id; directory.mkdir(parents=True, exist_ok=True)
+    final = directory/'final.xlsx'
+    workbook = Workbook(); workbook.active['A1'] = 'MERLIN'; workbook.save(final); workbook.close()
+    repository.add_artifact(job_id, 'UPLOAD_RECONCILIATION',
+                            f'jobs/{job_id}/final.xlsx', final.stat().st_size,
+                            hashlib.sha256(final.read_bytes()).hexdigest())
+    repository.transition(job_id, status, worker_id='test-worker')
+    return final
 
 
 def test_landing_is_isolated_accessible_and_security_hardened(web):
@@ -202,10 +224,12 @@ def test_polling_api_is_safe_and_reflects_persisted_progress(web):
     job_id = _queue(client, upload_id, ('EMAIL',))
     queued = client.get(f'/api/jobs/{job_id}').get_json()['job']
     assert set(queued) == {'state', 'stage', 'processed', 'total', 'percent',
-        'download_ready', 'requested_outputs', 'matched_rows', 'review_rows'}
+        'download_ready', 'requested_outputs', 'matched_rows', 'review_rows',
+        'complete_rows', 'incomplete_rows'}
     assert queued == {**queued, 'state': 'working', 'stage': 'Identifying companies',
                       'processed': 0, 'total': 2, 'percent': 0,
-                      'download_ready': False, 'requested_outputs': ['EMAIL']}
+                      'download_ready': False, 'requested_outputs': ['EMAIL'],
+                      'complete_rows': None, 'incomplete_rows': None}
     page = BeautifulSoup(client.get(f'/jobs/{job_id}').get_data(as_text=True),
                          'html.parser')
     progress = page.select_one('[data-job-progress]')
@@ -279,6 +303,58 @@ def test_completed_job_downloads_only_verified_final_workspace_artifact(web):
     final.write_bytes(b'tampered')
     assert client.get(f'/jobs/{job_id}/download').status_code == 404
     assert client.get(f'/api/jobs/{job_id}').get_json()['job']['state'] == 'failed'
+
+
+def test_partial_job_is_customer_safe_complete_enough_and_downloadable(web):
+    _, client, service, root = web
+    upload_id = _upload(client)
+    job_id = _queue(client, upload_id, ('WEBSITE', 'EMAIL'))
+    _finish_with_workbook(service.repository, root, job_id, 'PARTIAL', {
+        'official_website': 'https://alfa.si/', 'default_email': None,
+        'discovery_status': 'FAILED', 'provenance': ['/internal/path'],
+    })
+
+    response = client.get(f'/api/jobs/{job_id}')
+    projected = response.get_json()['job']
+    assert projected['state'] == 'partial'
+    assert projected['stage'] == "Done — some information couldn't be found."
+    assert projected['download_ready'] is True
+    assert (projected['complete_rows'], projected['incomplete_rows']) == (0, 1)
+    serialized = response.get_data(as_text=True).casefold()
+    assert not any(term in serialized for term in (
+        'provider', 'run_id', 'discovery', '/internal/path', 'traceback'))
+
+    page = BeautifulSoup(client.get(f'/jobs/{job_id}').get_data(as_text=True),
+                         'html.parser')
+    assert page.select_one('[data-job-progress]')['data-state'] == 'partial'
+    assert page.select_one('[data-stage]').get_text(' ', strip=True) == (
+        "Done — some information couldn't be found.")
+    assert not page.select_one('[data-complete]').has_attr('hidden')
+    assert page.select_one('[data-completeness]').get_text(' ', strip=True) == (
+        'Matched rows missing some requested information: 1')
+    assert client.get(f'/jobs/{job_id}/download').status_code == 200
+
+
+def test_disabled_workspace_cannot_read_or_download_existing_resources(web):
+    _, client, service, root = web
+    upload_id = _upload(client)
+    job_id = _queue(client, upload_id, ('WEBSITE',))
+    _finish_with_workbook(service.repository, root, job_id, 'COMPLETED', {
+        'official_website': 'https://alfa.si/',
+    })
+    assert client.get(f'/uploads/{upload_id}').status_code == 200
+    assert client.get(f'/jobs/{job_id}').status_code == 200
+    assert client.get(f'/api/jobs/{job_id}').status_code == 200
+    assert client.get(f'/jobs/{job_id}/download').status_code == 200
+
+    conn = sqlite3.connect(service.repository.path)
+    conn.execute("UPDATE workspaces SET status='DISABLED' WHERE workspace_id='workspace-a'")
+    conn.commit(); conn.close()
+    for path in (f'/uploads/{upload_id}', f'/jobs/{job_id}',
+                 f'/api/jobs/{job_id}', f'/jobs/{job_id}/download'):
+        response = client.get(path)
+        assert response.status_code == 404
+        assert 'This page or file is not available.' in response.get_data(as_text=True)
 
 
 def test_failed_job_never_exposes_internal_error(web):

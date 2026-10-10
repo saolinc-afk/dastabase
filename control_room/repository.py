@@ -460,8 +460,10 @@ class JobRepository:
     def get_upload_for_workspace(self, workspace_id, upload_id):
         conn = self._connect()
         try:
-            row = conn.execute('''SELECT * FROM uploads WHERE upload_id=?
-                AND workspace_id=? AND origin_surface='MERLIN' ''',
+            row = conn.execute('''SELECT u.* FROM uploads u
+                JOIN workspaces w ON w.workspace_id=u.workspace_id
+                WHERE u.upload_id=? AND u.workspace_id=?
+                  AND u.origin_surface='MERLIN' AND w.status='ACTIVE' ''',
                 (upload_id, workspace_id)).fetchone()
             if not row:
                 return None
@@ -1229,7 +1231,9 @@ class JobRepository:
         try:
             return [dict(row) for row in conn.execute('''SELECT a.*
                 FROM job_artifacts a JOIN control_jobs j ON j.job_id=a.job_id
+                JOIN workspaces w ON w.workspace_id=j.workspace_id
                 WHERE a.job_id=? AND j.workspace_id=? AND j.origin_surface='MERLIN'
+                  AND w.status='ACTIVE'
                 ORDER BY a.created_at''', (job_id, workspace_id))]
         finally:
             conn.close()
@@ -1247,8 +1251,9 @@ class JobRepository:
         try:
             row = conn.execute('''SELECT a.* FROM job_artifacts a
                 JOIN control_jobs j ON j.job_id=a.job_id
+                JOIN workspaces w ON w.workspace_id=j.workspace_id
                 WHERE a.artifact_id=? AND j.workspace_id=?
-                  AND j.origin_surface='MERLIN' ''',
+                  AND j.origin_surface='MERLIN' AND w.status='ACTIVE' ''',
                 (artifact_id, workspace_id)).fetchone()
             return dict(row) if row else None
         finally:
@@ -1265,8 +1270,10 @@ class JobRepository:
     def get_job_for_workspace(self, workspace_id, job_id):
         conn = self._connect()
         try:
-            row = conn.execute('''SELECT * FROM control_jobs WHERE job_id=?
-                AND workspace_id=? AND origin_surface='MERLIN' ''',
+            row = conn.execute('''SELECT j.* FROM control_jobs j
+                JOIN workspaces w ON w.workspace_id=j.workspace_id
+                WHERE j.job_id=? AND j.workspace_id=?
+                  AND j.origin_surface='MERLIN' AND w.status='ACTIVE' ''',
                 (job_id, workspace_id)).fetchone()
             return dict(row) if row else None
         finally:
