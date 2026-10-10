@@ -30,3 +30,21 @@ one configured internal workspace stored in a signed session, queues the shared
 durable Import & Enrich job, polls only a customer-safe status projection, and
 downloads only the verified final workspace-owned XLSX. It does not register or
 import Control Room or Monitor routes.
+
+M5 supports realistic invited-beta imports by retaining one immutable Discovery
+run per job while the existing runner works through deterministic bounded
+manifest windows. Existing accepted knowledge is checked before planning, and
+canonical company IDs are deduplicated before Discovery. The default total
+Discovery ceiling is 200 unique companies with a batch size of 10; both are
+worker configuration, and exceeding the ceiling fails explicitly without
+truncating the cohort.
+
+Customer progress is persisted with the current stage, completed/total units
+when meaningful, stage start, and last activity. Matching uses source rows;
+Discovery uses unique canonical companies. Knowledge checks and export remain
+indeterminate rather than displaying a fabricated percentage. The customer
+surface distinguishes queued, recently active, delayed, and terminal jobs from
+persisted server timestamps. No ETA is shown yet: the stored Discovery stage
+timestamps and completed units are the foundation, but an estimate is not
+eligible until the actual Discovery cohort is known and enough current-job
+units have completed to establish stable throughput.

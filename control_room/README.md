@@ -26,7 +26,8 @@ Configuration:
 | `CONTROL_ROOM_WORKER_STALE` | `15` seconds |
 | `CONTROL_ROOM_UPLOAD_MAX_BYTES` | `20971520` (20 MiB) |
 | `CONTROL_ROOM_UPLOAD_MAX_ROWS` | `5000` |
-| `CONTROL_ROOM_REAL_DISCOVERY_MAX_COMPANIES` | `10` |
+| `CONTROL_ROOM_REAL_DISCOVERY_MAX_COMPANIES` | `200` |
+| `CONTROL_ROOM_REAL_DISCOVERY_BATCH_SIZE` | `10` |
 
 Run from the repository root in two terminals using the same database setting.
 
@@ -131,14 +132,20 @@ payload rather than reopening live source databases.
 
 Upload jobs explicitly select either `FAKE` or `DISCOVERY_V2` at confirmation.
 The explicitly styled live start action confirms the selected live mode, and
-jobs must remain within the configured company limit. Discovery execution always enables municipality context and sets
-the maximum Serper query count to one per company.
+jobs must remain within the configured total company ceiling. The invited-beta
+default permits 200 distinct companies and feeds the existing Discovery runner
+deterministic manifest windows of 10. The ceiling is checked without truncation;
+the batch size controls checkpoint granularity, not the immutable job cohort.
+Discovery execution always enables municipality context and sets the maximum
+Serper query count to one per company.
 
 Each live job uses a generated directory under `jobs/<job-id>/` containing its
 immutable manifest, isolated Discovery result database, accepted Discovery CSV,
 and row-preserving upload reconciliation CSV. The Control Room persists the
 Discovery run ID before execution. A stale job resumes that run and refuses to
-create a replacement run when results already exist.
+create a replacement run when results already exist. Company attempts are
+committed individually by Discovery, so terminal companies are skipped after a
+worker restart and only pending/failed/partial manifest positions are retried.
 
 The worker requires `SERPER_API_KEY` for live jobs. The key is passed directly
 to the existing Discovery v2 Serper provider and is never persisted by Control

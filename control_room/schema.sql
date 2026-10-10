@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS control_jobs (
     failed_company_count INTEGER NOT NULL DEFAULT 0,
     ineligible_company_count INTEGER NOT NULL DEFAULT 0,
     progress_stage TEXT,
+    progress_completed_units INTEGER CHECK(progress_completed_units IS NULL OR progress_completed_units >= 0),
+    progress_total_units INTEGER CHECK(progress_total_units IS NULL OR progress_total_units >= 0),
+    progress_stage_started_at TEXT,
+    progress_updated_at TEXT,
     import_total_rows INTEGER NOT NULL DEFAULT 0,
     import_matched_count INTEGER NOT NULL DEFAULT 0,
     import_ambiguous_count INTEGER NOT NULL DEFAULT 0,
@@ -265,4 +269,4 @@ CREATE INDEX IF NOT EXISTS job_artifacts_job ON job_artifacts(job_id,artifact_ty
 CREATE INDEX IF NOT EXISTS identity_tasks_job ON identity_resolution_tasks(job_id,status);
 CREATE INDEX IF NOT EXISTS identity_queries_task ON identity_search_queries(task_id,sequence);
 
-PRAGMA user_version=8;
+PRAGMA user_version=9;

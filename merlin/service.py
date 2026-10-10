@@ -34,6 +34,10 @@ class MerlinJob:
     review_rows: int
     complete_rows: int | None
     incomplete_rows: int | None
+    progress_completed_units: int | None
+    progress_total_units: int | None
+    progress_stage_started_at: str | None
+    last_activity_at: str | None
 
 
 @dataclass(frozen=True)
@@ -170,7 +174,12 @@ class MerlinImportEnrichService:
             stored.get('import_matched_count') or 0,
             ((stored.get('import_ambiguous_count') or 0) +
              (stored.get('import_unresolved_count') or 0)),
-            complete_rows, incomplete_rows)
+            complete_rows, incomplete_rows,
+            stored.get('progress_completed_units'), stored.get('progress_total_units'),
+            stored.get('progress_stage_started_at'),
+            max((value for value in (
+                stored.get('progress_updated_at'), stored.get('worker_heartbeat_at'),
+                stored.get('queued_at'), stored.get('created_at')) if value), default=None))
 
     @staticmethod
     def _artifact(stored):

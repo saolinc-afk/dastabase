@@ -243,7 +243,7 @@ def _csv_workbook(upload, upload_rows):
     return workbook, sheet
 
 
-def export_import_xlsx(repository, job_id, storage_root):
+def export_import_xlsx(repository, job_id, storage_root, *, worker_id=None):
     """Create/replace a lossless legacy or request-aware MERLIN workbook."""
     root = Path(storage_root).expanduser().absolute()
     job = repository.get_job(job_id)
@@ -368,6 +368,12 @@ def export_import_xlsx(repository, job_id, storage_root):
     finally:
         temporary.unlink(missing_ok=True)
     relative = output.relative_to(root).as_posix()
-    repository.add_artifact(job_id, 'UPLOAD_RECONCILIATION', relative, size, digest)
+    try:
+        repository.add_artifact(job_id, 'UPLOAD_RECONCILIATION', relative, size,
+                                digest, worker_id)
+    except BaseException:
+        if worker_id is not None:
+            output.unlink(missing_ok=True)
+        raise
     return {'path': output, 'relative_path': relative,
             'headers': dict(zip(base_headers, labels)), 'qc': dict(metrics)}

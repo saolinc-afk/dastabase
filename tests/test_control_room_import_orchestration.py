@@ -382,7 +382,7 @@ def test_import_discovery_resume_reuses_completed_run_without_second_runner_call
     job = repository.create_import_enrich_job('u', 'Discovery interruption', mapping)
     runner_calls = []
 
-    def complete_then_interrupt(store, run_id, provider):
+    def complete_then_interrupt(store, run_id, provider, batch_size=100):
         runner_calls.append(run_id)
         with store.conn:
             store.conn.execute("UPDATE discovery_run_companies SET status='COMPLETED' "
@@ -455,7 +455,7 @@ def test_v3_control_room_migrates_without_losing_existing_discovery_job(tmp_path
     )
     lines = [line for line in schema.splitlines()
              if not line.strip().startswith(remove_prefixes)]
-    schema = '\n'.join(lines).replace('PRAGMA user_version=8', 'PRAGMA user_version=3')
+    schema = '\n'.join(lines).replace('PRAGMA user_version=9', 'PRAGMA user_version=3')
     conn = sqlite3.connect(database)
     conn.executescript(schema)
     conn.execute('''INSERT INTO control_jobs(job_id,display_name,input_kind,module,status,
@@ -473,7 +473,7 @@ def test_v3_control_room_migrates_without_losing_existing_discovery_job(tmp_path
         'DISCOVERY_CONTACTS', 'DISCOVERY_V2', 'Existing Discovery')
     assert repository.events('existing')[0]['event_code'] == 'OLD_EVENT'
     conn = sqlite3.connect(database)
-    assert conn.execute('PRAGMA user_version').fetchone()[0] == 8
+    assert conn.execute('PRAGMA user_version').fetchone()[0] == 9
     sql = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='control_jobs'"
     ).fetchone()[0]

@@ -27,6 +27,11 @@ def canonical(path):
       (0,'ZERO d.o.o.','100','200','Zero 1','Kranj',1,1),
       (1,'ONE d.o.o.','101','201','One 1','Ljubljana',2,2),
       (2,'TWO d.o.o.','102','202','Two 1','Celje',3,3);''')
+    conn.executemany('INSERT INTO companies_lite VALUES (?,?,?,?,?,?,?,?)', [
+        (value, f'COMPANY {value} d.o.o.', str(100 + value), str(200 + value),
+         f'Address {value}', 'Kranj', value + 1, value + 1)
+        for value in range(3, 43)])
+    conn.commit()
     conn.close()
 
 
@@ -60,10 +65,11 @@ class AdapterTests(unittest.TestCase):
           'normalized_registration_number':'','normalized_address':'','normalized_municipality':''})
         matches.append(('NOT_FOUND',[]))
         self.repo.save_mapping_and_matches(upload['upload_id'],{'company_name':0},normalized,matches)
-        return self.repo.create_upload_job(upload['upload_id'],'Live job',adapter,10,adapter=='DISCOVERY_V2')
+        return self.repo.create_upload_job(upload['upload_id'],'Live job',adapter,
+            max(10, len(set(ids))), adapter=='DISCOVERY_V2')
 
     @staticmethod
-    def complete_runner(store,run_id,provider):
+    def complete_runner(store,run_id,provider,batch_size=100):
         with store.conn:
             store.conn.execute("UPDATE discovery_run_companies SET status='COMPLETED' WHERE run_id=?",(run_id,))
             store.conn.execute("UPDATE discovery_runs SET status='COMPLETED' WHERE run_id=?",(run_id,))
@@ -73,7 +79,8 @@ class AdapterTests(unittest.TestCase):
     def export_rows(source,results,ids,run_ids=None):
         names={0:'ZERO d.o.o.',1:'ONE d.o.o.',2:'TWO d.o.o.'}
         return [{**{header:'' for header in HEADERS},'company_id':company_id,
-                 'company_name':names[company_id],'website_status':'REVIEW'} for company_id in ids]
+                 'company_name':names.get(company_id, f'COMPANY {company_id} d.o.o.'),
+                 'website_status':'REVIEW'} for company_id in ids]
 
     def adapter(self,runner=None,export_writer=write_csv):
         return DiscoveryV2JobAdapter(self.repo,self.root/'storage',self.source,
@@ -109,7 +116,7 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(self.source.read_bytes(),self.before)
 
     def test_partial_job_persists_and_displays_both_exports(self):
-        def partial_runner(store,run_id,provider):
+        def partial_runner(store,run_id,provider,batch_size=100):
             rows=store.conn.execute('SELECT company_id FROM discovery_run_companies WHERE run_id=? ORDER BY manifest_position',(run_id,)).fetchall()
             with store.conn:
                 store.conn.execute("UPDATE discovery_run_companies SET status='COMPLETED' WHERE run_id=? AND company_id=?",(run_id,rows[0][0]))
@@ -152,6 +159,80 @@ class AdapterTests(unittest.TestCase):
         store=Store(self.root/'storage/jobs'/job['job_id']/'results.sqlite3')
         try: self.assertEqual(store.conn.execute('SELECT COUNT(*) FROM discovery_runs').fetchone()[0],1)
         finally: store.close()
+
+    def test_43_company_run_is_processed_in_deterministic_bounded_batches(self):
+        observed=[]
+        def runner(store,run_id,provider,batch_size=100):
+            while True:
+                rows=store.conn.execute('''SELECT company_id FROM discovery_run_companies
+                    WHERE run_id=? AND status='PENDING' ORDER BY manifest_position LIMIT ?''',
+                    (run_id,batch_size)).fetchall()
+                if not rows: break
+                batch=tuple(row['company_id'] for row in rows); observed.append(batch)
+                with store.conn:
+                    store.conn.executemany('''UPDATE discovery_run_companies
+                        SET status='INELIGIBLE' WHERE run_id=? AND company_id=?''',
+                        [(run_id,value) for value in batch])
+            with store.conn:
+                store.conn.execute("UPDATE discovery_runs SET status='COMPLETED' WHERE run_id=?",
+                                   (run_id,))
+            return {'status':'COMPLETED','run_id':run_id,'processed':43,
+                    'failed':0,'partial':0,'remaining':0}
+        job=self.job(tuple(range(43)))
+        result=self.run_job(job,self.adapter(runner=runner))
+        self.assertEqual(result['status'],'COMPLETED')
+        self.assertEqual([len(batch) for batch in observed],[10,10,10,10,3])
+        self.assertEqual(tuple(value for batch in observed for value in batch),tuple(range(43)))
+
+    def test_crash_between_batches_reuses_completed_companies_on_resume(self):
+        first_batches=[]
+        def interrupted(store,run_id,provider,batch_size=100):
+            rows=store.conn.execute('''SELECT company_id FROM discovery_run_companies
+                WHERE run_id=? AND status='PENDING' ORDER BY manifest_position LIMIT ?''',
+                (run_id,batch_size)).fetchall()
+            batch=tuple(row['company_id'] for row in rows); first_batches.append(batch)
+            with store.conn:
+                store.conn.executemany('''UPDATE discovery_run_companies
+                    SET status='INELIGIBLE' WHERE run_id=? AND company_id=?''',
+                    [(run_id,value) for value in batch])
+                store.conn.execute("UPDATE discovery_runs SET status='PARTIAL' WHERE run_id=?",
+                                   (run_id,))
+            raise KeyboardInterrupt()
+
+        job=self.job(tuple(range(43)))
+        crashed=self.adapter(runner=interrupted)
+        fake=FakeEnrichmentAdapter(delay=0)
+        worker=Worker(self.repo,fake,worker_id='crashed',
+            adapters={'FAKE':fake,'DISCOVERY_V2':crashed},stale_seconds=0)
+        with self.assertRaises(KeyboardInterrupt): worker.run_once()
+        conn=sqlite3.connect(self.repo.path)
+        conn.execute("UPDATE control_jobs SET worker_heartbeat_at='2000-01-01T00:00:00+00:00' WHERE job_id=?",(job['job_id'],))
+        conn.execute("UPDATE control_workers SET heartbeat_at='2000-01-01T00:00:00+00:00'")
+        conn.commit(); conn.close()
+
+        resumed_batches=[]
+        def resumed(store,run_id,provider,batch_size=100):
+            while True:
+                rows=store.conn.execute('''SELECT company_id FROM discovery_run_companies
+                    WHERE run_id=? AND status='PENDING' ORDER BY manifest_position LIMIT ?''',
+                    (run_id,batch_size)).fetchall()
+                if not rows: break
+                batch=tuple(row['company_id'] for row in rows); resumed_batches.append(batch)
+                with store.conn:
+                    store.conn.executemany('''UPDATE discovery_run_companies
+                        SET status='INELIGIBLE' WHERE run_id=? AND company_id=?''',
+                        [(run_id,value) for value in batch])
+            with store.conn:
+                store.conn.execute("UPDATE discovery_runs SET status='COMPLETED' WHERE run_id=?",
+                                   (run_id,))
+            return {'status':'COMPLETED','run_id':run_id,'processed':33,
+                    'failed':0,'partial':0,'remaining':0}
+        result=self.run_job(job,self.adapter(runner=resumed))
+        self.assertEqual(result['status'],'COMPLETED')
+        self.assertEqual(first_batches,[tuple(range(10))])
+        self.assertEqual([len(batch) for batch in resumed_batches],[10,10,10,3])
+        self.assertEqual(tuple(value for batch in resumed_batches for value in batch),
+                         tuple(range(10,43)))
 
     def test_discovery_and_export_failures_persist_failed(self):
         for label,adapter in (

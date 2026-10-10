@@ -48,21 +48,33 @@ function setText(selector, value) {
 function renderJob(job) {
   if (!progressRoot || !job) return;
   progressRoot.dataset.state = job.state;
+  progressRoot.dataset.activity = job.activity;
   setText('[data-stage]', job.stage);
-  setText('[data-count]', `${job.processed} / ${job.total}`);
+  setText('[data-count]', `${job.completed_units ?? 0} / ${job.total_units ?? 0}`);
   setText('[data-matched]', job.matched_rows);
   setText('[data-review]', job.review_rows);
   setText('[data-incomplete]', job.incomplete_rows ?? 0);
   const bar = progressRoot.querySelector('[data-progress]');
-  if (bar) bar.value = job.percent;
+  const count = progressRoot.querySelector('[data-count]');
+  if (bar) {
+    bar.hidden = !job.progress_determinate;
+    bar.value = job.percent ?? 0;
+  }
+  if (count) count.hidden = !job.progress_determinate;
   const complete = progressRoot.querySelector('[data-complete]');
   const failed = progressRoot.querySelector('[data-failed]');
   const working = progressRoot.querySelector('[data-working-status]');
   const completeness = progressRoot.querySelector('[data-completeness]');
+  const activityMessage = progressRoot.querySelector('[data-activity-message]');
   if (complete) complete.hidden = !['done', 'partial'].includes(job.state);
   if (failed) failed.hidden = job.state !== 'failed';
   if (working) working.hidden = job.state !== 'working';
   if (completeness) completeness.hidden = !job.incomplete_rows;
+  if (activityMessage) activityMessage.textContent = {
+    queued: 'Waiting to start…',
+    delayed: 'Processing is temporarily delayed…',
+    active: 'Working on it…',
+  }[job.activity] || 'Working on it…';
 }
 async function poll() {
   if (!progressRoot) return;

@@ -27,7 +27,7 @@ class JobRepository:
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                             "AND name='control_jobs'").fetchone():
                 # Migrate existing databases before schema.sql advances the
-                # declared version. A failure therefore cannot advertise v8.
+                # declared version. A failure therefore cannot advertise v9.
                 self._migrate_workspace_ownership(conn)
                 self._migrate_requested_outputs(conn)
             conn.executescript(Path(__file__).with_name('schema.sql').read_text())
@@ -37,7 +37,7 @@ class JobRepository:
             # indexes/triggers and is deliberately repeat-safe.
             self._migrate_workspace_ownership(conn)
             self._migrate_requested_outputs(conn)
-            conn.execute('PRAGMA user_version=8')
+            conn.execute('PRAGMA user_version=9')
         finally:
             conn.close()
 
@@ -145,6 +145,10 @@ class JobRepository:
             'failed_company_count': 'INTEGER NOT NULL DEFAULT 0',
             'ineligible_company_count': 'INTEGER NOT NULL DEFAULT 0',
             'progress_stage': 'TEXT',
+            'progress_completed_units': 'INTEGER',
+            'progress_total_units': 'INTEGER',
+            'progress_stage_started_at': 'TEXT',
+            'progress_updated_at': 'TEXT',
             'import_total_rows': 'INTEGER NOT NULL DEFAULT 0',
             'import_matched_count': 'INTEGER NOT NULL DEFAULT 0',
             'import_ambiguous_count': 'INTEGER NOT NULL DEFAULT 0',
@@ -348,6 +352,14 @@ class JobRepository:
         conn.execute('PRAGMA foreign_keys=ON')
         conn.execute('PRAGMA busy_timeout=5000')
         return conn
+
+    @staticmethod
+    def _require_running_worker(conn, job_id, worker_id):
+        job = conn.execute('SELECT status,worker_id FROM control_jobs WHERE job_id=?',
+                           (job_id,)).fetchone()
+        if not job or job['status'] != 'RUNNING' or job['worker_id'] != worker_id:
+            raise ValueError('Job is owned by another worker')
+        return job
 
     def _event(self, conn, job_id, code, message, level='INFO', details=None):
         sequence = conn.execute(
@@ -674,12 +686,13 @@ class JobRepository:
             created = now()
             conn.execute('''INSERT INTO control_jobs(job_id,display_name,input_kind,module,status,
                 created_at,queued_at,selected_company_count,execution_adapter,progress_stage,
-                import_total_rows,workspace_id,origin_surface,requested_outputs_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                import_total_rows,workspace_id,origin_surface,requested_outputs_json,
+                progress_stage_started_at,progress_updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (job_id, name, 'UPLOAD', 'IMPORT_ENRICH', 'QUEUED', created, created,
                  len(rows), 'IMPORT_ENRICH', 'PARSING', len(rows),
                  upload['workspace_id'], upload['origin_surface'],
-                 encode_requested_outputs(outputs, allow_none=True)))
+                 encode_requested_outputs(outputs, allow_none=True), None, created))
             for position, row in enumerate(rows, 1):
                 conn.execute('''INSERT INTO job_items(job_id,item_position,upload_id,
                     upload_row_number,company_id,match_status,match_method,selected,
@@ -726,11 +739,36 @@ class JobRepository:
             raise ValueError('Invalid Import & Enrich progress stage')
         conn = self._connect()
         try:
-            updated = conn.execute('''UPDATE control_jobs SET progress_stage=?,worker_id=?,
-                worker_heartbeat_at=? WHERE job_id=? AND module='IMPORT_ENRICH'
-                AND status='RUNNING' ''', (stage, worker_id, now(), job_id)).rowcount
+            conn.execute('BEGIN IMMEDIATE')
+            job = conn.execute('SELECT * FROM control_jobs WHERE job_id=?',
+                               (job_id,)).fetchone()
+            if (not job or job['module'] != 'IMPORT_ENRICH' or job['status'] != 'RUNNING'
+                    or job['worker_id'] != worker_id):
+                raise ValueError('Import stage requires the current running IMPORT_ENRICH worker')
+            timestamp = now()
+            if stage == 'MATCHING':
+                completed = conn.execute('''SELECT COUNT(*) FROM job_items
+                    WHERE job_id=? AND processing_status='COMPLETED' ''', (job_id,)).fetchone()[0]
+                total = job['selected_company_count']
+            elif stage == 'DISCOVERY':
+                completed = job['import_discovery_processed_company_count']
+                total = job['import_discovery_required_company_count']
+            else:
+                completed = total = None
+            updated = conn.execute('''UPDATE control_jobs SET progress_stage=?,
+                progress_completed_units=?,progress_total_units=?,
+                progress_stage_started_at=CASE WHEN progress_stage IS NOT ?
+                    OR progress_stage_started_at IS NULL THEN ? ELSE progress_stage_started_at END,
+                progress_updated_at=?,worker_heartbeat_at=?
+                WHERE job_id=? AND worker_id=?''',
+                (stage, completed, total, stage, timestamp, timestamp, timestamp,
+                 job_id, worker_id)).rowcount
             if updated != 1:
                 raise ValueError('Import stage requires a running IMPORT_ENRICH job')
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -742,7 +780,8 @@ class JobRepository:
             conn.execute('BEGIN IMMEDIATE')
             job = conn.execute('SELECT * FROM control_jobs WHERE job_id=?',
                                (job_id,)).fetchone()
-            if not job or job['module'] != 'IMPORT_ENRICH' or job['status'] != 'RUNNING':
+            if (not job or job['module'] != 'IMPORT_ENRICH' or job['status'] != 'RUNNING'
+                    or job['worker_id'] != worker_id):
                 raise ValueError('Import match requires a running IMPORT_ENRICH job')
             updated = conn.execute('''UPDATE job_items SET processing_status='COMPLETED',
                 company_id=?,match_status=?,match_method=?,selected=?,match_evidence_json=?,
@@ -769,10 +808,12 @@ class JobRepository:
             conn.execute('''UPDATE control_jobs SET processed_company_count=?,progress_stage='MATCHING',
                 import_matched_count=?,import_ambiguous_count=?,import_unresolved_count=?,
                 import_resolved_without_ai_count=?,import_matched_requires_enrichment_count=?,
-                worker_id=?,worker_heartbeat_at=? WHERE job_id=?''',
+                progress_completed_units=?,progress_total_units=?,progress_updated_at=?,
+                worker_heartbeat_at=? WHERE job_id=? AND worker_id=?''',
                 (summary['processed_rows'], summary['matched'], summary['ambiguous'],
                  summary['unresolved'], summary['resolved_without_ai'],
-                 summary['matched_requires_enrichment'], worker_id, now(), job_id))
+                 summary['matched_requires_enrichment'], summary['processed_rows'],
+                 summary['total_rows'], now(), now(), job_id, worker_id))
             conn.commit()
             return summary
         except BaseException:
@@ -806,11 +847,12 @@ class JobRepository:
         finally:
             conn.close()
 
-    def ensure_identity_task(self, job_id, item_position, spec):
+    def ensure_identity_task(self, job_id, item_position, spec, worker_id):
         """Create/link one deduplicated task without changing matcher evidence."""
         conn = self._connect()
         try:
             conn.execute('BEGIN IMMEDIATE')
+            self._require_running_worker(conn, job_id, worker_id)
             row = conn.execute('''SELECT * FROM identity_resolution_tasks
                 WHERE job_id=? AND identity_fingerprint=?''',
                 (job_id, spec['fingerprint'])).fetchone()
@@ -884,7 +926,7 @@ class JobRepository:
         finally:
             conn.close()
 
-    def apply_identity_decision(self, task_id, decision):
+    def apply_identity_decision(self, task_id, decision, worker_id):
         conn = self._connect()
         try:
             conn.execute('BEGIN IMMEDIATE')
@@ -892,6 +934,7 @@ class JobRepository:
                                 (task_id,)).fetchone()
             if not task:
                 raise ValueError('Unknown identity task')
+            self._require_running_worker(conn, task['job_id'], worker_id)
             conn.execute('''UPDATE identity_resolution_tasks SET status=?,
                 canonical_company_id=?,resolution_rule=?,decisive_evidence_json=?,
                 alternative_company_ids_json=?,conflicts_json=?,identity_resolution_status=?,
@@ -922,7 +965,7 @@ class JobRepository:
         finally:
             conn.close()
 
-    def plan_identity_queries(self, task_id, plans):
+    def plan_identity_queries(self, task_id, plans, worker_id):
         conn = self._connect()
         try:
             conn.execute('BEGIN IMMEDIATE')
@@ -930,6 +973,7 @@ class JobRepository:
                                 (task_id,)).fetchone()
             if not task:
                 raise ValueError('Unknown identity task')
+            self._require_running_worker(conn, task['job_id'], worker_id)
             for sequence, plan in enumerate(plans, 1):
                 conn.execute('''INSERT OR IGNORE INTO identity_search_queries(
                     query_id,task_id,sequence,provider,query_text,query_strategy,
@@ -962,45 +1006,80 @@ class JobRepository:
         finally:
             conn.close()
 
-    def start_identity_query(self, query_id, provider):
+    def start_identity_query(self, query_id, provider, worker_id):
         """Durably mark a future provider call; Commit 5 never calls this itself."""
         conn = self._connect()
         try:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('''SELECT t.job_id FROM identity_search_queries q
+                JOIN identity_resolution_tasks t ON t.task_id=q.task_id
+                WHERE q.query_id=?''', (query_id,)).fetchone()
+            if not row:
+                raise ValueError('Unknown identity query')
+            self._require_running_worker(conn, row['job_id'], worker_id)
             updated = conn.execute('''UPDATE identity_search_queries SET provider=?,
                 status='RUNNING',started_at=?,uncertain_billing=1 WHERE query_id=?
                 AND status IN ('PLANNED','INTERRUPTED')''',
                 (provider, now(), query_id)).rowcount
             if updated != 1:
                 raise ValueError('Identity query is not available to start')
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
-    def fail_identity_query(self, query_id, message, provider_requests=0):
+    def fail_identity_query(self, query_id, message, provider_requests=0, *, worker_id):
         conn = self._connect()
         try:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('''SELECT t.job_id FROM identity_search_queries q
+                JOIN identity_resolution_tasks t ON t.task_id=q.task_id
+                WHERE q.query_id=?''', (query_id,)).fetchone()
+            if not row:
+                raise ValueError('Unknown identity query')
+            self._require_running_worker(conn, row['job_id'], worker_id)
             updated = conn.execute('''UPDATE identity_search_queries SET status='FAILED',
                 sanitized_error=?,provider_request_count=?,completed_at=? WHERE query_id=?
                 AND status='RUNNING' ''', (str(message)[:500], provider_requests,
                                            now(), query_id)).rowcount
             if updated != 1:
                 raise ValueError('Identity query is not running')
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
-    def recover_identity_queries(self, job_id):
+    def recover_identity_queries(self, job_id, worker_id):
         conn = self._connect()
         try:
+            conn.execute('BEGIN IMMEDIATE')
+            self._require_running_worker(conn, job_id, worker_id)
             conn.execute('''UPDATE identity_search_queries SET status='INTERRUPTED',
                 uncertain_billing=1,completed_at=? WHERE status='RUNNING' AND task_id IN
                 (SELECT task_id FROM identity_resolution_tasks WHERE job_id=?)''',
                 (now(), job_id))
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
     def persist_identity_response(self, query_id, payload, *, provider='INJECTED',
-                                  logical_calls=0, provider_requests=0):
+                                  logical_calls=0, provider_requests=0, worker_id):
         conn = self._connect()
         try:
+            conn.execute('BEGIN IMMEDIATE')
+            row = conn.execute('''SELECT t.job_id FROM identity_search_queries q
+                JOIN identity_resolution_tasks t ON t.task_id=q.task_id
+                WHERE q.query_id=?''', (query_id,)).fetchone()
+            if not row:
+                raise ValueError('Unknown identity query')
+            self._require_running_worker(conn, row['job_id'], worker_id)
             updated = conn.execute('''UPDATE identity_search_queries SET provider=?,
                 status='COMPLETED',raw_result_json=?,logical_call_count=?,
                 provider_request_count=?,completed_at=?,uncertain_billing=0
@@ -1009,13 +1088,19 @@ class JobRepository:
                  separators=(',', ':')), logical_calls, provider_requests, now(), query_id)).rowcount
             if updated != 1:
                 raise ValueError('Identity query is not available for an injected response')
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
     def update_identity_preflight(self, job_id, task_cap=1000, query_cap=2000,
-                                  max_attempts_per_query=3):
+                                  max_attempts_per_query=3, *, worker_id):
         conn = self._connect()
         try:
+            conn.execute('BEGIN IMMEDIATE')
+            self._require_running_worker(conn, job_id, worker_id)
             counts = conn.execute('''SELECT COUNT(*) tasks,
                 SUM(status='LOCAL_RESOLVED') local_resolved,
                 SUM(EXISTS(SELECT 1 FROM identity_search_queries q
@@ -1050,12 +1135,16 @@ class JobRepository:
                  summary['ambiguous'], summary['unresolved'],
                  summary['resolved_without_ai'], summary['matched_requires_enrichment'],
                  job_id))
+            conn.commit()
             return {'unmatched_rows': unmatched, 'identity_tasks': counts['tasks'] or 0,
                     'local_resolved': counts['local_resolved'] or 0,
                     'search_eligible': counts['search_eligible'] or 0,
                     'search_ineligible': counts['ineligible'] or 0,
                     'planned_queries': queries, 'estimated_provider_requests': queries,
                     'maximum_provider_requests': queries * max_attempts_per_query}
+        except BaseException:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -1071,7 +1160,7 @@ class JobRepository:
             conn.close()
 
     def persist_import_enrichment(self, job_id, payloads, sufficient_ids,
-                                  discovery_ids, *, after_discovery=False):
+                                  discovery_ids, worker_id, *, after_discovery=False):
         """Fan company enrichment out to matched registration rows atomically."""
         sufficient_ids = set(sufficient_ids)
         discovery_ids = set(discovery_ids)
@@ -1080,7 +1169,8 @@ class JobRepository:
             conn.execute('BEGIN IMMEDIATE')
             job = conn.execute('SELECT * FROM control_jobs WHERE job_id=?',
                                (job_id,)).fetchone()
-            if not job or job['module'] != 'IMPORT_ENRICH' or job['status'] != 'RUNNING':
+            if (not job or job['module'] != 'IMPORT_ENRICH' or job['status'] != 'RUNNING'
+                    or job['worker_id'] != worker_id):
                 raise ValueError('Import enrichment requires a running IMPORT_ENRICH job')
             matched_ids = {row[0] for row in conn.execute('''SELECT DISTINCT company_id
                 FROM job_items WHERE job_id=? AND processing_status='COMPLETED'
@@ -1114,15 +1204,23 @@ class JobRepository:
             usable_discovery = sufficient_ids & discovery_ids if after_discovery else set()
             missing_discovery = discovery_ids - usable_discovery if after_discovery else set()
             stage = 'DISCOVERY' if after_discovery else 'EXISTING_ENRICHMENT'
+            progress_completed = (job['import_discovery_processed_company_count']
+                                  if after_discovery else None)
+            progress_total = (len(discovery_ids) if after_discovery else None)
+            timestamp = now()
             conn.execute('''UPDATE control_jobs SET progress_stage=?,
                 import_matched_company_count=?,import_existing_satisfied_company_count=?,
                 import_discovery_required_company_count=?,import_discovery_usable_company_count=?,
                 import_discovery_missing_company_count=?,import_resolved_without_ai_count=?,
-                import_matched_requires_enrichment_count=? WHERE job_id=?''',
+                import_matched_requires_enrichment_count=?,progress_completed_units=?,
+                progress_total_units=?,progress_updated_at=?,worker_heartbeat_at=?
+                WHERE job_id=? AND worker_id=?''',
                 (stage, len(matched_ids), len(existing_satisfied), len(discovery_ids),
                  len(usable_discovery), len(missing_discovery),
                  row_counts.get('RESOLVED_WITHOUT_AI', 0),
-                 row_counts.get('MATCHED_REQUIRES_ENRICHMENT', 0), job_id))
+                 row_counts.get('MATCHED_REQUIRES_ENRICHMENT', 0),
+                 progress_completed, progress_total, timestamp, timestamp,
+                 job_id, worker_id))
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -1131,15 +1229,22 @@ class JobRepository:
             conn.close()
 
     def update_import_discovery_progress(self, job_id, counts, worker_id):
+        if any(type(counts.get(key, 0)) is not int or counts.get(key, 0) < 0
+               for key in ('COMPLETED', 'PARTIAL', 'FAILED', 'INELIGIBLE')):
+            raise ValueError('Import Discovery progress contains invalid counts')
         processed = sum(counts.get(key, 0) for key in
                         ('COMPLETED', 'PARTIAL', 'FAILED', 'INELIGIBLE'))
         conn = self._connect()
         try:
             updated = conn.execute('''UPDATE control_jobs SET progress_stage='DISCOVERY',
-                import_discovery_processed_company_count=?,worker_id=?,worker_heartbeat_at=?
+                import_discovery_processed_company_count=?,progress_completed_units=?,
+                progress_total_units=import_discovery_required_company_count,
+                progress_updated_at=?,worker_heartbeat_at=?
                 WHERE job_id=? AND module='IMPORT_ENRICH' AND status='RUNNING'
-                  AND import_discovery_processed_company_count<=?''',
-                (processed, worker_id, now(), job_id, processed)).rowcount
+                  AND worker_id=? AND import_discovery_processed_company_count<=?
+                  AND import_discovery_required_company_count>=?''',
+                (processed, processed, now(), now(), job_id, worker_id,
+                 processed, processed)).rowcount
             if updated != 1:
                 raise ValueError('Import Discovery progress is invalid or non-monotonic')
         finally:
@@ -1165,12 +1270,13 @@ class JobRepository:
     def selected_company_ids(self, job_id):
         return [row['company_id'] for row in self.job_items(job_id) if row['selected'] == 1]
 
-    def set_discovery_run(self, job_id, run_id):
+    def set_discovery_run(self, job_id, run_id, worker_id):
         conn = self._connect()
         try:
             conn.execute('BEGIN IMMEDIATE')
-            row = conn.execute('SELECT discovery_run_id FROM control_jobs WHERE job_id=?',(job_id,)).fetchone()
-            if not row:
+            row = conn.execute('SELECT discovery_run_id,status,worker_id FROM control_jobs WHERE job_id=?',
+                               (job_id,)).fetchone()
+            if not row or row['status'] != 'RUNNING' or row['worker_id'] != worker_id:
                 raise ValueError('Unknown job')
             if row['discovery_run_id'] and row['discovery_run_id'] != run_id:
                 raise ValueError('Discovery run is already fixed for this job')
@@ -1190,31 +1296,42 @@ class JobRepository:
         try:
             conn.execute('BEGIN IMMEDIATE')
             row = conn.execute('SELECT * FROM control_jobs WHERE job_id=?',(job_id,)).fetchone()
-            if not row or row['status'] != 'RUNNING':
+            if not row or row['status'] != 'RUNNING' or row['worker_id'] != worker_id:
                 raise ValueError('Discovery progress requires a running job')
             if processed > row['selected_company_count']:
                 raise ValueError('Discovery progress exceeds selected manifest')
             conn.execute('''UPDATE control_jobs SET processed_company_count=?,completed_company_count=?,
                 partial_company_count=?,failed_company_count=?,ineligible_company_count=?,
-                emails_found=?,websites_found=?,phones_found=?,worker_id=?,worker_heartbeat_at=?
+                emails_found=?,websites_found=?,phones_found=?,progress_completed_units=?,
+                progress_total_units=selected_company_count,progress_updated_at=?,worker_heartbeat_at=?
                 WHERE job_id=?''',(processed,counts.get('COMPLETED',0),counts.get('PARTIAL',0),
                 counts.get('FAILED',0),counts.get('INELIGIBLE',0),counts.get('emails',0),
-                counts.get('websites',0),counts.get('phones',0),worker_id,now(),job_id))
+                counts.get('websites',0),counts.get('phones',0),processed,now(),now(),job_id))
             conn.commit()
         except BaseException:
             conn.rollback(); raise
         finally:
             conn.close()
 
-    def add_artifact(self, job_id, artifact_type, relative_path, size_bytes, sha256):
+    def add_artifact(self, job_id, artifact_type, relative_path, size_bytes, sha256,
+                     worker_id=None):
         artifact_id = uuid.uuid4().hex
         conn = self._connect()
         try:
+            if worker_id is not None:
+                conn.execute('BEGIN IMMEDIATE')
+                self._require_running_worker(conn, job_id, worker_id)
             conn.execute('''INSERT INTO job_artifacts(artifact_id,job_id,artifact_type,relative_path,
                 created_at,size_bytes,sha256) VALUES (?,?,?,?,?,?,?) ON CONFLICT(job_id,artifact_type)
                 DO UPDATE SET relative_path=excluded.relative_path,created_at=excluded.created_at,
                 size_bytes=excluded.size_bytes,sha256=excluded.sha256''',
                 (artifact_id,job_id,artifact_type,relative_path,now(),size_bytes,sha256))
+            if worker_id is not None:
+                conn.commit()
+        except BaseException:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -1313,18 +1430,25 @@ class JobRepository:
         conn = self._connect()
         try:
             conn.execute('BEGIN IMMEDIATE')
-            row = conn.execute('SELECT status FROM control_jobs WHERE job_id=?',
+            row = conn.execute('SELECT status,worker_id,selected_company_count FROM control_jobs WHERE job_id=?',
                                (job_id,)).fetchone()
             if row is None:
                 raise ValueError('Unknown job')
             validate_transition(row['status'], target)
+            if (row['status'] in ('STARTING', 'RUNNING', 'EXPORTING')
+                    and row['worker_id'] != worker_id):
+                raise ValueError('Job is owned by another worker')
             timestamp = now()
             fields = ['status=?']; values = [target]
             if target == 'RUNNING':
                 fields += ['started_at=COALESCE(started_at,?)', 'worker_heartbeat_at=?']
                 values += [timestamp, timestamp]
             if target in ('COMPLETED', 'PARTIAL', 'FAILED'):
-                fields.append('finished_at=?'); values.append(timestamp)
+                fields += ['finished_at=?', 'progress_updated_at=?']
+                values += [timestamp, timestamp]
+                if target in ('COMPLETED', 'PARTIAL'):
+                    fields += ['progress_completed_units=?', 'progress_total_units=?']
+                    values += [row['selected_company_count'], row['selected_company_count']]
             if worker_id is not None:
                 fields.append('worker_id=?'); values.append(worker_id)
             if target == 'FAILED':
@@ -1398,7 +1522,7 @@ class JobRepository:
         try:
             conn.execute('BEGIN IMMEDIATE')
             row = conn.execute('SELECT * FROM control_jobs WHERE job_id=?', (job_id,)).fetchone()
-            if row is None or row['status'] != 'RUNNING':
+            if row is None or row['status'] != 'RUNNING' or row['worker_id'] != worker_id:
                 raise ValueError('Progress requires a running job')
             values = (processed, emails, websites, phones)
             if (any(type(value) is not int or value < 0 for value in values)
@@ -1407,8 +1531,10 @@ class JobRepository:
                 raise ValueError('Invalid or regressing job progress')
             timestamp = now()
             conn.execute('''UPDATE control_jobs SET processed_company_count=?,emails_found=?,
-                websites_found=?,phones_found=?,worker_id=?,worker_heartbeat_at=?
-                WHERE job_id=?''', (*values, worker_id, timestamp, job_id))
+                websites_found=?,phones_found=?,progress_completed_units=?,
+                progress_total_units=selected_company_count,progress_updated_at=?,worker_heartbeat_at=?
+                WHERE job_id=? AND worker_id=?''',
+                (*values, processed, timestamp, timestamp, job_id, worker_id))
             self._event(conn, job_id, 'PROGRESS',
                         f'{processed} / {row["selected_company_count"]} processed',
                         details={'processed': processed, 'emails': emails,

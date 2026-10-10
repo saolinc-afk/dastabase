@@ -29,7 +29,7 @@ class DiscoveryV2JobAdapter:
     def __init__(self, repository, storage_root, canonical_db, *, environ=None,
                  provider_factory=SerperSearch, runner=run_discovery,
                  export_builder=build_rows, export_writer=write_csv, poll_interval=0.5,
-                 max_companies=10):
+                 batch_size=10, max_companies=200):
         self.repository = repository
         self.storage_root = Path(storage_root).expanduser().absolute()
         self.canonical_db = Path(canonical_db).expanduser().absolute()
@@ -40,6 +40,12 @@ class DiscoveryV2JobAdapter:
         self.export_writer = export_writer
         self.poll_interval = poll_interval
         self.max_companies = int(max_companies)
+        configured_batch_size = int(batch_size)
+        if not 1 <= configured_batch_size <= 200:
+            raise ValueError('Discovery batch size must be between 1 and 200')
+        if not 1 <= self.max_companies <= 5000:
+            raise ValueError('Discovery total ceiling must be between 1 and 5000')
+        self.batch_size = min(configured_batch_size, self.max_companies)
         self.worker_id = None
 
     def _job_directory(self, job_id):
@@ -62,7 +68,7 @@ class DiscoveryV2JobAdapter:
             raise DiscoveryAdapterError('Artifact escaped Control Room storage')
         digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
         self.repository.add_artifact(job['job_id'],kind,str(resolved.relative_to(root)),
-                                     resolved.stat().st_size,digest)
+                                     resolved.stat().st_size,digest,self.worker_id)
 
     def _write_manifest(self, job, ids, directory):
         path = directory/'manifest.csv'
@@ -99,7 +105,7 @@ class DiscoveryV2JobAdapter:
             if job.get('discovery_run_id') and job['discovery_run_id'] != run_id:
                 store.close()
                 raise DiscoveryAdapterError('Control Room and Discovery run IDs disagree')
-            self.repository.set_discovery_run(job['job_id'],run_id)
+            self.repository.set_discovery_run(job['job_id'],run_id,self.worker_id)
             return store,run_id
         if job.get('discovery_run_id'):
             raise DiscoveryAdapterError('Discovery run is recorded but its results database is missing')
@@ -107,7 +113,7 @@ class DiscoveryV2JobAdapter:
         store = Store(results_path,source=self.canonical_db,create=True,require_new=True)
         try:
             run_id = store.create_run(descriptor,companies,configured)
-            self.repository.set_discovery_run(job['job_id'],run_id)
+            self.repository.set_discovery_run(job['job_id'],run_id,self.worker_id)
             return store,run_id
         except BaseException:
             store.close(); raise
@@ -131,11 +137,14 @@ class DiscoveryV2JobAdapter:
         try:
             store = Store(results_path)
             try:
-                callback(self._counts(store,run_id))
+                counts = self._counts(store,run_id)
             finally:
                 store.close()
         except (OSError,sqlite3.Error,ValueError):
-            pass
+            return
+        # Repository ownership failures must fence a stale worker. They are not
+        # result-database read failures and therefore must not be swallowed.
+        callback(counts)
 
     def _reconciliation(self, job, export_rows, output):
         items = self.repository.job_items(job['job_id'])
@@ -202,7 +211,8 @@ class DiscoveryV2JobAdapter:
                     key = self.environ.get('SERPER_API_KEY')
                     if not key:
                         raise DiscoveryAdapterError('SERPER_API_KEY is required for live Discovery')
-                    outcome = self.runner(active,run_id,provider=self.provider_factory(key))
+                    outcome = self.runner(active,run_id,provider=self.provider_factory(key),
+                                          batch_size=self.batch_size)
             finally:
                 active.close()
         finally:
@@ -218,4 +228,7 @@ class DiscoveryV2JobAdapter:
 
     def _monitor(self,stop,results,run_id,counts_callback):
         while not stop.wait(self.poll_interval):
-            self._sync(results,run_id,counts_callback)
+            try:
+                self._sync(results,run_id,counts_callback)
+            except ValueError:
+                return

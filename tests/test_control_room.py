@@ -93,6 +93,39 @@ class ControlRoomRepositoryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'regressing'):
             self.repository.update_progress(job['job_id'], 4, 2, 3, 1, 'worker')
 
+    def test_stale_worker_is_fenced_after_recovery_claim(self):
+        job = self.repository.create_job('Fence stale worker', 10)
+        self.repository.heartbeat('old-worker')
+        self.repository.claim_oldest('old-worker')
+        self.repository.transition(job['job_id'], 'RUNNING', worker_id='old-worker')
+        old = (datetime.now(timezone.utc)-timedelta(minutes=2)).isoformat()
+        conn = sqlite3.connect(self.db)
+        conn.execute('UPDATE control_jobs SET worker_heartbeat_at=? WHERE job_id=?',
+                     (old, job['job_id']))
+        conn.execute('UPDATE control_workers SET heartbeat_at=? WHERE worker_id=?',
+                     (old, 'old-worker'))
+        conn.commit(); conn.close()
+
+        recovered = self.repository.claim_oldest('new-worker', stale_seconds=15)
+        self.assertEqual((recovered['status'], recovered['worker_id']),
+                         ('STARTING', 'new-worker'))
+        with self.assertRaisesRegex(ValueError, 'another worker|running job'):
+            self.repository.update_progress(job['job_id'], 1, 0, 0, 0, 'old-worker')
+        with self.assertRaisesRegex(ValueError, 'another worker'):
+            self.repository.transition(job['job_id'], 'RUNNING', worker_id='old-worker')
+        self.repository.transition(job['job_id'], 'RUNNING', worker_id='new-worker')
+        with self.assertRaisesRegex(ValueError, 'another worker'):
+            self.repository.transition(job['job_id'], 'COMPLETED', worker_id='old-worker')
+        with self.assertRaisesRegex(ValueError, 'another worker'):
+            self.repository.add_artifact(
+                job['job_id'], 'DISCOVERY_EXPORT', 'jobs/stale.csv', 1, 'sha',
+                'old-worker')
+        self.assertEqual(self.repository.artifacts(job['job_id']), [])
+        self.repository.update_progress(job['job_id'], 10, 1, 1, 1, 'new-worker')
+        result = self.repository.transition(
+            job['job_id'], 'COMPLETED', worker_id='new-worker')
+        self.assertEqual(result['status'], 'COMPLETED')
+
     def test_worker_online_stale_and_idle_heartbeat(self):
         self.assertEqual(self.repository.worker_status()['status'], 'OFFLINE')
         worker = Worker(self.repository, FakeEnrichmentAdapter(delay=0), worker_id='idle-worker')

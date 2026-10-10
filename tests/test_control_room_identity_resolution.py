@@ -296,8 +296,12 @@ def test_interrupted_query_recovery_marks_uncertain_billing_without_calling_prov
     assert worker.run_once()
     task=repo.identity_tasks(job['job_id'])[0]
     query=repo.identity_queries(task['task_id'])[0]
-    repo.start_identity_query(query['query_id'],'future-provider')
-    repo.recover_identity_queries(job['job_id'])
+    conn=sqlite3.connect(repo.path)
+    conn.execute("UPDATE control_jobs SET status='RUNNING',worker_id='worker' WHERE job_id=?",
+                 (job['job_id'],))
+    conn.commit(); conn.close()
+    repo.start_identity_query(query['query_id'],'future-provider','worker')
+    repo.recover_identity_queries(job['job_id'],'worker')
     recovered=repo.identity_queries(task['task_id'])[0]
     assert recovered['status']=='INTERRUPTED'
     assert recovered['uncertain_billing']==1

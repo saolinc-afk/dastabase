@@ -51,7 +51,7 @@ def create_app(config=None):
         UPLOAD_MAX_BYTES=int(os.environ.get('CONTROL_ROOM_UPLOAD_MAX_BYTES', str(20*1024*1024))),
         UPLOAD_MAX_ROWS=int(os.environ.get('CONTROL_ROOM_UPLOAD_MAX_ROWS', '5000')),
         REAL_DISCOVERY_MAX_COMPANIES=int(os.environ.get(
-            'CONTROL_ROOM_REAL_DISCOVERY_MAX_COMPANIES','10')),
+            'CONTROL_ROOM_REAL_DISCOVERY_MAX_COMPANIES','200')),
     )
     if config:
         app.config.update(config)

@@ -21,7 +21,7 @@ class IdentityResolutionAdapter:
                        for company_id in evidence.get('company_ids', ())})
 
     def run(self, job_id, worker_id):
-        self.repository.recover_identity_queries(job_id)
+        self.repository.recover_identity_queries(job_id, worker_id)
         self.repository.set_import_stage(job_id, 'IDENTITY_LOCAL', worker_id)
         for item in self.repository.identity_registration_items(job_id):
             normalized = normalize_import_row(item['headers'], item['original_values'],
@@ -33,14 +33,15 @@ class IdentityResolutionAdapter:
                     'resolver_version': RESOLVER_VERSION}
             spec['fingerprint'] = fingerprint(inputs, spec['origin_status'], candidates,
                                               spec['conflicts'])
-            self.repository.ensure_identity_task(job_id, item['item_position'], spec)
+            self.repository.ensure_identity_task(
+                job_id, item['item_position'], spec, worker_id)
 
         for task in self.repository.identity_tasks(job_id):
             if task['status'] != 'PENDING':
                 continue
             decision = local_resolve(self.index, task['normalized_input'],
                 task['origin_status'], task['origin_candidate_ids'], task['origin_conflicts'])
-            self.repository.apply_identity_decision(task['task_id'], decision)
+            self.repository.apply_identity_decision(task['task_id'], decision, worker_id)
 
         self.repository.set_import_stage(job_id, 'IDENTITY_PREFLIGHT', worker_id)
         for task in self.repository.identity_tasks(job_id):
@@ -48,9 +49,9 @@ class IdentityResolutionAdapter:
                 continue
             plans = plan_queries(task['normalized_input'], task['alternative_company_ids'],
                                  self.index)
-            self.repository.plan_identity_queries(task['task_id'], plans)
+            self.repository.plan_identity_queries(task['task_id'], plans, worker_id)
         preflight = self.repository.update_identity_preflight(
-            job_id, self.task_cap, self.query_cap)
+            job_id, self.task_cap, self.query_cap, worker_id=worker_id)
 
         self.repository.set_import_stage(job_id, 'IDENTITY_SEARCH', worker_id)
         if self.injected_results is not None:
@@ -65,7 +66,8 @@ class IdentityResolutionAdapter:
                     payload = supplied.get(query['sequence'])
                     if payload is not None:
                         self.repository.persist_identity_response(
-                            query['query_id'], payload, provider='INJECTED')
+                            query['query_id'], payload, provider='INJECTED',
+                            worker_id=worker_id)
 
         for task in self.repository.identity_tasks(job_id):
             if task['status'] != 'SEARCH_PLANNED':
@@ -77,6 +79,6 @@ class IdentityResolutionAdapter:
             decision = resolve_results(self.index, task['normalized_input'],
                 task['origin_status'], task['origin_candidate_ids'],
                 [query['raw_result'] for query in completed])
-            self.repository.apply_identity_decision(task['task_id'], decision)
+            self.repository.apply_identity_decision(task['task_id'], decision, worker_id)
         return self.repository.update_identity_preflight(
-            job_id, self.task_cap, self.query_cap)
+            job_id, self.task_cap, self.query_cap, worker_id=worker_id)

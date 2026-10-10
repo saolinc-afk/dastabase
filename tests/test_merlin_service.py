@@ -155,9 +155,19 @@ def _v6_schema():
 
 
 def _v7_schema():
-    schema = Path('control_room/schema.sql').read_text()
+    schema = _v8_schema()
     schema = schema.replace('    requested_outputs_json TEXT,\n', '')
     return schema.replace('PRAGMA user_version=8', 'PRAGMA user_version=7')
+
+
+def _v8_schema():
+    schema = Path('control_room/schema.sql').read_text()
+    for column in (
+            'progress_completed_units INTEGER', 'progress_total_units INTEGER',
+            'progress_stage_started_at TEXT', 'progress_updated_at TEXT'):
+        schema = '\n'.join(line for line in schema.splitlines()
+                           if not line.strip().startswith(column))
+    return schema.replace('PRAGMA user_version=9', 'PRAGMA user_version=8')
 
 
 def test_v6_migration_preserves_admin_rows_and_adds_ownership(tmp_path):
@@ -186,7 +196,7 @@ def test_v6_migration_preserves_admin_rows_and_adds_ownership(tmp_path):
         None, 'CONTROL_ROOM')
     conn = sqlite3.connect(path)
     try:
-        assert conn.execute('PRAGMA user_version').fetchone()[0] == 8
+        assert conn.execute('PRAGMA user_version').fetchone()[0] == 9
         assert conn.execute('SELECT COUNT(*) FROM upload_rows').fetchone()[0] == 1
         assert conn.execute("SELECT name FROM sqlite_master WHERE type='table' "
                             "AND name='workspaces'").fetchone()
@@ -287,8 +297,35 @@ def test_v7_migration_preserves_jobs_and_adds_requested_outputs(tmp_path):
     assert old['requested_outputs_json'] is None
     conn = sqlite3.connect(path)
     try:
-        assert conn.execute('PRAGMA user_version').fetchone()[0] == 8
+        assert conn.execute('PRAGMA user_version').fetchone()[0] == 9
         assert 'requested_outputs_json' in {
             row[1] for row in conn.execute('PRAGMA table_info(control_jobs)')}
+    finally:
+        conn.close()
+
+
+def test_v8_migration_preserves_jobs_and_adds_persisted_progress(tmp_path):
+    path = tmp_path/'v8.sqlite3'
+    conn = sqlite3.connect(path)
+    conn.executescript(_v8_schema())
+    conn.execute('''INSERT INTO control_jobs(job_id,display_name,input_kind,module,status,
+        created_at,queued_at,selected_company_count,execution_adapter,progress_stage,
+        import_total_rows,requested_outputs_json) VALUES
+        ('old-job','Old','UPLOAD','IMPORT_ENRICH','QUEUED','then','then',3,
+         'IMPORT_ENRICH','PARSING',3,'["WEBSITE"]')''')
+    conn.commit(); conn.close()
+
+    repository = JobRepository(path); repository.initialize(); repository.initialize()
+    old = repository.get_job('old-job')
+    assert old['display_name'] == 'Old'
+    assert old['requested_outputs_json'] == '["WEBSITE"]'
+    assert old['progress_completed_units'] is None
+    assert old['progress_total_units'] is None
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute('PRAGMA user_version').fetchone()[0] == 9
+        columns = {row[1] for row in conn.execute('PRAGMA table_info(control_jobs)')}
+        assert {'progress_completed_units', 'progress_total_units',
+                'progress_stage_started_at', 'progress_updated_at'} <= columns
     finally:
         conn.close()

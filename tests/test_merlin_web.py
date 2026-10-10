@@ -223,11 +223,14 @@ def test_polling_api_is_safe_and_reflects_persisted_progress(web):
         'ALFA d.o.o.,11111111\n', 'BETA d.o.o.,22222222\n')))
     job_id = _queue(client, upload_id, ('EMAIL',))
     queued = client.get(f'/api/jobs/{job_id}').get_json()['job']
-    assert set(queued) == {'state', 'stage', 'processed', 'total', 'percent',
+    assert set(queued) == {'state', 'stage', 'activity', 'completed_units',
+        'total_units', 'percent', 'progress_determinate', 'last_activity_at',
         'download_ready', 'requested_outputs', 'matched_rows', 'review_rows',
         'complete_rows', 'incomplete_rows'}
-    assert queued == {**queued, 'state': 'working', 'stage': 'Identifying companies',
-                      'processed': 0, 'total': 2, 'percent': 0,
+    assert queued == {**queued, 'state': 'working', 'stage': 'Waiting to start',
+                      'activity': 'queued', 'completed_units': None,
+                      'total_units': None, 'percent': None,
+                      'progress_determinate': False,
                       'download_ready': False, 'requested_outputs': ['EMAIL'],
                       'complete_rows': None, 'incomplete_rows': None}
     page = BeautifulSoup(client.get(f'/jobs/{job_id}').get_data(as_text=True),
@@ -237,7 +240,7 @@ def test_polling_api_is_safe_and_reflects_persisted_progress(web):
     assert progress['data-state'] == 'working'
     assert len(page.select('.sparkles span')) == 3
     assert not working.has_attr('hidden')
-    assert working.select_one('p').get_text(strip=True) == 'Working on it…'
+    assert working.select_one('p').get_text(strip=True) == 'Waiting to start…'
     assert page.select_one('[data-eta-fallback]').get_text(' ', strip=True) == (
         'Time estimate will appear once Merlin has enough information.')
     assert not any(key in queued for key in ('eta', 'eta_seconds', 'remaining_seconds'))
@@ -249,11 +252,24 @@ def test_polling_api_is_safe_and_reflects_persisted_progress(web):
     repository.set_import_stage(job_id, 'EXISTING_ENRICHMENT', 'test-worker')
     checking = client.get(f'/api/jobs/{job_id}').get_json()['job']
     assert checking['stage'] == 'Checking existing information'
+    assert checking['progress_determinate'] is False
+    conn = sqlite3.connect(repository.path)
+    conn.execute('''UPDATE control_jobs SET import_discovery_required_company_count=2
+        WHERE job_id=?''', (job_id,))
+    conn.commit(); conn.close()
     repository.set_import_stage(job_id, 'DISCOVERY', 'test-worker')
-    repository.update_progress(job_id, 1, 0, 0, 0, 'test-worker')
+    repository.update_import_discovery_progress(job_id, {'COMPLETED': 1}, 'test-worker')
     active = client.get(f'/api/jobs/{job_id}').get_json()['job']
-    assert (active['stage'], active['processed'], active['total'], active['percent']) == (
+    assert (active['stage'], active['completed_units'], active['total_units'], active['percent']) == (
         'Finding missing information', 1, 2, 50)
+    conn = sqlite3.connect(repository.path)
+    conn.execute('''UPDATE control_jobs SET created_at=?,queued_at=?,
+        progress_updated_at=?,worker_heartbeat_at=? WHERE job_id=?''',
+        ('2000-01-01T00:00:00+00:00',) * 4 + (job_id,))
+    conn.commit(); conn.close()
+    delayed = client.get(f'/api/jobs/{job_id}').get_json()['job']
+    assert delayed['activity'] == 'delayed'
+    assert delayed['stage'] == 'Finding missing information'
     repository.set_import_stage(job_id, 'EXPORT', 'test-worker')
     preparing = client.get(f'/api/jobs/{job_id}').get_json()['job']
     assert preparing['stage'] == 'Preparing your Excel file'
@@ -286,6 +302,7 @@ def test_completed_job_downloads_only_verified_final_workspace_artifact(web):
 
     progress = client.get(f'/api/jobs/{job_id}').get_json()['job']
     assert progress['state'] == 'done' and progress['download_ready'] is True
+    assert progress['stage'] == 'Done.'
     page = BeautifulSoup(client.get(f'/jobs/{job_id}').get_data(as_text=True),
                          'html.parser')
     assert page.select_one('[data-job-progress]')['data-state'] == 'done'

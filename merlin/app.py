@@ -3,6 +3,7 @@ import hmac
 import io
 import os
 import secrets
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import (Flask, abort, jsonify, redirect, render_template, request,
@@ -44,6 +45,8 @@ def create_app(config=None):
         MERLIN_WORKSPACE_NAME=os.environ.get('MERLIN_WORKSPACE_NAME', 'MERLIN Internal'),
         UPLOAD_MAX_BYTES=int(os.environ.get('MERLIN_UPLOAD_MAX_BYTES', str(20*1024*1024))),
         UPLOAD_MAX_ROWS=int(os.environ.get('MERLIN_UPLOAD_MAX_ROWS', '5000')),
+        MERLIN_ACTIVITY_STALE_SECONDS=int(os.environ.get(
+            'MERLIN_ACTIVITY_STALE_SECONDS', '30')),
         HOST=os.environ.get('MERLIN_HOST', '127.0.0.1'),
         PORT=int(os.environ.get('MERLIN_PORT', '8780')),
         SESSION_COOKIE_HTTPONLY=True,
@@ -126,6 +129,21 @@ def create_app(config=None):
     def present_job(job):
         final = (job.status in ('COMPLETED', 'PARTIAL') and
                  service.final_workbook(active_workspace(), job.job_id) is not None)
+        terminal = job.status in ('COMPLETED', 'PARTIAL', 'FAILED')
+        if terminal:
+            activity = 'terminal'
+        elif job.status == 'QUEUED':
+            activity = 'queued'
+        else:
+            try:
+                last = datetime.fromisoformat(job.last_activity_at)
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                age = (datetime.now(timezone.utc) - last.astimezone(timezone.utc)).total_seconds()
+            except (TypeError, ValueError):
+                age = float('inf')
+            activity = ('delayed' if age > app.config['MERLIN_ACTIVITY_STALE_SECONDS']
+                        else 'active')
         if job.status == 'FAILED':
             state, stage = 'failed', 'We could not finish this file.'
         elif job.status in ('COMPLETED', 'PARTIAL'):
@@ -138,15 +156,23 @@ def create_app(config=None):
                 state, stage = 'failed', 'We could not prepare the Excel file.'
         else:
             state = 'working'
-            stage = {
+            stage = ('Waiting to start' if activity == 'queued' else {
                 'EXISTING_ENRICHMENT': 'Checking existing information',
                 'DISCOVERY': 'Finding missing information',
                 'EXPORT': 'Preparing your Excel file',
-            }.get(job.stage, 'Identifying companies')
-        percent = round(100 * job.processed / job.total) if job.total else 0
+            }.get(job.stage, 'Identifying companies'))
+        completed_units = job.progress_completed_units
+        total_units = job.progress_total_units
+        determinate = (type(completed_units) is int and type(total_units) is int
+                       and total_units > 0 and 0 <= completed_units <= total_units)
+        percent = round(100 * completed_units / total_units) if determinate else None
         return {
-            'state': state, 'stage': stage, 'processed': job.processed,
-            'total': job.total, 'percent': max(0, min(percent, 100)),
+            'state': state, 'stage': stage, 'activity': activity,
+            'completed_units': completed_units if determinate else None,
+            'total_units': total_units if determinate else None,
+            'percent': max(0, min(percent, 100)) if determinate else None,
+            'progress_determinate': determinate,
+            'last_activity_at': job.last_activity_at,
             'download_ready': state in ('done', 'partial'),
             'requested_outputs': list(job.requested_outputs),
             'matched_rows': job.matched_rows, 'review_rows': job.review_rows,

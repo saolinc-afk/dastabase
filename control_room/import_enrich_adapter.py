@@ -63,7 +63,7 @@ class ImportEnrichAdapter:
         for company_id in discovery_ids:
             payloads[company_id]['discovery_status'] = 'PENDING'
         self.repository.persist_import_enrichment(
-            job['job_id'], payloads, sufficient, discovery_ids)
+            job['job_id'], payloads, sufficient, discovery_ids, self.worker_id)
         if not discovery_ids:
             self._export(job['job_id'])
             return 'COMPLETED'
@@ -87,7 +87,7 @@ class ImportEnrichAdapter:
                       if not missing_discovery_outputs(
                           refreshed_knowledge.snapshot(company_id), requested_outputs)}
         self.repository.persist_import_enrichment(job['job_id'], payloads, sufficient,
-            discovery_ids, after_discovery=True)
+            discovery_ids, self.worker_id, after_discovery=True)
         self._export(job['job_id'])
         return 'PARTIAL' if outcome['status'] == 'PARTIAL' else 'COMPLETED'
 
@@ -102,7 +102,8 @@ class ImportEnrichAdapter:
                                and upload['format'] == 'CSV')):
             return None
         self.repository.set_import_stage(job_id, 'EXPORT', self.worker_id)
-        return export_import_xlsx(self.repository, job_id, self.storage_root)
+        return export_import_xlsx(self.repository, job_id, self.storage_root,
+                                  worker_id=self.worker_id)
 
     @staticmethod
     def _payload(knowledge, company_id, discovery_status=None,

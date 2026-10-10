@@ -60,7 +60,8 @@ class Worker:
                 event_code='ENRICHMENT_COMPLETE', event_message='enrichment complete')
         except Exception as exc:
             current = self.repository.get_job(job['job_id'])
-            if current and current['status'] in ('STARTING', 'RUNNING'):
+            if (current and current['status'] in ('STARTING', 'RUNNING')
+                    and current['worker_id'] == self.worker_id):
                 self.repository.transition(job['job_id'], 'FAILED', worker_id=self.worker_id,
                     error_code=f'{job["execution_adapter"]}_ADAPTER_ERROR', error_message=sanitized_error(exc),
                     event_code='ENRICHMENT_FAILED', event_message='fake enrichment failed')
@@ -97,7 +98,9 @@ def main(argv=None):
     parser.add_argument('--storage-root', default=os.environ.get('CONTROL_ROOM_STORAGE_ROOT',
                         str(Path.home()/'.local/share/dastabase-control')))
     parser.add_argument('--real-discovery-max-companies',type=int,default=int(os.environ.get(
-                        'CONTROL_ROOM_REAL_DISCOVERY_MAX_COMPANIES','10')))
+                        'CONTROL_ROOM_REAL_DISCOVERY_MAX_COMPANIES','200')))
+    parser.add_argument('--real-discovery-batch-size',type=int,default=int(os.environ.get(
+                        'CONTROL_ROOM_REAL_DISCOVERY_BATCH_SIZE','10')))
     args = parser.parse_args(argv)
     repository = JobRepository(args.database); repository.initialize()
     try:
@@ -105,6 +108,7 @@ def main(argv=None):
         from control_room.discovery_adapter import DiscoveryV2JobAdapter
         from control_room.import_enrich_adapter import ImportEnrichAdapter
         discovery = DiscoveryV2JobAdapter(repository,args.storage_root,args.canonical,
+                                           batch_size=args.real_discovery_batch_size,
                                            max_companies=args.real_discovery_max_companies)
         result_paths = tuple(filter(None, os.environ.get(
             'CONTROL_ROOM_IMPORT_DISCOVERY_RESULTS', '').split(os.pathsep)))

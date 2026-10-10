@@ -3,17 +3,21 @@
 {% block content %}
 <section class="progress-view" data-job-progress
          data-state="{{ job.state }}"
+         data-activity="{{ job.activity }}"
          data-progress-url="{{ url_for('job_progress', job_id=job_id) }}"
          data-download-url="{{ url_for('download', job_id=job_id) }}">
   <div class="sparkles" aria-hidden="true">
     <span>✧</span><span>✦</span><span>✧</span>
   </div>
   <h1 data-stage>{{ job.stage }}</h1>
-  <p class="count" data-count>{{ job.processed }} / {{ job.total }}</p>
-  <progress max="100" value="{{ job.percent }}" data-progress>{{ job.percent }}%</progress>
+  <p class="count" data-count {% if not job.progress_determinate %}hidden{% endif %}>
+    {{ job.completed_units or 0 }} / {{ job.total_units or 0 }}
+  </p>
+  <progress max="100" value="{{ job.percent or 0 }}" data-progress
+            {% if not job.progress_determinate %}hidden{% endif %}>{{ job.percent or 0 }}%</progress>
   <div class="working-status" data-working-status
        {% if job.state != 'working' %}hidden{% endif %}>
-    <p>Working on it…</p>
+    <p data-activity-message>{% if job.activity == 'queued' %}Waiting to start…{% elif job.activity == 'delayed' %}Processing is temporarily delayed…{% else %}Working on it…{% endif %}</p>
     <p class="eta-fallback" data-eta-fallback>
       Time estimate will appear once Merlin has enough information.
     </p>
