@@ -187,3 +187,33 @@ From `/home/saolinc/dastabase`, choose a new output directory:
   --sample-size 100 \
   --seed 20261010
 ```
+
+## Human-review export
+
+`discovery_v2.ambiguity_review` turns the completed audit into a compact,
+read-only 100-company review sheet. It reuses `ambiguity_sample_100.csv` only
+when that file has approximately the requested 30/20/20/20 primary-category
+mix and 10 tail cases; otherwise it derives a stable hash-based stratified
+sample from `ambiguity_companies.csv`. Candidate summaries and evidence previews
+come only from persisted audit/result rows. Search snippets remain diagnostic
+evidence and never become accepted websites.
+
+The exporter opens both SQLite inputs read-only, performs no provider or HTTP
+calls, and writes only into a new output directory. From
+`/home/saolinc/dastabase` on Duke:
+
+```sh
+.venv/bin/python -m discovery_v2.ambiguity_review \
+  --master database/dastabase_lite_18916_20261001.db \
+  --results /home/saolinc/dastabase-runs/discovery-v2/18916-serper-20261004/results.sqlite3 \
+  --run-id 402b7d44275344aeaae8ece8191fad64 \
+  --ambiguity-companies /home/saolinc/dastabase-runs/discovery-v2/18916-serper-20261004/ambiguity-audit-20261010/ambiguity_companies.csv \
+  --existing-sample /home/saolinc/dastabase-runs/discovery-v2/18916-serper-20261004/ambiguity-audit-20261010/ambiguity_sample_100.csv \
+  --output-dir /home/saolinc/dastabase-runs/discovery-v2/18916-serper-20261004/ambiguity-human-review-20261010 \
+  --seed 20261010 \
+  --max-candidates 6
+```
+
+The new directory contains `ambiguity_human_review_100.csv` and
+`AMBIGUITY_HUMAN_REVIEW_GUIDE.md`. Existing outputs are not overwritten unless
+`--overwrite` is explicitly supplied.
