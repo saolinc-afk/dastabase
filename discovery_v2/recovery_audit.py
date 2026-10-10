@@ -117,6 +117,10 @@ def _base_features(targets, companies, run_records):
             'accepted_website': accepted_website,
             'accepted_email': result.get('email_value') or legacy.get('email') or '',
             'accepted_phone': result.get('phone_value') or '',
+            'selected_result_id': result.get('result_id') or '',
+            'selected_result_attempt_id': result.get('attempt_id') or '',
+            'selected_website_status': result.get('website_status') or '',
+            'selected_contact_outcome': result.get('contact_outcome') or '',
             'diagnostics': record['latest']['diagnostic'],
             'website_candidates': defaultdict(lambda: {
                 'urls': set(), 'observation_ids': set(), 'evidence_ids': set(),

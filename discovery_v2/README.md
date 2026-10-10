@@ -4,7 +4,9 @@ The offline, read-only recall-planning funnel is documented in
 [`COVERAGE_AUDIT.md`](COVERAGE_AUDIT.md). It is separate from Discovery execution
 and does not change search, verification, scoring, or production data. The same
 document covers the stored-evidence recovery opportunity audit for completed
-`PARTIAL` and `FAILED` populations.
+`PARTIAL` and `FAILED` populations. The follow-up read-only ambiguity breakdown
+and deterministic resolver design are in
+[`AMBIGUITY_AUDIT.md`](AMBIGUITY_AUDIT.md).
 
 An isolated `DISCOVERY_CONTACTS` module. It reads company identities from a frozen
 Lite snapshot and writes only to a separate Discovery v2 SQLite database. It does
